@@ -1,7 +1,7 @@
 %global srcname ferdim
 
 Name:           %{srcname}
-Version:        1.3.1
+Version:        1.3.2
 Release:        1%{?dist}
 Summary:        Dynamic self-tuning download manager with Firefox integration
 
@@ -99,6 +99,10 @@ python3 -m unittest discover -s tests -v
 # %{_userunitdir}, so explicit scriptlets are unnecessary.
 
 %changelog
+* Wed Oct 21 2026 The FerDim Authors <ferdim@ferdim.app> - 1.3.2-1
+- Packaging polish: /usr/share/mozilla manifest, no user-unit scriptlets,
+  man pages for all three executables
+
 * Wed Oct 21 2026 The FerDim Authors <ferdim@ferdim.app> - 1.3.1-1
 - Review-grade packaging: %%check test run, man page, systemd user scriptlets,
   centralized native-messaging registration, arch-independent payload path

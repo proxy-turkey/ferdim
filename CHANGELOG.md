@@ -4,6 +4,13 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [1.3.2] — 2026-10-21
+
+### Changed
+- Packaging polish: `/usr/share/mozilla` manifest location, user-unit
+  scriptlets dropped (systemd file triggers), man pages for `ferdim`,
+  `ferdim-nm` and `ferdim-gui`; hermetic per-run test roots.
+
 ## [1.3.1] — 2026-10-21
 
 ### Changed
