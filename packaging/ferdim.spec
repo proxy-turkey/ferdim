@@ -89,7 +89,7 @@ python3 -m unittest discover -s tests -v
 %{_datadir}/%{srcname}/
 %{_datadir}/applications/%{srcname}.desktop
 %{_datadir}/icons/hicolor/scalable/apps/%{srcname}.svg
-%{_libdir}/mozilla/native-messaging-hosts/%{srcname}.json
+%{_datadir}/mozilla/native-messaging-hosts/%{srcname}.json
 %{_userunitdir}/%{srcname}.service
 %{_mandir}/man1/%{srcname}.1*
 %{_mandir}/man1/%{srcname}-nm.1*
