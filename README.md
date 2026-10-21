@@ -200,8 +200,10 @@ tests/             unittest suite + local HTTP fixtures
 - [x] Metalink / mirror blending
 - [x] Wayland clipboard deep integration (`wl-paste --watch`)
 
-Ideas for later: browser-integrated video sniffing beyond generic media
-detection, per-site connection profiles, and a D-Bus interface.
+The forward plan — distribution (COPR, official Fedora), desktop
+integration (D-Bus, GNOME Shell), and research items (HTTP/3,
+content-defined chunk verification) — lives in
+[ROADMAP.md](ROADMAP.md).
 
 ## Contributing
 
