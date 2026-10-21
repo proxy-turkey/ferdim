@@ -3,7 +3,7 @@
 Segmentli coklu baglanti indirme motoru, Firefox entegrasyonu (WebExtension +
 native messaging), kuyruk/planlayici, hiz limiti ve web/GTK arayuzleri.
 """
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 APP_NAME = "FerDim"
 EXTENSION_ID = "ferdim@ferdim.app"

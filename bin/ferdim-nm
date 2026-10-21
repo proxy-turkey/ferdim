@@ -1,6 +1,15 @@
 #!/bin/sh
 # FerDim native messaging host (Firefox <-> daemon koprusu)
-FERDIM_LIB="$(cd "$(dirname "$(readlink -f "$0")")/../lib/ferdim" 2>/dev/null && pwd)"
-[ -z "$FERDIM_LIB" ] && FERDIM_LIB="/usr/lib/ferdim"
+SELF="$(readlink -f "$0")"
+FERDIM_LIB=""
+for d in "$(dirname "$SELF")/../share/ferdim" \
+         "$(dirname "$SELF")/../lib/ferdim" \
+         /usr/share/ferdim /usr/lib/ferdim; do
+    if [ -f "$d/ferdim/nativehost.py" ]; then FERDIM_LIB="$d"; break; fi
+done
+if [ -z "$FERDIM_LIB" ]; then
+    echo "ferdim-nm: kutuphane bulunamadi" >&2
+    exit 1
+fi
 export PYTHONPATH="$FERDIM_LIB${PYTHONPATH:+:$PYTHONPATH}"
 exec python3 -m ferdim.nativehost

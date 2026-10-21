@@ -1,6 +1,6 @@
 [Unit]
 Description=FerDim Download Manager daemon
-Documentation=file:///usr/share/doc/ferdim/README.md
+Documentation=man:ferdim(1)
 
 [Service]
 ExecStart=@BIN@ daemon

@@ -4,6 +4,15 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [1.3.1] — 2026-10-21
+
+### Changed
+- Review-grade RPM packaging: `%check` runs the full test suite at build
+  time, man page (`ferdim(1)`), proper systemd user scriptlets, centralized
+  native-messaging registration under `/usr/lib*/mozilla`, arch-independent
+  payload at `/usr/share/ferdim`, executable wrappers locate both packaged
+  and user-level installs.
+
 ## [1.3.0] — 2026-10-21
 
 ### Added
