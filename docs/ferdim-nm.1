@@ -1,0 +1,11 @@
+.TH FERDIM-NM 1 "2026-10-21" "ferdim 1.3.1" "User Commands"
+.SH NAME
+ferdim-nm \- FerDim native messaging host for Firefox
+.SH DESCRIPTION
+Internal bridge between the FerDim Firefox extension and the
+.BR ferdim (1)
+daemon. Firefox launches it automatically per the manifest installed at
+/usr/share/mozilla/native-messaging-hosts/ferdim.json; it is not meant to be
+run by hand. Starts the daemon on demand if it is not running.
+.SH SEE ALSO
+.BR ferdim (1)

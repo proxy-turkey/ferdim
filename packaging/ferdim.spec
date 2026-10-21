@@ -12,7 +12,6 @@ BuildArch:      noarch
 
 BuildRequires:  python3-devel
 BuildRequires:  zip
-BuildRequires:  systemd-rpm-macros
 Requires:       python3 >= 3.9
 Recommends:     python3-gobject
 Recommends:     firefox
@@ -53,15 +52,18 @@ sed 's|@BIN@|%{_bindir}/ferdim-gui|' scripts/ferdim.desktop > \
 install -D -m 0644 scripts/icons/ferdim.svg \
   %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/%{srcname}.svg
 install -D -m 0644 docs/%{srcname}.1 %{buildroot}%{_mandir}/man1/%{srcname}.1
+install -D -m 0644 docs/%{srcname}-nm.1 %{buildroot}%{_mandir}/man1/%{srcname}-nm.1
+install -D -m 0644 docs/%{srcname}-gui.1 %{buildroot}%{_mandir}/man1/%{srcname}-gui.1
 
 # systemd user unit
 mkdir -p %{buildroot}%{_userunitdir}
 sed 's|@BIN@|%{_bindir}/ferdim|' scripts/systemd/ferdim.service > \
   %{buildroot}%{_userunitdir}/%{srcname}.service
 
-# Firefox native messaging registration (system-wide)
-mkdir -p %{buildroot}%{_libdir}/mozilla/native-messaging-hosts
-cat > %{buildroot}%{_libdir}/mozilla/native-messaging-hosts/%{srcname}.json <<EOF
+# Firefox native messaging registration (system-wide; /usr/share/mozilla is
+# a documented manifest location and keeps the package arch-independent)
+mkdir -p %{buildroot}%{_datadir}/mozilla/native-messaging-hosts
+cat > %{buildroot}%{_datadir}/mozilla/native-messaging-hosts/%{srcname}.json <<EOF
 {
   "name": "%{srcname}",
   "description": "FerDim Download Manager integration",
@@ -90,12 +92,11 @@ python3 -m unittest discover -s tests -v
 %{_libdir}/mozilla/native-messaging-hosts/%{srcname}.json
 %{_userunitdir}/%{srcname}.service
 %{_mandir}/man1/%{srcname}.1*
+%{_mandir}/man1/%{srcname}-nm.1*
+%{_mandir}/man1/%{srcname}-gui.1*
 
-%post
-%systemd_user_post %{srcname}.service
-
-%postun
-%systemd_user_postun %{srcname}.service
+# systemd ships file triggers that reload user units installed under
+# %{_userunitdir}, so explicit scriptlets are unnecessary.
 
 %changelog
 * Wed Oct 21 2026 The FerDim Authors <ferdim@ferdim.app> - 1.3.1-1
