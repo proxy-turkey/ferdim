@@ -4,6 +4,7 @@ from __future__ import annotations
 from .engine.job import JobSpec
 from . import util
 from .i18n import detect_lang, dict_for
+from . import metalink as _ml
 
 
 def _default_segments(cfg: dict) -> int:
@@ -18,10 +19,16 @@ def _spec_from(params: dict, cfg: dict) -> JobSpec:
         if ":" in h:
             k, v = h.split(":", 1)
             headers[k.strip()] = v.strip()
+    sha = (params.get("sha256") or "").strip().lower()
+    md5v = (params.get("md5") or "").strip().lower()
     return JobSpec(
         url=params.get("url", ""),
         filename=util.sanitize_filename(params["filename"])
         if params.get("filename") else "",
+        mirrors=[u for u in (params.get("mirrors") or [])
+                 if isinstance(u, str) and u.startswith(("http://", "https://"))][:6],
+        sha256=sha if len(sha) == 64 else "",
+        md5=md5v if len(md5v) == 32 else "",
         directory=params.get("dir") or params.get("directory") or "",
         segments=int(params.get("segments") or _default_segments(cfg)),
         headers=headers,
@@ -59,9 +66,46 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         return {"ok": True, "turbo": state}
     if cmd == "stats" or cmd == "list" or cmd == "jobs":
         return {"ok": True, **qm.stats()}
+    if cmd == "zip-preview":
+        job = qm.get(params.get("id", ""))
+        if not job or job.state != "done":
+            return {"ok": False, "error": "is yok"}
+        entries, note = util.zip_preview(job.final_path)
+        if entries is None:
+            return {"ok": False, "error": note}
+        return {"ok": True, "entries": entries, "note": note,
+                "filename": job.final_filename}
     if cmd == "add":
         if not params.get("url", "").startswith(("http://", "https://")):
             return {"ok": False, "error": "gecersiz URL"}
+        # metalink / .meta4: icindeki dosyalara ac
+        try:
+            from .engine import httpcli as _hc
+            if _ml.looks_like_metalink(params["url"]):
+                opt = _hc.DlOptions(
+                    user_agent=params.get("ua") or cfg.get("user_agent", ""),
+                    headers={}, timeout=int(cfg.get("timeout", 30)))
+                opener = _hc._make_opener(opt)
+                with opener.open(_hc.request_of(params["url"], opt),
+                                 timeout=opt.timeout) as _r:
+                    _text = _r.read().decode("utf-8", "replace")
+                items = _ml.parse(_text)
+                ids = []
+                first = None
+                for it in items[:16]:
+                    r2 = handle(ctx, "add", {
+                        "url": it["urls"][0],
+                        "mirrors": it["urls"][1:],
+                        "filename": it["filename"],
+                        "sha256": it["sha256"], "md5": it["md5"]})
+                    if r2.get("ok"):
+                        ids.append(r2["id"])
+                        first = first or r2
+                return first and {**first, "ids": ids,
+                                  "metalink": len(items)} or {
+                    "ok": False, "error": "metalink bos"}
+        except Exception as e:
+            return {"ok": False, "error": f"metalink: {e}"}
         spec = _spec_from(params, cfg)
         job = qm.add(spec)
         qm._tick()

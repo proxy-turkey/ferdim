@@ -126,3 +126,27 @@ def parse_size(text: str | None):
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def file_digest(path, algo: str = "sha256") -> str:
+    import hashlib
+    h = hashlib.new(algo)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def zip_preview(path, limit: int = 500):
+    """ZIP icindekiler listesi: [(isim, boyut, sikistirmis)]. Hata olursa
+    (None, mesaj) dondurur."""
+    try:
+        import zipfile
+        with zipfile.ZipFile(path) as zf:
+            infos = zf.infolist()
+            entries = [(i.filename, i.file_size, i.compress_size)
+                       for i in infos[:limit] if not i.is_dir()]
+            more = f"+{len(infos) - limit}…" if len(infos) > limit else ""
+            return entries, more
+    except Exception as e:
+        return None, str(e)

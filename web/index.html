@@ -76,6 +76,7 @@
     <label><span data-i18n="lbl_filename">Dosya adı</span> <input id="addName" type="text" data-i18n-ph="auto" placeholder="(otomatik)"></label>
     <label><span data-i18n="lbl_segments">Bağlantı</span> <input id="addSeg" type="number" min="1" max="32" value="32"></label>
   </div>
+  <label><span data-i18n="lbl_sha256">SHA-256</span> <input id="addSha" type="text" placeholder="(optional)" style="font-family:monospace"></label>
   <label class="chk"><input type="checkbox" id="addNow" checked> <span data-i18n="start_now">Hemen başlat</span></label>
   <div class="dlg-actions">
     <button class="btn ghost" id="addCancel" data-i18n="btn_cancel">Vazgeç</button>
@@ -105,6 +106,14 @@
   <div class="dlg-actions">
     <button class="btn ghost" id="setClose" data-i18n="btn_close">Kapat</button>
     <button class="btn primary" id="setSave" data-i18n="btn_save">Kaydet</button>
+  </div>
+</dialog>
+
+<dialog id="zipDlg">
+  <h2 id="zipTitle" data-i18n="zip_title">Arşiv içeriği</h2>
+  <div id="zipList" class="ziplist"></div>
+  <div class="dlg-actions">
+    <button class="btn primary" id="zipClose" data-i18n="btn_close">Kapat</button>
   </div>
 </dialog>
 

@@ -46,7 +46,8 @@ def cmd_add(a, env):
                       segments=a.segments, headers=a.header, cookies=a.cookie,
                       user=a.user, password=a.password, proxy=a.proxy,
                       insecure=a.insecure, referer=a.referer,
-                      limit=a.limit)
+                      limit=a.limit, mirrors=a.mirror,
+                      sha256=a.sha256, md5=a.md5)
         if not r.get("ok"):
             print(_("cli_error") + ":", r.get("error"), file=sys.stderr)
             return 1
@@ -169,6 +170,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-k", "--insecure", action="store_true",
                     help="TLS sertifikasi dogrulama")
     sp.add_argument("--wait", action="store_true", help="bitmesini bekle")
+    sp.add_argument("--sha256", help="bitiste SHA-256 dogrulamasi")
+    sp.add_argument("--md5", help="bitiste MD5 dogrulamasi")
+    sp.add_argument("--mirror", action="append", default=[],
+                    help="aynak URL (tekrarlanabilir; .metalink otomatik)")
     sp.set_defaults(fn=cmd_add)
 
     sp = sub.add_parser("list", aliases=["ls"], help="kuyrugu listele")

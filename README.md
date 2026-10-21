@@ -24,6 +24,10 @@ front-ends: CLI, web UI, and GTK 4.
                     └─────────────┘   └──────────────────┘   engine (1–32 links)
 ```
 
+| Web UI | GTK 4 app |
+|:---:|:---:|
+| ![Web UI](docs/screenshots/web-ui.png) | ![GTK app](docs/screenshots/gtk-gui.png) |
+
 ## Why it is fast — and smart
 
 | Mechanism | What it does |
@@ -36,12 +40,16 @@ front-ends: CLI, web UI, and GTK 4.
 | **Crash-safe resume** | Sparse `.part` files in the target directory, metadata checkpointed every 2 s, `If-Range` (ETag / Last-Modified) validation; changed sources restart automatically. |
 | **Big sockets** | Every connection requests a large `SO_RCVBUF` so the kernel keeps deep receive queues per link. |
 | **HLS assembler** | Picks the best variant, fetches segments in parallel (1–8 workers), assembles in order, resumes per segment. |
+| **DASH (MPD)** | Selects the best representation by resolution/bandwidth, resolves SegmentTemplate (`$Number$`/`$Time$`/SegmentTimeline) and SegmentList, then drives the same parallel-segment pipeline. |
+| **Mirrors & metalink** | Repeatable `--mirror` URLs are blended round-robin into one job; `.metalink` / `.meta4` documents expand into queued files with preference-sorted mirrors and checksums. |
+| **Integrity** | Optional per-job `--sha256` / `--md5` verification; a mismatch fails the job while keeping the data for inspection. |
+| **Smart queue** | A background prober learns the size of queued files and runs smallest-first, so a 2 MB PDF never waits behind a 4 GB ISO. |
 
 Also included: queue with concurrency limits and a night-window scheduler,
-global + per-job speed limits, clipboard watching (optional), proxy and
-Basic-Auth support, custom headers/cookies/referer/UA passthrough from the
-browser extension, and graceful single-stream fallback for servers without
-byte ranges.
+global + per-job speed limits, clipboard watching (event-driven on Wayland),
+proxy and Basic-Auth support, custom headers/cookies/referer/UA passthrough
+from the browser extension, ZIP preview from the queue view, and graceful
+single-stream fallback for servers without byte ranges.
 
 **Deliberate limits:** DRM-protected streams and live (non-VOD) HLS are not
 downloaded; site-specific scraping is out of scope (generic media sniffing
@@ -131,6 +139,9 @@ ferdim pause all | ferdim resume <id>           # control
 ferdim limit 2MB                                # politeness mode
 ferdim turbo off|on                             # default is max power
 ferdim web                                      # open the web UI
+ferdim add https://example.com/big.iso --mirror https://mirror.example.com/big.iso
+ferdim add https://example.com/data.metalink             # mirrors + checksums
+ferdim add https://example.com/big.iso --sha256 <digest> # verify when done
 ferdim config --set '{"language":"ru"}'
 ```
 
@@ -183,11 +194,14 @@ tests/             unittest suite + local HTTP fixtures
 
 ## Roadmap
 
-- [ ] DASH (MPD) downloads
-- [ ] Checksum verification (sha256/md5) per job
-- [ ] ZIP preview and category filters in the web UI
-- [ ] Metalink / mirror blending
-- [ ] Wayland clipboard deep integration
+- [x] DASH (MPD) downloads
+- [x] Checksum verification (sha256/md5) per job
+- [x] ZIP preview in the web UI
+- [x] Metalink / mirror blending
+- [x] Wayland clipboard deep integration (`wl-paste --watch`)
+
+Ideas for later: browser-integrated video sniffing beyond generic media
+detection, per-site connection profiles, and a D-Bus interface.
 
 ## Contributing
 

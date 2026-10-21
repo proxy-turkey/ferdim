@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import http.client
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -20,7 +21,7 @@ from pathlib import Path
 from .. import util
 from ..paths import AppEnv
 from ..ratelimit import TokenBucket
-from . import httpcli, hls
+from . import dash, hls, httpcli
 
 CHUNK = 1 << 16            # 64 KB okuma blogu
 MIN_SPLIT = 1 << 20        # 1 MB'dan kucuk aralik bolunmez
@@ -52,6 +53,9 @@ class JobSpec:
     proxy: str = ""
     insecure: bool = False
     limit: int = 0  # is basina bayt/sn
+    mirrors: list = field(default_factory=list)  # alternatif kaynak URL'leri
+    sha256: str = ""   # bitiste dogrulanir
+    md5: str = ""
 
     def options(self, cfg: dict) -> httpcli.DlOptions:
         h = dict(self.headers or {})
@@ -94,6 +98,7 @@ class DownloadJob:
         # isci havuzu sunucunun izin verdigi kadarina adaptive
         # kuculur; limit asimlari isi HATA ile bitirmez.
         self._allowed = max(1, min(int(spec.segments or 8), 32))
+        self._src_rr = 0
         self._active = 0          # su an aralik isleyen isci sayisi
         self._alive: set[int] = set()
         self._spawned_n = 0       # park edilenler dahil toplam isci
@@ -167,6 +172,8 @@ class DownloadJob:
                 "segments_cfg": self.spec.segments,
                 "segments_effective": self._allowed,
                 "adaptive": self.extra.get("adaptive"),
+                "checksum": self.extra.get("checksum", ""),
+                "mirrors": len(self.spec.mirrors or []),
                 "best_speed": int(self._gov["best"]),
             }
 
@@ -194,7 +201,7 @@ class DownloadJob:
     def _prepare(self):
         opt = self.spec.options(self.cfg)
         self.target_dir.mkdir(parents=True, exist_ok=True)
-        # HLS mi?
+        # HLS / DASH manifest mi?
         resume_meta = util.read_json(self.meta_path) or {}
         if self.kind == "hls" or httpcli.is_hls(self.url, "") or \
            resume_meta.get("kind") == "hls":
@@ -205,13 +212,23 @@ class DownloadJob:
             self._fd = os.open(self.part_path, os.O_RDWR | os.O_CREAT, 0o644)
             self._meta = resume_meta
             return
+        if self.kind == "dash" or dash.is_dash(self.url, "") or \
+           resume_meta.get("kind") == "dash":
+            self.kind = "dash"
+            if not self.final_filename:
+                base = util.filename_from_url(self.url)
+                self.final_filename = re.sub(r"\.mpd$", "", base,
+                                             flags=re.I) + ".mp4"
+            self._fd = os.open(self.part_path, os.O_RDWR | os.O_CREAT, 0o644)
+            self._meta = resume_meta
+            return
 
         # sunucu limitliyse probe bile 429/503 donebilir: pes etme, bekle
         p = None
         last_err = None
         for attempt in range(6):
             try:
-                p = httpcli.probe(self.url, opt)
+                p = httpcli.probe(self._next_source(), opt)
                 break
             except urllib.error.HTTPError as e:
                 last_err = e
@@ -221,6 +238,15 @@ class DownloadJob:
                 raise
         if p is None:
             raise last_err
+        # aynalar: ilkinin boyutu uyusuyor mu? uyusmayan elenir
+        if self.spec.mirrors and p.total > 0:
+            for m in list(self.spec.mirrors):
+                try:
+                    pm = httpcli.probe(m, opt)
+                    if pm.total != p.total:
+                        self.spec.mirrors.remove(m)
+                except Exception:
+                    pass  # ayna simdilik erisilemez; yine de denenebilir
         if not self.final_filename:
             # RFC 5987 filename* one cikar; sonra get_filename(), sonra URL
             cand = (util.parse_content_disposition(p.content_disposition)
@@ -397,6 +423,19 @@ class DownloadJob:
                   > self._target_size_locked() * allowed * 2):
                 self._start_probe(-1, ema, now)
 
+    # --------------------------------------------------- coklu kaynak (ayna)
+    def _next_source(self) -> str:
+        """Birincil + aynalar arasinda round-robin; her baglanti farkli
+        kaynaktan acilir (mirror blending)."""
+        with self._lock:
+            srcs = [self.url] + [m for m in (self.spec.mirrors or [])
+                                 if m != self.url]
+            if not srcs:
+                return self.url
+            src = srcs[self._src_rr % len(srcs)]
+            self._src_rr += 1
+            return src
+
     # ------------------------------------------------- adaptif isci havuzu
     def _acquire(self, wid: int) -> tuple[int, int] | None:
         """Slot alir. Fazla iscalar OLMEZ, park edilir: governor buyudugunde
@@ -485,9 +524,13 @@ class DownloadJob:
         last_donate = time.monotonic()
         while cursor <= e and not self._stop.is_set():
             try:
+                src = self._next_source()
+                # If-Range yalniz birincil kaynaga gider (aynanin etagi farkli
+                # olabilir; 200 donmesi yanlis restart tetiklemesin)
                 resp = httpcli.open_range(
-                    self.url, opt, cursor, e,
-                    self._etag, self._last_modified)
+                    src, opt, cursor, e,
+                    self._etag if src == self.url else "",
+                    self._last_modified if src == self.url else "")
             except urllib.error.HTTPError as err:
                 if err.code in (429, 503):
                     # sunucu limiti -> kucul, bekle, devam et
@@ -621,8 +664,9 @@ class DownloadJob:
 
     # --------------------------------------------------------------- monitor
     def _monitor_loop(self):
-        if self.kind == "hls":
-            t = threading.Thread(target=self._run_hls, daemon=True)
+        if self.kind in ("hls", "dash"):
+            runner = self._run_hls if self.kind == "hls" else self._run_dash
+            t = threading.Thread(target=runner, daemon=True)
             t.start()
             t.join()
             self._after_run()
@@ -657,6 +701,27 @@ class DownloadJob:
             hls.download_hls(self.url, opt, self._fd, meta, self._stop,
                              self._bucket, prog, self.extra,
                              meta_path=self.meta_path)
+            self.total = self.done = int(meta.get("tail", 0))
+            util.atomic_write_json(self.meta_path, meta)
+        except Exception as ex:
+            self._fail(str(ex))
+
+    def _run_dash(self):
+        opt = self.spec.options(self.cfg)
+        meta = util.read_json(self.meta_path) or {}
+        meta.setdefault("url", self.url)
+        meta["kind"] = "dash"
+        try:
+            def prog(n):
+                with self._lock:
+                    self.done += n
+
+            text = dash.fetch_mpd(self.url, opt)
+            init_url, seg_urls = dash.build_segment_list(text, self.url)
+            self.extra["segments_listed"] = len(seg_urls)
+            hls.segments.assemble(opt, self._fd, meta, self._stop,
+                                  self._bucket, prog, self.meta_path,
+                                  init_url, seg_urls)
             self.total = self.done = int(meta.get("tail", 0))
             util.atomic_write_json(self.meta_path, meta)
         except Exception as ex:
@@ -718,6 +783,19 @@ class DownloadJob:
             self.meta_path.unlink(missing_ok=True)
             self.state = JobState.DONE
             self.speed = 0
+            # istege bagli saglama (SHA-256 / MD5)
+            want_sha = (self.spec.sha256 or "").strip().lower()
+            want_md5 = (self.spec.md5 or "").strip().lower()
+            if want_sha or want_md5:
+                got = util.file_digest(str(dest), want_sha and "sha256" or "md5")
+                if got != (want_sha or want_md5):
+                    self.state = JobState.ERROR
+                    self.error = ("saglama uyusmazi: beklenen "
+                                  f"{want_sha or want_md5[:12]}…, gelen {got[:12]}…")
+                    self.extra["checksum"] = "mismatch"
+                    self._changed()
+                    return
+                self.extra["checksum"] = "ok"
         except Exception as ex:
             self._fail(str(ex))
         self._changed()

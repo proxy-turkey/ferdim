@@ -227,7 +227,7 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
     if (u) await handoff(u, { referer, filename: nameFromUrl(u) });
   } else if (info.menuItemId === "fd-page" || info.menuItemId === "fd-selection") {
     await grabTab(tab.id, info.menuItemId === "fd-selection");
-    browser.pageAction.open(tab.id).catch(() => {});
+    browser.pageAction.show(tab.id).catch(() => {});
   }
 });
 
@@ -299,7 +299,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.getTurbo) return sendResponse({ ok: true, turbo: hostTurbo });
     if (msg.openPanel && sender.tab) {
-      browser.pageAction.open(sender.tab.id).catch(() => {});
+      browser.pageAction.show(sender.tab.id).catch(() => {});
       return sendResponse({ ok: true });
     }
     sendResponse({ ok: false });

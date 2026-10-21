@@ -80,3 +80,10 @@ dialog input[type=text],dialog input[type=number],dialog input[type=time]{
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
 .chk{display:flex;align-items:center;gap:8px}
 .dlg-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+
+.ziplist{max-height:320px;min-width:420px;overflow-y:auto;font-size:12.5px}
+.ziprow{display:flex;justify-content:space-between;gap:12px;
+  padding:4px 8px;border-bottom:1px solid var(--line)}
+.ziprow .n{font-family:ui-monospace,monospace;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.ziprow .s{color:var(--dim);white-space:nowrap}

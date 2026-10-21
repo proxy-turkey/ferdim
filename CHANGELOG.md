@@ -4,6 +4,30 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [1.4.0] — 2026-10-21
+
+### Added
+- DASH (MPD) downloads: best-representation selection, SegmentTemplate
+  (`$Number$`/`$Time$`/SegmentTimeline) and SegmentList, parallel segment
+  fetch with per-segment resume (shared with the HLS pipeline).
+- Multi-mirror downloads: repeatable `--mirror`, round-robin blending
+  across primary and mirrors, mirror size validation.
+- Metalink / `.meta4` (RFC 5854) expansion: preference-sorted mirrors and
+  checksums are applied to each queued file.
+- Per-job integrity verification: `--sha256` / `--md5` (also in the web UI);
+  mismatches mark the job as failed without deleting data.
+- ZIP preview: list archive contents from the web UI and the API without
+  opening external tools.
+- Smart queue: a background prober learns file sizes and schedules
+  smallest-first so short downloads never wait behind giants.
+- Event-driven clipboard watching on Wayland (`wl-paste --watch`) with a
+  polling fallback.
+
+### Changed
+- WebExtension hardened for linter cleanliness: no dynamic `innerHTML`
+  interpolation, `pageAction.show` instead of non-standard `open`.
+- `python -m ferdim.gui` now works (GTK app gained `__main__`).
+
 ## [1.3.3] — 2026-10-21
 
 ### Changed

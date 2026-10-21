@@ -62,16 +62,22 @@ function renderMedia(items) {
   for (const it of items) {
     const el = document.createElement("div");
     el.className = "item";
-    const ico = it.kind === "audio" ? "🎵" : "🎬";
     el.innerHTML = `
-      <span class="ico">${ico}</span>
+      <span class="ico"></span>
       <div class="meta">
-        <div class="n" title="${it.url}"></div>
-        <div class="s">${humanSize(it.size) || "?"} · ${it.mime.split(";")[0]}</div>
+        <div class="n"></div>
+        <div class="s"></div>
       </div>
-      <button class="copy" title="${_("btnCopy")}">⧉</button>
-      <button class="primary">${_("btnDownload")}</button>`;
-    el.querySelector(".n").textContent = it.filename || it.url;
+      <button class="copy">⧉</button>
+      <button class="primary"></button>`;
+    el.querySelector(".ico").textContent = it.kind === "audio" ? "🎵" : "🎬";
+    const n = el.querySelector(".n");
+    n.textContent = it.filename || it.url;
+    n.title = it.url;
+    el.querySelector(".s").textContent =
+      `${humanSize(it.size) || "?"} · ${it.mime.split(";")[0]}`;
+    el.querySelector(".copy").title = _("btnCopy");
+    el.querySelector(".primary").textContent = _("btnDownload");
     el.querySelector(".primary").onclick = () => {
       send({ download: true, url: it.url, filename: it.filename });
       el.querySelector(".primary").textContent = "✓";
@@ -132,11 +138,13 @@ function renderGrab() {
     el.innerHTML = `
       <input type="checkbox" checked>
       <div class="meta">
-        <div class="n" title="${l.url}"></div>
+        <div class="n"></div>
         <div class="s dim"></div>
       </div>`;
-    el.querySelector(".n").textContent =
+    const n = el.querySelector(".n");
+    n.textContent =
       l.text && l.text !== name ? l.text + " → " + name : name;
+    n.title = l.url;
     el.querySelector(".s").textContent = l.url;
     el.dataset.url = l.url;
     el.dataset.name = name;

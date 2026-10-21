@@ -107,6 +107,7 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
                 "/api/cancel": "cancel", "/api/restart": "restart",
                 "/api/remove": "remove", "/api/limit": "limit",
                 "/api/config": "config-set", "/api/turbo": "turbo",
+                "/api/zip-preview": "zip-preview",
                 "/api/clear-finished": "clear-finished",
             }
             cmd = table.get(u.path)

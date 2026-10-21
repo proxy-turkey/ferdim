@@ -27,6 +27,9 @@ class QueueManager:
         self.last_nm_ping = 0.0
         self._load()
         self._running = True
+        self._size_probed: set[str] = set()
+        self._prober = threading.Thread(target=self._prober_loop, daemon=True)
+        self._prober.start()
         self._ticker = threading.Thread(target=self._tick_loop, daemon=True)
         self._ticker.start()
 
@@ -148,9 +151,21 @@ class QueueManager:
         limit = int(self.cfg.get("max_concurrent", 3))
         started = False
         if self._schedule_active():
-            for job in queued[: max(0, limit - len(running))]:
-                job.start()
-                started = True
+            slots = max(0, limit - len(running))
+            if self.cfg.get("smart_queue", True) and slots:
+                # kucuk dosya once: boyutu bilinmeyenleri yoklayici
+                # isaretleyene kadar beklet, sonra kucukten buyuge basla
+                ready = [j for j in queued if j.id in self._size_probed]
+                if ready:
+                    ready.sort(key=lambda j: (j.total if j.total > 0
+                                              else float("inf"), j.created))
+                    for job in ready[:slots]:
+                        job.start()
+                        started = True
+            else:
+                for job in queued[:slots]:
+                    job.start()
+                    started = True
         for j in self.jobs:
             j.update_speed()
         # durum degisimlerini kalici kaydet (biten/iptal edilen isler)
@@ -217,6 +232,10 @@ class QueueManager:
 
     # ------------------------------------------------------------ persistence
     def _save(self):
+        with self._lock:
+            self._save_locked()
+
+    def _save_locked(self):
         data = []
         for j in self.jobs:
             data.append({
@@ -280,6 +299,35 @@ class QueueManager:
             "language": self.cfg.get("language", "auto"),
             "version": _version(),
         }
+
+    def _prober_loop(self):
+        """Kuyrukta bekleyen islerin boyutunu arka planda ogrenir; boylece
+        smart_queue kucuk-once siralamasi gercek boyutla calisir."""
+        from . import httpcli, dash, hls as _hls
+        while self._running:
+            try:
+                with self._lock:
+                    cand = next((j for j in self.jobs
+                                 if j.state == JobState.QUEUED
+                                 and j.total < 0
+                                 and j.id not in self._size_probed), None)
+                if cand is None:
+                    time.sleep(0.4)
+                    continue
+                url = cand.url
+                if httpcli.is_hls(url, "") or dash.is_dash(url, ""):
+                    cand.total = -1  # manifest; boyut anlamsiz
+                else:
+                    try:
+                        p = httpcli.probe(url, cand.spec.options(self.cfg))
+                        if p.total > 0:
+                            cand.total = p.total
+                    except Exception:
+                        pass
+                with self._lock:
+                    self._size_probed.add(cand.id)
+            except Exception:
+                time.sleep(0.5)
 
     def shutdown(self):
         self._running = False

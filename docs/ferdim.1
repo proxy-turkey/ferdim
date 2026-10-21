@@ -1,4 +1,4 @@
-.TH FERDIM 1 "2026-10-21" "ferdim 1.3.3" "User Commands"
+.TH FERDIM 1 "2026-10-21" "ferdim 1.4.0" "User Commands"
 .SH NAME
 ferdim \- dynamic, self-tuning download manager
 .SH SYNOPSIS
@@ -8,7 +8,11 @@ ferdim \- dynamic, self-tuning download manager
 \fBFerDim\fR is a segmented, self-tuning download manager for Linux. Its
 engine opens up to 32 parallel connections per file and continuously
 calibrates the connection count to saturate either the local line or the
-remote server, whichever ceiling is reachable. Downloads are crash-safe
+remote server, whichever ceiling is reachable. Adaptive streaming media
+(HLS and DASH manifests) is fetched as parallel segments, metalink
+(.metalink / .meta4) documents expand into queued mirror sets with
+checksums, and finished ZIP archives can be previewed in place.
+Downloads are crash-safe
 (sparse part files with periodic metadata checkpoints and ETag/If-Range
 validation), adapt gracefully to server throttling (HTTP 429/503), and
 resume after restarts. A daemon exposes a Unix-socket JSON-RPC API plus a
@@ -35,6 +39,13 @@ Referer header,
 HTTP Basic authentication,
 .BI \-\-proxy " URL"
 proxy,
+.BI \-\-mirror " URL"
+additional mirror for the same file (repeatable; primary and mirrors
+are blended round-robin),
+.BI \-\-sha256 " HEX"
+verify the finished file against a SHA-256 digest,
+.BI \-\-md5 " HEX"
+verify the finished file against an MD5 digest,
 .BI \-\-limit " RATE"
 per-job speed limit (e.g. 2MB),
 .B \-k

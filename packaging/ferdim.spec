@@ -1,7 +1,7 @@
 %global srcname ferdim
 
 Name:           %{srcname}
-Version:        1.3.3
+Version:        1.4.0
 Release:        1%{?dist}
 Summary:        Dynamic self-tuning download manager with Firefox integration
 
@@ -100,7 +100,14 @@ python3 -m unittest discover -s tests -v
 # the user unit dir, so explicit scriptlets are unnecessary.
 
 %changelog
+* Wed Oct 21 2026 Enes Aksu <eaksu@pm.me> - 1.4.0-1
+- DASH (MPD) downloads, multi-mirror blending, metalink/.meta4 expansion,
+- per-job SHA-256/MD5 verification, ZIP preview, size-probing smart queue,
+- event-driven Wayland clipboard watching, GTK via python -m ferdim.gui,
+- WebExtension lint hardening
+
 * Wed Oct 21 2026 Enes Aksu <eaksu@pm.me> - 1.3.3-1
+
 - Maintainer metadata: named copyright holder, README author section,
   WebExtension author field, man page author section
 

@@ -15,6 +15,10 @@ LIMIT_SEM = threading.BoundedSemaphore(3)  # sunucu en fazla 3 eszamanli
 SEG = [os.urandom(200_000 + i * 333) for i in range(8)]  # HLS segmentleri
 ETAG_V1 = '"v1"'
 ETAG_V2 = '"v2"'
+TINY = os.urandom(32 * 1024)
+DASH_INIT = os.urandom(8192)
+DASH_SEGS = [os.urandom(48 * 1024) for _ in range(6)]
+REQUEST_COUNTS: dict[int, int] = {}  # port -> istek sayaci (ayna testi)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -25,6 +29,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, code, body: bytes, ctype="application/octet-stream",
               extra: list[tuple[str, str]] = ()):
+        port = self.server.server_address[1]
+        REQUEST_COUNTS[port] = REQUEST_COUNTS.get(port, 0) + 1
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -145,6 +151,44 @@ class Handler(BaseHTTPRequestHandler):
             for i in range(0, len(body), 16384):
                 time.sleep(0.04)
                 self.wfile.write(body[i:i + 16384])
+        elif p == "/tiny.bin":
+            rng = self.headers.get("Range")
+            if rng and rng.startswith("bytes="):
+                a, b = rng[6:].split("-", 1)
+                a = int(a); b = min(int(b), len(TINY) - 1)
+                body = TINY[a:b + 1]
+                self.send_response(206)
+                self.send_header("Content-Range",
+                                 f"bytes {a}-{b}/{len(TINY)}")
+            else:
+                body = TINY
+                self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("ETag", '"tiny"')
+            self.end_headers()
+            self.wfile.write(body)
+        elif p == "/manifest.mpd":
+            body = (
+                '<?xml version="1.0"?>'
+                '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"'
+                ' mediaPresentationDuration="PT6S">'
+                '<Period duration="PT6S"><AdaptationSet mimeType="video/mp4">'
+                '<Representation id="720" bandwidth="900000" width="1280"'
+                ' height="720">'
+                '<SegmentTemplate timescale="1" duration="1" startNumber="1"'
+                ' initialization="dash-init.mp4"'
+                ' media="dash-seg-$Number$.m4s"/>'
+                '</Representation>'
+                '<Representation id="360" bandwidth="300000" width="640"'
+                ' height="360"/>'
+                '</AdaptationSet></Period></MPD>').encode()
+            self._send(200, body, ctype="application/dash+xml")
+        elif p == "/dash-init.mp4":
+            self._send(200, DASH_INIT, ctype="video/mp4")
+        elif p.startswith("/dash-seg-"):
+            i = int(p.rsplit("-", 1)[1].split(".")[0]) - 1
+            self._send(200, DASH_SEGS[i], ctype="video/mp4")
         elif p == "/redir":
             self.send_response(302)
             self.send_header("Location", "/file.bin")

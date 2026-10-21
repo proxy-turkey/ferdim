@@ -120,6 +120,9 @@ S = {
     "cat_compressed": {"en": "archive", "tr": "arşiv", "es": "archivo", "ru": "архив"},
     "cat_program":   {"en": "program", "tr": "program", "es": "programa", "ru": "программа"},
     "cat_document":  {"en": "document", "tr": "belge", "es": "documento", "ru": "документ"},
+    "lbl_sha256": {"en": "SHA-256 (optional)", "tr": "SHA-256 (isteğe bağlı)", "es": "SHA-256 (opcional)", "ru": "SHA-256 (необязательно)"},
+    "zip_title": {"en": "Archive contents", "tr": "Arşiv içeriği", "es": "Contenido del archivo", "ru": "Содержимое архива"},
+    "zip_empty": {"en": "No entries.", "tr": "Kayıt yok.", "es": "Sin entradas.", "ru": "Нет записей."},
     "cat_other":     {"en": "file", "tr": "dosya", "es": "archivo", "ru": "файл"},
 }
 

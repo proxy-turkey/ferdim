@@ -25,8 +25,8 @@
     btn.innerHTML =
       '<svg width="18" height="18" viewBox="0 0 96 96">' +
       '<path d="M48 16v40m0 0 18-18m-18 18-18-18M20 78h56" stroke="#fff"' +
-      'stroke-width="12" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
-      label;
+      'stroke-width="12" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    btn.appendChild(document.createTextNode(" " + label));
     btn.addEventListener("click", () => {
       browser.runtime.sendMessage({ openPanel: true }).catch(() => {});
     });

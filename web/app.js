@@ -72,6 +72,8 @@ function row(j) {
   if (playing || j.state === "paused")
     acts.push(`<button class="act" title="${tr("act_pause")}" data-act="pause">⏸</button>`);
   acts.push(`<button class="act" title="${tr("act_restart")}" data-act="restart">↻</button>`);
+  if (j.state === "done" && /\.zip$/i.test(j.filename))
+    acts.push(`<button class="act" title="${tr("zip_title")}" data-act="zip">📦</button>`);
   acts.push(`<button class="act" title="${tr("act_remove")}" data-act="remove">🗑</button>`);
   const adaptive = (j.adaptive && j.adaptive < j.segments_cfg)
     ? `⚙ ${trf("adaptive_limit", j.adaptive)} · ` : "";
@@ -126,6 +128,26 @@ async function act(kind, id) {
   if (kind === "remove") {
     if (!confirm(tr("confirm_remove"))) return;
     await api("/api/remove", { id, delete_files: true });
+  } else if (kind === "zip") {
+    const r = await api("/api/zip-preview", { id });
+    const list = $("#zipList");
+    list.innerHTML = "";
+    if (r.ok) {
+      $("#zipTitle").textContent = `${tr("zip_title")} — ${
+        r.filename} (${r.entries.length}${r.note})`;
+      for (const [name, size] of r.entries.slice(0, 400)) {
+        const d = document.createElement("div");
+        d.className = "ziprow";
+        d.innerHTML = `<span class="n"></span><span class="s">${human(size)}</span>`;
+        d.querySelector(".n").textContent = name;
+        list.appendChild(d);
+      }
+      if (!r.entries.length) list.innerHTML =
+        `<div class="dim">${tr("zip_empty")}</div>`;
+      $("#zipDlg").showModal();
+    } else {
+      alert(tr("zip_title") + ": " + (r.error || ""));
+    }
   } else if (kind === "pause") await api("/api/pause", { id });
   else if (kind === "resume") await api("/api/resume", { id });
   else if (kind === "restart") await api("/api/restart", { id });
@@ -159,12 +181,16 @@ $("#addOk").onclick = async () => {
   if (!/^https?:\/\//i.test(url)) { $("#addUrl").focus(); return; }
   await api("/api/add", {
     url, filename: $("#addName").value.trim(),
-    segments: parseInt($("#addSeg").value) || 8,
+    segments: parseInt($("#addSeg").value) || 32,
+    sha256: $("#addSha").value.trim(),
   });
+  $("#addSha").value = "";
   addDlg.close();
   $("#addUrl").value = ""; $("#addName").value = "";
   poll();
 };
+
+$("#zipClose").onclick = () => $("#zipDlg").close();
 
 /* ---- hiz limiti ---- */
 $("#limitSel").onchange = async (e) => {
