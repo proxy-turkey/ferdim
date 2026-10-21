@@ -51,6 +51,11 @@ only); `blob:` URLs are not reachable from outside the browser; no FTP.
 
 ### Fedora (recommended)
 
+The RPM is verified review-ready: it builds in a sterile `mock` chroot with
+the full test suite running inside `%check`, and `rpmlint` is clean. See
+[docs/fedora-submission.md](docs/fedora-submission.md) for the path into the
+official repositories, and [docs/packaging.md](docs/packaging.md) for COPR.
+
 Once the package lands in COPR / Fedora repositories:
 
 ```bash
