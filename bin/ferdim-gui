@@ -1,0 +1,6 @@
+#!/bin/sh
+# FerDim GTK4 arayuzu
+FERDIM_LIB="$(cd "$(dirname "$(readlink -f "$0")")/../lib/ferdim" 2>/dev/null && pwd)"
+[ -z "$FERDIM_LIB" ] && FERDIM_LIB="/usr/lib/ferdim"
+export PYTHONPATH="$FERDIM_LIB${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m ferdim.gui "$@"

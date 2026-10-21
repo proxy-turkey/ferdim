@@ -1,0 +1,54 @@
+{
+  "manifest_version": 2,
+  "default_locale": "en",
+  "name": "__MSG_extName__",
+  "version": "1.2.0",
+  "description": "__MSG_extDesc__",
+  "author": "FerDim",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "ferdim@ferdim.app",
+      "strict_min_version": "112.0"
+    }
+  },
+  "icons": {
+    "48": "icons/icon.svg",
+    "96": "icons/icon.svg"
+  },
+  "permissions": [
+    "downloads",
+    "webRequest",
+    "contextMenus",
+    "cookies",
+    "storage",
+    "tabs",
+    "notifications",
+    "nativeMessaging",
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "browser_action": {
+    "default_title": "FerDim",
+    "default_popup": "popup.html",
+    "default_icon": "icons/icon.svg"
+  },
+  "page_action": {
+    "default_title": "__MSG_pageActionTitle__",
+    "default_popup": "popup.html",
+    "default_icon": "icons/icon.svg"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["overlay.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

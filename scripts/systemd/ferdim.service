@@ -1,0 +1,11 @@
+[Unit]
+Description=FerDim Download Manager daemon
+Documentation=file:///usr/share/doc/ferdim/README.md
+
+[Service]
+ExecStart=@BIN@ daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

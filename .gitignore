@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build / package artifacts
+dist/
+build/
+*.tar.gz
+*.zip
+*.rpm
+*.src.rpm
+
+# Runtime state (never commit)
+*.part
+.ferdim-*
+ferdim.sock
+ferdim.pid
+state/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

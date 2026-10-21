@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<header>
+  <img src="icons/icon.svg" width="22" height="22" alt="">
+  <b>FerDim</b>
+  <span id="hostState" class="state dim" data-i18n="hostOff">…</span>
+  <span class="spacer"></span>
+  <button id="turboBtn" class="turbo" data-i18n="turbo" title="Turbo">⚡ Turbo</button>
+  <button id="optBtn" title="⚙">⚙</button>
+</header>
+
+<section id="quick">
+  <input id="urlInput" type="text" data-i18n-ph="quickPh" placeholder="https://...">
+  <button id="urlAdd" class="primary" data-i18n="btnDownload">İndir</button>
+</section>
+
+<section>
+  <div class="sec-title" id="mediaTitle" data-i18n="popupTitle">Bu sekmede yakalanan medya</div>
+  <div id="mediaList" class="list"></div>
+  <div id="mediaEmpty" class="empty">
+    <span data-i18n="noMedia"></span><br>
+    <span class="dim" data-i18n="noMediaHint"></span>
+  </div>
+</section>
+
+<section>
+  <button id="grabBtn" class="wide ghost">🔎 <span data-i18n="grabBtn"></span></button>
+  <div id="grabBox" hidden>
+    <input id="grabFilter" type="text" data-i18n-ph="grabFilter" placeholder="filtre">
+    <select id="grabPreset">
+      <option value="" data-i18n="typeAll">türü: hepsi</option>
+      <option value="media" data-i18n="typeMedia">medya</option>
+      <option value="archive" data-i18n="typeArchive">arşiv</option>
+      <option value="doc" data-i18n="typeDoc">belge</option>
+    </select>
+    <div class="row grab-head">
+      <label><input type="checkbox" id="grabAll"> <span data-i18n="checkAll"></span></label>
+      <span class="dim" id="grabCount"></span>
+    </div>
+    <div id="grabList" class="list small"></div>
+    <button id="grabDl" class="wide primary" data-i18n="sendSelected"></button>
+  </div>
+</section>
+
+<footer>
+  <a href="#" id="webUi" data-i18n="webUi">Web arayüzü</a>
+  <span class="spacer"></span>
+  <span class="dim" id="ver">v1.1</span>
+</footer>
+<script src="popup.js"></script>
+</body>
+</html>

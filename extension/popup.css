@@ -1,0 +1,48 @@
+:root{
+  --bg:#0f172a; --panel:#1e293b; --line:#334155; --text:#e2e8f0;
+  --dim:#94a3b8; --acc:#0ea5e9; --ok:#22c55e; --err:#ef4444;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{width:380px;font:13px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;align-items:center;gap:8px;padding:10px 12px;
+  background:var(--panel);border-bottom:1px solid var(--line)}
+header b{font-size:14px}
+.spacer{flex:1}
+.state{font-size:11px;padding:2px 8px;border-radius:99px;background:var(--panel)}
+.state.ok{color:var(--ok)} .state.bad{color:var(--err)} .state.dim{color:var(--dim)}
+button{font:inherit;border:0;border-radius:8px;padding:7px 12px;cursor:pointer;
+  background:var(--panel);color:var(--text)}
+button.primary{background:var(--acc);color:#fff;font-weight:600}
+button.ghost{background:transparent;border:1px solid var(--line)}
+button.wide{width:100%;margin-top:8px}
+header button{background:transparent;font-size:15px;padding:4px 8px}
+header button.turbo{font-size:12px;font-weight:700;color:var(--dim);
+  border:1px solid var(--line);border-radius:99px;padding:4px 10px}
+header button.turbo.active{background:linear-gradient(135deg,#f59e0b,#b45309);
+  color:#fff;border-color:#fbbf24}
+section{padding:10px 12px;border-bottom:1px solid var(--line)}
+.sec-title{font-size:11px;text-transform:uppercase;letter-spacing:.5px;
+  color:var(--dim);margin-bottom:6px}
+#quick{display:flex;gap:6px}
+#quick input{flex:1}
+input,select{background:#172033;border:1px solid var(--line);color:var(--text);
+  border-radius:8px;padding:7px 9px;font:inherit}
+input:focus,select:focus{outline:1px solid var(--acc)}
+.list{max-height:200px;overflow-y:auto}
+.item{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:8px;
+  background:var(--panel);margin-bottom:5px}
+.item:hover{outline:1px solid var(--line)}
+.item .ico{font-size:16px}
+.item .meta{flex:1;min-width:0}
+.item .meta .n{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
+.item .meta .s{font-size:11px;color:var(--dim)}
+.item button{padding:4px 9px;font-size:12px}
+.item .copy{background:transparent;color:var(--dim)}
+.empty{color:var(--dim);text-align:center;padding:14px 0;font-size:12.5px}
+.dim{color:var(--dim)}
+#grabBox .row{display:flex;align-items:center;gap:8px;margin:8px 0}
+#grabBox input[type=text],#grabBox select{width:100%;margin-bottom:6px}
+.grab-head{justify-content:space-between}
+.list.small .item{padding:5px 8px}
+footer{display:flex;padding:8px 12px;font-size:12px}
+footer a{color:var(--acc);text-decoration:none}

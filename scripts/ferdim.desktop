@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FerDim Download Manager
+GenericName=İndirme Yöneticisi
+Comment=Dinamik, segmentli indirme yöneticisi (Firefox entegrasyonlu)
+Exec=@BIN@
+Icon=ferdim
+Terminal=false
+Categories=Network;FileTransfer;GNOME;GTK;
+Keywords=download;manager;accelerator;indirme;ferdim;
+StartupNotify=true

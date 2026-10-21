@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FerDim — <span data-i18n="app_title">İndirme Yöneticisi</span></title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%230ea5e9'/><path d='M16 6v13m0 0 6-6m-6 6-6-6M8 25h16' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg viewBox="0 0 32 32" class="logo"><rect width="32" height="32" rx="7" fill="#0ea5e9"/><path d="M16 6v13m0 0 6-6m-6 6-6-6M8 25h16" stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <div>
+      <h1>FerDim</h1>
+      <span id="connState" class="conn ok" data-i18n="daemon_ok">● daemon bağlı</span>
+      <span id="nmState" class="conn dim" data-i18n="nm_off">○ Firefox eklentisi yok</span>
+    </div>
+  </div>
+  <div class="header-actions">
+    <div class="global-speed" id="globalSpeed">0 B/sn</div>
+    <select id="limitSel" data-i18n-title="lbl_speed" title="Hız limiti">
+      <option value="0" data-i18n="unlimited">Sınırsız</option>
+      <option value="128000">128 KB/sn</option>
+      <option value="512000">512 KB/sn</option>
+      <option value="1000000">1 MB/sn</option>
+      <option value="2000000">2 MB/sn</option>
+      <option value="5000000">5 MB/sn</option>
+    </select>
+    <button class="btn turbo" id="turboBtn" data-i18n="turbo" data-i18n-title="turbo_title" title="Turbo: azami güç">⚡ Turbo</button>
+    <button class="btn primary" id="addBtn" data-i18n="h_new">＋ Yeni İndirme</button>
+    <button class="btn ghost" id="settingsBtn" data-i18n="h_settings">⚙ Ayarlar</button>
+  </div>
+</header>
+
+<div id="turboBar" hidden><span data-i18n="turbo_hint"></span></div>
+
+<nav class="tabs" id="tabs">
+  <button data-cat="all" class="active" data-i18n="tab_all">Tümü</button>
+  <button data-cat="video" data-i18n="tab_video">Video</button>
+  <button data-cat="music" data-i18n="tab_music">Müzik</button>
+  <button data-cat="compressed" data-i18n="tab_compressed">Sıkıştırılmış</button>
+  <button data-cat="program" data-i18n="tab_program">Program</button>
+  <button data-cat="document" data-i18n="tab_document">Belge</button>
+  <button data-cat="other" data-i18n="tab_other">Diğer</button>
+  <span class="spacer"></span>
+  <button id="clearFinished" class="mini" data-i18n="clear_finished">Tamamlananları temizle</button>
+</nav>
+
+<main>
+  <div class="thead row">
+    <div class="c-file" data-i18n="col_file">Dosya</div>
+    <div class="c-prog" data-i18n="col_progress">İlerleme</div>
+    <div class="c-size" data-i18n="col_size">Boyut</div>
+    <div class="c-speed" data-i18n="col_speed">Hız</div>
+    <div class="c-eta" data-i18n="col_eta">Kalan</div>
+    <div class="c-act"></div>
+  </div>
+  <div id="jobList"></div>
+  <div id="empty" class="empty" hidden>
+    <p data-i18n="empty_title">Kuyruk boş.</p>
+    <p class="dim" data-i18n="empty_hint"></p>
+  </div>
+</main>
+
+<footer>
+  <span id="schedState"></span>
+  <span class="dim" id="dirLabel"></span>
+</footer>
+
+<!-- Yeni indirme penceresi -->
+<dialog id="addDlg">
+  <h2 data-i18n="dlg_new">Yeni İndirme</h2>
+  <label><span data-i18n="lbl_url">Adres</span> <input id="addUrl" type="text" placeholder="https://..." autofocus></label>
+  <div class="grid2">
+    <label><span data-i18n="lbl_filename">Dosya adı</span> <input id="addName" type="text" data-i18n-ph="auto" placeholder="(otomatik)"></label>
+    <label><span data-i18n="lbl_segments">Bağlantı</span> <input id="addSeg" type="number" min="1" max="32" value="32"></label>
+  </div>
+  <label class="chk"><input type="checkbox" id="addNow" checked> <span data-i18n="start_now">Hemen başlat</span></label>
+  <div class="dlg-actions">
+    <button class="btn ghost" id="addCancel" data-i18n="btn_cancel">Vazgeç</button>
+    <button class="btn primary" id="addOk" data-i18n="btn_download">İndir</button>
+  </div>
+</dialog>
+
+<!-- Ayarlar penceresi -->
+<dialog id="setDlg">
+  <h2 data-i18n="h_settings">Ayarlar</h2>
+  <div class="grid2">
+    <label><span data-i18n="lbl_dl_dir">İndirme dizini</span> <input id="setDir" type="text"></label>
+    <label><span data-i18n="lbl_segments">Bağlantı</span> <input id="setSeg" type="number" min="1" max="32"></label>
+    <label><span data-i18n="lbl_conc">Eşzamanlı</span> <input id="setConc" type="number" min="1" max="16"></label>
+    <label><span data-i18n="lbl_lang">Dil</span>
+      <select id="setLang">
+        <option value="auto">Auto / Sistem</option>
+        <option value="tr">Türkçe</option>
+        <option value="en">English</option>
+        <option value="es">Español</option>
+        <option value="ru">Русский</option>
+      </select></label>
+    <label><span data-i18n="lbl_sched_start">Başlangıç</span> <input id="setSchedStart" type="time"></label>
+    <label><span data-i18n="lbl_sched_stop">Bitiş</span> <input id="setSchedStop" type="time"></label>
+    <label class="chk"><input type="checkbox" id="setSched"> <span data-i18n="lbl_sched_only">Sadece zamanlama penceresinde indir</span></label>
+  </div>
+  <div class="dlg-actions">
+    <button class="btn ghost" id="setClose" data-i18n="btn_close">Kapat</button>
+    <button class="btn primary" id="setSave" data-i18n="btn_save">Kaydet</button>
+  </div>
+</dialog>
+
+<script>window.FERDIM_TOKEN="__TOKEN__";</script>
+<script src="/app.js"></script>
+</body>
+</html>

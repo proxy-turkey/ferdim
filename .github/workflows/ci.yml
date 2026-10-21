@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile
+        run: python3 -m compileall -q ferdim
+      - name: Unit & integration tests
+        run: python3 -m unittest discover -s tests -v
+
+  lint-js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Syntax-check extension and web JS
+        run: |
+          for f in extension/background.js extension/popup.js \
+                   extension/options.js extension/overlay.js web/app.js; do
+            node --check "$f"
+          done
+      - name: Validate JSON (manifest + locales)
+        run: |
+          python3 - <<'EOF'
+          import json, pathlib, sys
+          json.load(open("extension/manifest.json"))
+          locales = sorted(p.name for p in pathlib.Path("extension/_locales").iterdir())
+          keys = None
+          for loc in locales:
+              data = json.load(open(f"extension/_locales/{loc}/messages.json"))
+              k = frozenset(data)
+              if keys is None:
+                  keys = k
+              elif k != keys:
+                  sys.exit(f"locale key mismatch: {loc}")
+          print("locales OK:", ", ".join(locales))
+          EOF

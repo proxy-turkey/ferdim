@@ -1,0 +1,52 @@
+# Changelog
+
+All notable changes to FerDim are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/) and the project uses
+semantic versioning.
+
+## [1.3.0] — 2026-10-21
+
+### Added
+- **Throughput governor**: continuously measures aggregate speed and
+  calibrates the connection count with upward/downward probes to reach
+  whichever ceiling is reachable (line or server), then keeps efficiency
+  probes running.
+- **Adaptive server-limit handling**: HTTP 429/503 and crowded connection
+  resets/refusals shrink the worker pool instead of failing the job;
+  `Retry-After` honored; learned floor remembered across resume and
+  re-explored after a penalty window.
+- **Dynamic range sizing** (~8 s of work per bite, 256 KB–32 MB) and
+  **end-game tail donation** to parked workers.
+- **Parked worker pool**: shrinking parks threads; growth re-arms them
+  instantly.
+- Probe retries on 429/503; clean single-stream fallback for servers
+  without byte ranges.
+- Scaled HLS worker pool (1–8 by segment count).
+- Live connection count and adaptive-limit indicator in UIs (4 languages).
+
+## [1.2.0] — 2026-10-21
+
+### Changed
+- **Maximum power is the default**: 32 links, unlimited speed, 8 concurrent
+  jobs out of the box; the turbo toggle now serves as a politeness switch.
+
+## [1.1.0] — 2026-10-21
+
+### Added
+- Turbo (max power) mode with per-surface toggles (CLI, web, GTK, extension).
+- Internationalization: Turkish, English, Spanish, Russian across web UI,
+  extension (`_locales`), GTK front-end and CLI.
+
+## [1.0.0] — 2026-10-21
+
+### Added
+- Segmented multi-connection engine (1–32 links) with work stealing.
+- Crash-safe resume with ETag/Last-Modified validation and automatic restart
+  on source change.
+- Firefox WebExtension + native messaging host: download takeover, media
+  sniffing with badge/floating button, link grabber with filters and batch
+  send, options page.
+- Queue manager with concurrency limit, night-window scheduler, global and
+  per-job speed limits, optional clipboard watcher.
+- Daemon with UNIX-socket JSON-RPC and token-protected localhost HTTP API;
+  web UI, GTK 4 app, full CLI; systemd user service; RPM packaging.
