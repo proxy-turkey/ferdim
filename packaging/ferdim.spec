@@ -12,6 +12,7 @@ BuildArch:      noarch
 
 BuildRequires:  python3-devel
 BuildRequires:  zip
+BuildRequires:  systemd-rpm-macros
 Requires:       python3 >= 3.9
 Recommends:     python3-gobject
 Recommends:     firefox
