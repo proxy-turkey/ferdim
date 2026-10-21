@@ -4,6 +4,13 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [1.3.3] — 2026-10-21
+
+### Changed
+- Maintainer metadata across the project: named copyright holder
+  (Enes Aksu), RPM changelog packager, README author section,
+  WebExtension `author` field, man page author section.
+
 ## [1.3.2] — 2026-10-21
 
 ### Changed

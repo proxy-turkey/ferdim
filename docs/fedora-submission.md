@@ -55,7 +55,8 @@ four languages. Pure Python (stdlib), MIT license.
 Koji scratch build:
 https://koji.fedoraproject.org/koji/taskinfo?taskID=...   (optional but recommended)
 
-This is my first Fedora package; I need a sponsor.
+I am the upstream author (Enes Aksu). This is my first Fedora
+package; I need a sponsor.
 fedora-review flag: ?
 ```
 

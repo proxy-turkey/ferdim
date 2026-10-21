@@ -194,9 +194,13 @@ tests/             unittest suite + local HTTP fixtures
 PRs are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Please keep the UI
 and code free of third-party product names and trademarks.
 
+## Author
+
+**Enes Aksu** — <eaksu@pm.me> — [@enesaksuu34](https://x.com/enesaksuu34)
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT © Enes Aksu — see [LICENSE](LICENSE).
 
 ---
 

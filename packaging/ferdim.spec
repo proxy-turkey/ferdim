@@ -1,7 +1,7 @@
 %global srcname ferdim
 
 Name:           %{srcname}
-Version:        1.3.2
+Version:        1.3.3
 Release:        1%{?dist}
 Summary:        Dynamic self-tuning download manager with Firefox integration
 
@@ -100,7 +100,11 @@ python3 -m unittest discover -s tests -v
 # the user unit dir, so explicit scriptlets are unnecessary.
 
 %changelog
-* Wed Oct 21 2026 The FerDim Authors <ferdim@ferdim.app> - 1.3.2-1
+* Wed Oct 21 2026 Enes Aksu <eaksu@pm.me> - 1.3.3-1
+- Maintainer metadata: named copyright holder, README author section,
+  WebExtension author field, man page author section
+
+* Wed Oct 21 2026 Enes Aksu <eaksu@pm.me> - 1.3.2-1
 - Packaging polish: /usr/share/mozilla manifest, no user-unit scriptlets,
   man pages for all three executables
 
