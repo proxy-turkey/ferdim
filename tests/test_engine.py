@@ -30,8 +30,10 @@ def sha(path: Path) -> str:
 class EngineTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        import tempfile
         cls.srv, cls.base = start_server()
-        cls.env = AppEnv(root=Path("/tmp/ferdim-test-env"))
+        # her run kendi temiz kokunu alir (stale dosya isim cakismasi olmasin)
+        cls.env = AppEnv(root=Path(tempfile.mkdtemp(prefix="ferdim-engine-")))
 
     @classmethod
     def tearDownClass(cls):

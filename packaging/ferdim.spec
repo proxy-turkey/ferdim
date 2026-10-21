@@ -47,6 +47,7 @@ install -D -m 0755 bin/ferdim-nm  %{buildroot}%{_bindir}/ferdim-nm
 install -D -m 0755 bin/ferdim-gui %{buildroot}%{_bindir}/ferdim-gui
 
 # desktop entry, icon, manual page
+mkdir -p %{buildroot}%{_datadir}/applications
 sed 's|@BIN@|%{_bindir}/ferdim-gui|' scripts/ferdim.desktop > \
   %{buildroot}%{_datadir}/applications/%{srcname}.desktop
 install -D -m 0644 scripts/icons/ferdim.svg \
@@ -54,6 +55,7 @@ install -D -m 0644 scripts/icons/ferdim.svg \
 install -D -m 0644 docs/%{srcname}.1 %{buildroot}%{_mandir}/man1/%{srcname}.1
 
 # systemd user unit
+mkdir -p %{buildroot}%{_userunitdir}
 sed 's|@BIN@|%{_bindir}/ferdim|' scripts/systemd/ferdim.service > \
   %{buildroot}%{_userunitdir}/%{srcname}.service
 
