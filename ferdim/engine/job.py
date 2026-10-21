@@ -104,7 +104,7 @@ class DownloadJob:
         self._last_limit_ts = 0.0
         self._gov = {
             "ema": 0.0, "best": 0.0, "best_workers": self._allowed,
-            "t": 0.0, "done": 0, "probe": False, "dir": 0,
+            "t": time.monotonic(), "done": 0, "probe": False, "dir": 0,
             "ref_allowed": 0, "ref_speed": 0.0,
             "cooldown": 0.0, "next_up": 0.0, "next_down": 15.0,
         }
@@ -365,7 +365,9 @@ class DownloadJob:
 
             if g["probe"]:
                 g["probe"] = False
-                accept = sample > 0 and ema >= g["ref_speed"] * 0.93
+                # esnek esik: anlik dalgalanmalar (CPU/wifi) keşfi yanlis
+                # reddetmesin; gercek kayip belirginse geri alinir
+                accept = sample > 0 and ema >= g["ref_speed"] * 0.85
                 if accept:
                     g["best"] = max(g["best"], ema)
                     g["best_workers"] = self._allowed

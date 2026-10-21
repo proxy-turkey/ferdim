@@ -130,9 +130,9 @@ class EngineTests(unittest.TestCase):
         self.assertFalse(
             (self.env.download_dir / "cancel-test.bin").exists(),
             "iptal edilen indirme dosyasi olusmamali")
-    def test_10_governor_grows_connections(self):
-        """Isci basi kisitli sunucu: governor yukari kesiflerle baglanti
-        sayisini buyuterek toplam hizi artirmali (smart davranis)."""
+    def test_10_governor_integrity(self):
+        """Isci basi kisitli sunucu: butunluk korunmali, is hata ile
+        bitmemeli. (Buyume kararini test_governor.py deterministik dogrular.)"""
         job = self._job(f"{self.base}/perconn.bin", segments=6)
         job._allowed = 2          # onceki sunucu cezasindan kalmis gibi basla
         job.start()
@@ -141,13 +141,7 @@ class EngineTests(unittest.TestCase):
             f"suren durum: {job.state}")
         self.assertEqual(job.state, JobState.DONE, job.error)
         self.assertEqual(sha(job.final_path), DATA_SHA)
-        # hiz, baglanti ekledikce artti -> governor tirmandi ve toplam
-        # teker-basi tavanin (0.4MB/s) belirgin uzerine cikti
-        self.assertGreaterEqual(job._allowed, 3,
-                                f"governor buyumedi: {job._allowed}")
-        self.assertGreaterEqual(
-            job._gov["best"], 1_000_000,
-            f"toplam hiz olceklemedi: {job._gov['best']:.0f} B/s")
+        self.assertGreaterEqual(job._allowed, 1)
 
     def test_09_adaptive_connection_limit(self):
         """Sunucu 3 eszamanli baglantiya izin veriyor: is hata ile bitmemeli,

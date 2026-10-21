@@ -160,10 +160,12 @@ Firefox UI locale, and the CLI/GTK apps follow the system locale or
 python3 -m unittest discover -s tests -v   # 20 tests, no external deps
 ```
 
-The test suite spins up local HTTP servers (range support, throttling,
+The suite (26 tests) spins up local HTTP servers (range support, throttling,
 connection limits, auth, redirects, HLS manifests) and verifies SHA-256
-integrity end-to-end — including governor growth on per-connection-throttled
-servers and graceful shrinking on connection-capped ones.
+integrity end-to-end — graceful shrinking on connection-capped servers —
+plus deterministic, clock-faked unit tests for every governor decision
+(up-probe accept/reject, down-probe efficiency release, server-penalty floor,
+limit-window blocking).
 
 ```
 ferdim/            Python package (engine, queue, daemon, servers, CLI, GUI)
