@@ -96,7 +96,7 @@ python3 -m unittest discover -s tests -v
 %{_mandir}/man1/%{srcname}-gui.1*
 
 # systemd ships file triggers that reload user units installed under
-# %{_userunitdir}, so explicit scriptlets are unnecessary.
+# the user unit dir, so explicit scriptlets are unnecessary.
 
 %changelog
 * Wed Oct 21 2026 The FerDim Authors <ferdim@ferdim.app> - 1.3.2-1
