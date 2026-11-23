@@ -1,0 +1,36 @@
+name: AMO
+
+# Etiket push'unda eklentinin yeni surumunu AMO'ya (listed) gonderir.
+# Mozilla incelemesi bitince imzali XPI AMO'dan dagitilir.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Version check
+        run: |
+          set -euo pipefail
+          mver=$(python3 -c "import json;print(json.load(open('extension/manifest.json'))['version'])")
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            test "${GITHUB_REF_NAME#v}" = "$mver" || { echo "tag ${GITHUB_REF_NAME} != manifest $mver"; exit 1; }
+          fi
+      - name: Lint
+        run: npx -y web-ext lint --source-dir extension --warnings-as-errors
+      - name: Submit to AMO
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: >
+          npx -y web-ext sign --source-dir extension --artifacts-dir dist
+          --channel listed --approval-timeout 0

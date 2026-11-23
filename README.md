@@ -121,20 +121,13 @@ sudo dnf install ~/rpmbuild/RPMS/noarch/ferdim-*.noarch.rpm
 ## Firefox integration
 
 The extension takes over browser downloads, detects media on pages, and adds
-context-menu items. Firefox requires add-ons to be signed for permanent
-installation, so either load it temporarily or sign it once (free AMO account):
+context-menu items. Install it from addons.mozilla.org (signed, auto-updating):
+<https://addons.mozilla.org/firefox/addon/ferdim-integration-module/>.
+New versions are submitted automatically on every release tag
+(`.github/workflows/amo.yml`).
 
-**Quick trial:** `about:debugging#/runtime/this-firefox` → *Load Temporary
-Add-on* → `~/.local/share/ferdim/ferdim-extension.zip`
-
-**Permanent:**
-
-```bash
-npm install -g web-ext
-web-ext sign --api-key=$AMO_KEY --api-secret=$AMO_SECRET \
-  --source-dir extension --channel unlisted --artifacts-dir /tmp/signed
-# then open /tmp/signed/ferdim-*.xpi in Firefox
-```
+**Quick trial / development:** `about:debugging#/runtime/this-firefox` →
+*Load Temporary Add-on* → `~/.local/share/ferdim/ferdim-extension.zip`
 
 Once installed: downloads are handed to FerDim automatically (configurable:
 all / media only / off), a floating button appears when a page serves video or

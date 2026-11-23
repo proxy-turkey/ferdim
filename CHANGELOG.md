@@ -7,6 +7,8 @@ semantic versioning.
 ## [Unreleased]
 
 ### Added
+- The Firefox extension is published on addons.mozilla.org (listed,
+  signed, auto-updating); `.github/workflows/amo.yml` submits each release tag.
 - COPR repository `proxy-turkey/ferdim` (Fedora 43+, x86_64/aarch64),
   rebuilt automatically on every release tag by `.github/workflows/copr.yml`.
 - Queue history in SQLite: every job that reaches a terminal state
