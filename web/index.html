@@ -53,6 +53,23 @@
 </nav>
 
 <main>
+  <section class="graphs" aria-labelledby="graphH">
+    <h2 id="graphH" class="sr-only" data-i18n="graph_title">Hız ve bağlantı grafikleri</h2>
+    <figure>
+      <figcaption>
+        <span data-i18n="total_speed">Toplam hız</span>
+        <span id="graphSpeedNow" class="gval">0 B/sn</span>
+      </figcaption>
+      <canvas id="speedGraph" role="img" aria-label="Hız grafiği" data-i18n-aria="graph_speed_a11y"></canvas>
+    </figure>
+    <figure>
+      <figcaption>
+        <span data-i18n="graph_conn">Bağlantılar</span>
+        <span id="graphConnNow" class="gval">0</span>
+      </figcaption>
+      <canvas id="connGraph" role="img" aria-label="Bağlantı grafiği" data-i18n-aria="graph_conn_a11y"></canvas>
+    </figure>
+  </section>
   <div id="jobPanel" role="tabpanel" tabindex="-1" aria-labelledby="tab-all">
     <span id="tblLabel" class="sr-only" data-i18n="a11y_table">İndirmeler</span>
     <div class="table" role="table" aria-labelledby="tblLabel">

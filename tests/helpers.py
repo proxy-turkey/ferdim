@@ -78,6 +78,8 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/norange.bin":  # Range yok, tek akis
             body = b"" if head else DATA[:1024 * 1024]
             self._send(200, body, ctype="application/x-iso")
+        elif p == "/plain.bin":    # Range yok, kucuk govde (ayna yoklamasi)
+            self._send(200, b"duz govde" * 8)
         elif p == "/slow.bin":
             if head:
                 self._send(200, b"", extra=[("Accept-Ranges", "bytes"),

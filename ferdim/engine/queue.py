@@ -93,9 +93,13 @@ class QueueManager:
                 self.remove(job.id)
         elif action == "restart":
             job.cancel(delete_files=False)
+            # bastan indirme: yarim .part (FTP'de resume noktasi) silinir
+            job.part_path.unlink(missing_ok=True)
             job.state = JobState.QUEUED
             job.error = ""
             job.total, job.done = -1, 0
+            with self._lock:
+                self._size_probed.discard(job.id)   # yeniden yoklanacak
         return True
 
     def remove(self, job_id: str, delete_files=False) -> bool:
@@ -339,7 +343,7 @@ class QueueManager:
     def _prober_loop(self):
         """Kuyrukta bekleyen islerin boyutunu arka planda ogrenir; boylece
         smart_queue kucuk-once siralamasi gercek boyutla calisir."""
-        from . import httpcli, dash, hls as _hls
+        from . import httpcli, dash, hls as _hls, ftp as _ftp
         while self._running:
             try:
                 with self._lock:
@@ -351,13 +355,31 @@ class QueueManager:
                     time.sleep(0.4)
                     continue
                 url = cand.url
-                if httpcli.is_hls(url, "") or dash.is_dash(url, ""):
-                    cand.total = -1  # manifest; boyut anlamsiz
+                if _ftp.is_ftp(url):
+                    # ftp:// urllib'in HTTP yoklayicisina gitmemeli
+                    try:
+                        opt = cand.spec.options(self.cfg)
+                        size = _ftp.probe_size(
+                            url, timeout=min(max(1, int(opt.timeout)), 5),
+                            insecure=opt.insecure, user=cand.spec.user,
+                            password=cand.spec.password)
+                        if size > 0:
+                            with cand._lock:
+                                if cand.state == JobState.QUEUED:
+                                    cand.total = size
+                    except Exception:
+                        pass
+                elif httpcli.is_hls(url, "") or dash.is_dash(url, ""):
+                    with cand._lock:
+                        if cand.state == JobState.QUEUED:
+                            cand.total = -1  # manifest; boyut anlamsiz
                 else:
                     try:
                         p = httpcli.probe(url, cand.spec.options(self.cfg))
                         if p.total > 0:
-                            cand.total = p.total
+                            with cand._lock:
+                                if cand.state == JobState.QUEUED:
+                                    cand.total = p.total
                     except Exception:
                         pass
                 with self._lock:

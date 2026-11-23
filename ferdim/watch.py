@@ -24,7 +24,7 @@ MAX_FILE = 4 << 20
 STABLE_SECS = 1.0
 STATE_FILE = "watch.json"
 ACTIONS = ("delete", "rename", "keep")
-URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
+URL_RE = re.compile(r"(?:https?|ftps?)://[^\s\"'<>]+", re.I)
 
 
 def _trim_url(u: str) -> str:

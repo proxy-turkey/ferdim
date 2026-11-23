@@ -41,11 +41,13 @@ front-ends: CLI, web UI, and GTK 4.
 | **Big sockets** | Every connection requests a large `SO_RCVBUF` so the kernel keeps deep receive queues per link. |
 | **HLS assembler** | Picks the best variant, fetches segments in parallel (1–8 workers), assembles in order, resumes per segment. |
 | **DASH (MPD)** | Selects the best representation by resolution/bandwidth, resolves SegmentTemplate (`$Number$`/`$Time$`/SegmentTimeline) and SegmentList, then drives the same parallel-segment pipeline. |
+| **FTP / FTPS** | Single-stream downloads over `ftplib`: credentials from the URL, the add form or anonymous; passive mode; `SIZE` for progress/ETA and `REST` for resuming a partial `.part` after a pause or crash, validated with the server's `MDTM` when offered. Transient failures retry from the last checkpoint. `ftps://` negotiates explicit TLS with an encrypted data channel. The same stall timeout, speed limit, checksum and verification rules apply. |
 | **Mirrors & metalink** | Repeatable `--mirror` URLs are blended into one job; `.metalink` / `.meta4` documents expand into queued files with preference-sorted mirrors and checksums. |
 | **Source health** | Work is balanced across the primary URL and mirrors by measured per-connection throughput (smooth weighted round-robin). A source that fails, stalls (no data for `stall_timeout` s) or serves a different file (`Content-Range` is checked on every response) is demoted, and the interrupted byte range **continues from another source** — one dead mirror never fails a job. Retries back off exponentially with jitter. |
 | **Integrity** | Per-job `--sha256` / `--md5` / `--sha1` / `--sha512` / `--checksum algo:digest`, all computed in one pass. Checksum sidecar files next to the URL (`.sha256`, `.md5`, …) are discovered automatically. Verification completes **before** a job is reported as finished; an explicit mismatch fails the job while keeping the data for inspection. |
 | **Automation** | Watched folders queue `.metalink` / `.meta4` documents and URL-list text files automatically; schedule windows can be set per category; `ferdim add @list.txt` queues a whole list. |
 | **Smart queue** | A background prober learns the size of queued files and runs smallest-first, so a 2 MB PDF never waits behind a 4 GB ISO. |
+| **Live telemetry** | The web UI plots aggregate throughput and the open-connection count over the last two minutes, plus a per-job speed sparkline — plain canvas, no chart library, client-side ring buffers. |
 
 Also included: queue with concurrency limits and a night-window scheduler,
 watched folders, global + per-job speed limits, clipboard watching (event-driven on Wayland),
@@ -55,7 +57,10 @@ single-stream fallback for servers without byte ranges.
 
 **Deliberate limits:** DRM-protected streams and live (non-VOD) HLS are not
 downloaded; site-specific scraping is out of scope (generic media sniffing
-only); `blob:` URLs are not reachable from outside the browser; no FTP.
+only); `blob:` URLs are not reachable from outside the browser; FTP/FTPS is
+single-stream (no segmentation or mirror blending) and its resume checks the
+server's `MDTM` only when the server offers it — otherwise a remote file
+replaced with the same size cannot be detected.
 
 ## Installation
 
@@ -147,13 +152,15 @@ ferdim add https://example.com/big.iso --sha256 <digest> # verify when done
 ferdim add https://example.com/distro.iso --checksum sha512:<digest> \
         --mirror https://mirror1.example.org/distro.iso --mirror https://mirror2.example.org/distro.iso
 ferdim add @liste.txt                           # queue every URL in a file
+ferdim add ftp://example.org/pub/distro.iso --wait       # FTP or ftps:// (anonymous or user:pass in URL)
 ferdim config --set '{"language":"ru"}'
 ferdim config --set '{"watch_dirs":["~/İndirilenler/ferdim-kuyruk"]}'   # auto-queue dropped lists
 ```
 
 - **Web UI** — `http://127.0.0.1:8378`: live queue, categories, speed/ETA,
-  per-job controls, settings, scheduler (global and per-category), watched
-  folders, language picker. Fully keyboard- and screen-reader-friendly.
+  per-job controls, throughput and connection graphs, settings, scheduler
+  (global and per-category), watched folders, language picker. Fully
+  keyboard- and screen-reader-friendly.
 - **GTK 4 app** — `ferdim-gui` or from your app menu.
 - **CLI** — full control; `ferdim --help`.
 
@@ -183,8 +190,9 @@ Firefox UI locale, and the CLI/GTK apps follow the system locale or
 python3 -m unittest discover -s tests -v   # 20 tests, no external deps
 ```
 
-The suite (26 tests) spins up local HTTP servers (range support, throttling,
-connection limits, auth, redirects, HLS manifests) and verifies SHA-256
+The suite (26 tests) spins up local HTTP and FTP servers (range support,
+throttling, connection limits, auth, redirects, HLS manifests, passive-mode
+FTP with `REST`) and verifies SHA-256
 integrity end-to-end — graceful shrinking on connection-capped servers —
 plus deterministic, clock-faked unit tests for every governor decision
 (up-probe accept/reject, down-probe efficiency release, server-penalty floor,

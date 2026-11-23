@@ -11,6 +11,8 @@ const ACTIONS = [["resume", "act_resume", "▶"], ["pause", "act_pause", "⏸"],
                  ["restart", "act_restart", "↻"], ["zip", "zip_title", "📦"],
                  ["remove", "act_remove", "🗑"]];
 const DIGEST_LEN = { sha256: 64, sha512: 128, md5: 32, sha1: 40 };
+const HIST_MAX = 240;       // 500 ms tarama -> 2 dakikalik grafik penceresi
+const HIST_SEC = 120;       // HIST_MAX * 0.5 sn
 
 let T = {};                 // aktif ceviri sozlugu
 let LANG = localStorage.getItem("ferdimLang") || "";
@@ -19,6 +21,9 @@ let states = new Map();     // is kimligi -> onceki durum (duyuru icin)
 let primed = false;         // ilk tarama yapildi mi (ilk tarama duyurulmaz)
 let polling = false;
 const rows = new Map();     // is kimligi -> satir ogeleri
+const histSpeed = [];       // toplam hiz ornekleri (ring)
+const histConn = [];        // acik baglanti sayisi ornekleri (ring)
+const jobHist = new Map();  // is kimligi -> hiz ornekleri; is kaybolunca silinir
 
 const CAT_ICON = { video: "🎬", music: "🎵", compressed: "🗜",
                    program: "📦", document: "📄", other: "" };
@@ -106,6 +111,105 @@ function checksumOk(s) {
 /* '2:00' -> '02:00' (type=time yalniz iki basamakli saati kabul eder) */
 const hm = (s) => (/^\d:/.test(s || "") ? "0" + s : (s || ""));
 
+/* ------------------------------------------------------------- grafikler */
+/* Grafikler yalniz yeni tarama verisi geldiginde yeniden cizilir; araya
+ * animasyon/gecis konmaz, boylece azaltilmis hareket tercihine uyar. */
+const cssColor = (() => {
+  const cache = {};
+  return (name) => {
+    if (!cache[name]) {
+      cache[name] = getComputedStyle(document.documentElement)
+        .getPropertyValue(name).trim() || "#0ea5e9";
+    }
+    return cache[name];
+  };
+})();
+
+/* canvas'i aygit piksel oranina gore olceklendirir (HiDPI) */
+function fitCanvas(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(cv.clientWidth || cv.width || 1));
+  const h = Math.max(1, Math.round(cv.clientHeight || cv.height || 1));
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr);
+    cv.height = Math.round(h * dpr);
+  }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h };
+}
+
+/* values eski -> yeni; sabit HIST_MAX penceresi saga yaslanir. Donus: tepe */
+function drawLine(cv, values, color, area) {
+  const { ctx, w, h } = fitCanvas(cv);
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = cssColor("--line");
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, h - 0.5);
+  ctx.lineTo(w, h - 0.5);
+  ctx.stroke();
+  const peak = values.length ? Math.max(...values) : 0;
+  if (values.length < 2) return peak;
+  const top = Math.max(1, peak);
+  const step = w / Math.max(1, HIST_MAX - 1);
+  const x0 = w - (values.length - 1) * step;
+  const px = (i) => x0 + i * step;
+  const py = (i) => h - 1 - (values[i] / top) * (h - 3);
+  ctx.beginPath();
+  ctx.moveTo(px(0), py(0));
+  for (let i = 1; i < values.length; i++) ctx.lineTo(px(i), py(i));
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.stroke();
+  if (area) {
+    ctx.lineTo(px(values.length - 1), h - 1);
+    ctx.lineTo(px(0), h - 1);
+    ctx.closePath();
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  return peak;
+}
+
+function pushHist(arr, v) {
+  arr.push(v);
+  if (arr.length > HIST_MAX) arr.shift();
+}
+
+/* her basarili taramada ornek alir; kaybolan islerin gecmisi silinir */
+function sampleHistory() {
+  let conns = 0;
+  const live = new Set();
+  for (const j of jobs) {
+    live.add(j.id);
+    conns += j.segments || 0;
+    const h = jobHist.get(j.id) || [];
+    pushHist(h, j.speed || 0);
+    jobHist.set(j.id, h);
+  }
+  for (const id of jobHist.keys()) if (!live.has(id)) jobHist.delete(id);
+  pushHist(histSpeed, Number(lastStats.total_speed) || 0);
+  pushHist(histConn, conns);
+}
+
+function updateGraphs() {
+  const curSpeed = histSpeed.length ? histSpeed[histSpeed.length - 1] : 0;
+  const curConn = histConn.length ? histConn[histConn.length - 1] : 0;
+  const peakSpeed = drawLine($("#speedGraph"), histSpeed, cssColor("--acc"), true);
+  const peakConn = drawLine($("#connGraph"), histConn, cssColor("--ok"), true);
+  $("#graphSpeedNow").textContent = rate(curSpeed);
+  $("#graphConnNow").textContent = String(curConn);
+  $("#speedGraph").setAttribute("aria-label", trf("graph_speed_a11y",
+    { cur: rate(curSpeed), peak: rate(peakSpeed), sec: HIST_SEC }));
+  $("#connGraph").setAttribute("aria-label", trf("graph_conn_a11y",
+    { cur: curConn, peak: peakConn, sec: HIST_SEC }));
+}
+
 async function api(path, body) {
   const opt = { headers: { "X-FerDim-Token": TOKEN } };
   if (body !== undefined) { opt.method = "POST"; opt.body = JSON.stringify(body); }
@@ -128,11 +232,18 @@ function say(text) {       // ekran okuyucuya duyuru (is bitti / hata)
 }
 
 /* ------------------------------------------------------------------ satir */
+/* motor hatasi: kararli kod varsa cevirisi, yoksa ham (Turkce) metin */
+function errText(code, fallback) {
+  const k = code ? "err_" + code : "";
+  return k && T[k] !== undefined ? T[k] : (fallback || "");
+}
+
 function notesFor(j) {
   const out = [];
   if (j.adaptive && j.adaptive < j.segments_cfg)
     out.push(["info", "⚙ " + trf("adaptive_limit", j.adaptive)]);
-  if (j.state === "error" && j.error) out.push(["bad", "⚠ " + j.error]);
+  if (j.state === "error" && (j.error || j.error_code))
+    out.push(["bad", "⚠ " + errText(j.error_code, j.error)]);
   if (j.sched_wait && j.window)
     out.push(["info", "⏱ " + trf("sched_wait", { w: j.window })]);
   if (j.sources_dead > 0)
@@ -151,6 +262,9 @@ function buildRow(j) {
                                 "aria-label": tr(key), title: tr(key), text: glyph });
     btn[kind].onclick = () => act(kind, j.id);
   }
+  const speedVal = dom("span");
+  const spark = dom("canvas", { class: "spark", role: "img", width: "64",
+                               height: "16", "aria-label": tr("spark_a11y") });
   const r = {
     id: j.id, sig: "", btn,
     cat: dom("span", { class: "cat" }),
@@ -160,7 +274,8 @@ function buildRow(j) {
     fill: dom("i"),
     plabel: dom("span", { class: "plabel" }),
     size: dom("div", { class: "c-size", role: "cell" }),
-    speed: dom("div", { class: "c-speed", role: "cell" }),
+    speedVal, spark,
+    speed: dom("div", { class: "c-speed", role: "cell" }, speedVal, spark),
     eta: dom("div", { class: "c-eta", role: "cell" }),
   };
   r.bar = dom("div", { class: "bar", role: "progressbar",
@@ -210,8 +325,14 @@ function updateRow(r, j) {
 
   const playing = j.state === "downloading" || j.state === "connecting";
   r.size.textContent = human(j.done) + " / " + human(j.size);
-  r.speed.textContent = playing ? rate(j.speed) : "";
+  r.speedVal.textContent = playing ? rate(j.speed) : "";
   r.eta.textContent = playing ? eta(j.eta) : "";
+  r.spark.hidden = !playing;    // duraklatilan/biten iste bos mini grafik kalmasin
+  if (playing) {
+    drawLine(r.spark, jobHist.get(j.id) || [], cssColor("--acc"), false);
+    r.spark.setAttribute("aria-label",
+      trf("spark_a11y", { cur: rate(j.speed) }));
+  }
   r.btn.resume.hidden =
     !["paused", "error", "queued", "canceled"].includes(j.state);
   r.btn.pause.hidden = !playing;
@@ -290,11 +411,12 @@ function announce() {
 async function poll() {
   if (polling) return;          // yanimda surmekte olan istek varsa atla
   polling = true;
+  let fresh = false;            // yalniz basarili tarama grafige ornek ekler
   const conn = $("#connState");
   try {
     const s = await api("/api/stats");
     if (s && s.ok) {
-      jobs = s.jobs || []; lastStats = s;
+      jobs = s.jobs || []; lastStats = s; fresh = true;
       conn.textContent = "● " + tr("daemon_ok"); conn.className = "conn ok";
     } else {
       conn.textContent = "● " + tr("daemon_down"); conn.className = "conn bad";
@@ -303,7 +425,8 @@ async function poll() {
     conn.textContent = "● " + tr("daemon_down"); conn.className = "conn bad";
   }
   polling = false;
-  render(); renderStatus(); announce();
+  if (fresh) sampleHistory();
+  render(); renderStatus(); announce(); updateGraphs();
 }
 
 /* ----------------------------------------------------------------- eylemler */
@@ -390,7 +513,7 @@ $("#addOk").onclick = async () => {
   const fail = (msg) => { err.textContent = msg; err.hidden = !msg; };
   fail("");
   const url = $("#addUrl").value.trim();
-  if (!/^https?:\/\/\S+$/i.test(url)) { fail(tr("err_url")); $("#addUrl").focus(); return; }
+  if (!/^(?:https?|ftps?):\/\/\S+$/i.test(url)) { fail(tr("err_url")); $("#addUrl").focus(); return; }
   const chk = $("#addChk").value.trim();
   if (chk && !checksumOk(chk)) {   // sunucu da reddeder; erken soyle
     fail(tr("cli_bad_checksum")); $("#addChk").focus(); return;

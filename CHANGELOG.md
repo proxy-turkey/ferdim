@@ -4,6 +4,64 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [Unreleased]
+
+### Added
+- Web UI speed graph: aggregate throughput and a live connection-count
+  timeline over the last two minutes, plus a per-job speed sparkline in the
+  queue. Canvas-based with no dependencies, HiDPI-aware, with textual ARIA
+  summaries; history lives in client-side ring buffers pruned when a job
+  disappears and is redrawn only on the 500 ms poll (no animation).
+- API error codes: a failed job now carries a stable machine `error_code`
+  (`not_found`, `forbidden`, `auth`, `source_changed`, `no_sources`,
+  `checksum_mismatch`, `disk`, `network`, `stall`, `size_mismatch`,
+  `incompatible`, `rate_limited`, `unknown`) next to the unchanged Turkish
+  message, so interfaces can translate it (`err_*` keys exist in all four
+  languages; the web UI and CLI use the translation and fall back to the raw
+  message). Source warnings are exposed as `warning_codes`
+  (`mirror_dead`, `checksum_mismatch`) and the per-mirror state as
+  `mirror_health` (`{url, state, code}`).
+- Background mirror probing: as soon as an HTTP job starts, every mirror is
+  probed in a background thread, so an unreachable, wrong-size or
+  range-less mirror is marked dead before a worker relies on it. The probe
+  honours pause/cancel, never probes the source that is currently serving,
+  and never fails the job by itself.
+- FTP and FTPS downloads (`ftp://`, `ftps://`) through the standard library
+  only. Credentials come from the URL userinfo (percent-decoded), the add
+  form's user/password fields, or anonymous login; transfers use passive mode,
+  obtain the size with `SIZE`, and resume an interrupted `.part` file with
+  `REST` (validated against the server's `MDTM` when available). FTPS uses
+  explicit `AUTH TLS` and an encrypted data channel (`PROT P`). Transient
+  network, stall and 4xx failures retry with backoff from the checkpointed
+  offset; permanent 5xx failures stop at once. Stall timeout, speed limits,
+  pause/resume, checksums, crash-safe resume and verification-before-DONE
+  behave exactly as for HTTP jobs. Watched URL lists and clipboard capture
+  accept both schemes.
+
+### Changed
+- GTK front-end: the add window is a plain modal `Gtk.Window` instead of
+  the deprecated dialog widget (no new dependency); Enter activates the
+  default "Download" button, Escape closes it and every field keeps its
+  mnemonic label.
+- GTK front-end: new Settings window mirroring the web UI settings —
+  downloads folder, language, connections and concurrent jobs, turbo,
+  speed limit, night schedule and per-category windows, watched folders,
+  clipboard watching, sidecar verification and advanced retries/timeouts.
+  Settings are read with `config-get` and written with `config-set`.
+
+### Fixed
+- FTP transfers no longer treat a server-aborted data stream as complete: a
+  clean data EOF must now be followed by a 2xx final reply, so a `426` (or any
+  other non-2xx) can never mark a truncated file as done — especially when the
+  server does not implement `SIZE`. Transient network, stall and 4xx failures
+  retry with jittered backoff from the checkpointed offset; permanent 5xx
+  responses fail immediately.
+- FTP URLs are now redacted in queue snapshots and mirror health (the
+  password is stripped, the user name is kept); the private `queue.json`
+  state file is written with mode `0600`. `ferdim restart` re-probes the file
+  size, and FTP size probes are capped at five seconds so a slow host cannot
+  stall the smart queue.
+
 ## [1.4.2] — 2026-11-23
 
 Bug-fix release for 1.4.1, found by an end-to-end run of the CLI against the

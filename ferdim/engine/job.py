@@ -17,13 +17,13 @@ import threading
 import time
 import urllib.error
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .. import util
 from ..paths import AppEnv
 from ..ratelimit import TokenBucket
-from . import dash, hls, httpcli
+from . import dash, ftp, hls, httpcli
 
 CHUNK = 1 << 16            # 64 KB okuma blogu
 MIN_SPLIT = 1 << 20        # 1 MB'dan kucuk aralik bolunmez
@@ -103,6 +103,43 @@ def _retry_after(err) -> float:
 class SourceInvalid(Exception):
     """Kaynak bu is icin gecersiz (farkli boyutlu ya da Range desteksiz ayna)."""
 
+    def __init__(self, msg: str, code: str = "size_mismatch"):
+        super().__init__(msg)
+        self.code = code
+
+
+_SRC_CODES = {           # kaynak basarisizlik nedeni -> kararli hata kodu
+    "gone": "not_found", "conn": "network", "stall": "stall",
+    "reset": "network", "read": "network", "http": "unknown",
+    "size": "size_mismatch",
+}
+
+
+def _code_for(e: BaseException) -> str:
+    """Arayuzlerin cevirebilmesi icin kararli hata kodu (mesaj Turkce kalir)."""
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code in (404, 410):
+            return "not_found"
+        if e.code in (401, 407):
+            return "auth"
+        if e.code in (403, 451):
+            return "forbidden"
+        if e.code == 416:
+            return "source_changed"
+        return "unknown"
+    if isinstance(e, urllib.error.URLError):
+        r = e.reason
+        return _code_for(r) if isinstance(r, BaseException) else "network"
+    if isinstance(e, (SourceInvalid, ftp.FtpError)):
+        return e.code
+    if isinstance(e, (TimeoutError, ConnectionError)):
+        return "network"
+    if isinstance(e, OSError):
+        if e.errno in util.DISK_ERRNOS:
+            return "disk"
+        return "network"
+    return "unknown"
+
 
 class _Src:
     """Bir indirme kaynaginin (birincil ya da ayna) saglik kaydi.
@@ -115,7 +152,7 @@ class _Src:
             sayisinin asinca kaynak bu is icin 'olu' sayilir
     """
     __slots__ = ("url", "primary", "cap", "active", "ema", "mass", "w", "cur",
-                 "streak", "fails", "cooldown", "dead", "reason")
+                 "streak", "fails", "cooldown", "dead", "reason", "code")
 
     def __init__(self, url: str, primary: bool, cap: int):
         self.url = url
@@ -131,6 +168,7 @@ class _Src:
         self.cooldown = 0.0
         self.dead = False
         self.reason = ""
+        self.code = ""          # arayuz icin kararli hata kodu
 
 
 class JobState:
@@ -203,6 +241,7 @@ class DownloadJob:
         self.done = 0
         self.speed = 0.0
         self.error = ""
+        self.error_code = ""
         self.kind = "http"
         self.created = time.time()
         self.final_filename = spec.filename
@@ -233,10 +272,13 @@ class DownloadJob:
         }
         self._threads: list[threading.Thread] = []
         self._monitor: threading.Thread | None = None
+        self._probe_t: threading.Thread | None = None   # ayna yoklamasi
+        self._runner: threading.Thread | None = None   # hls/dash/ftp kosucusu
         self._fd: int | None = None
         self._pending: list[tuple[int, int]] = []   # kalan araliklar
         self._etag = ""
         self._last_modified = ""
+        self._ftp_mtime = ""      # FTP MDTM: resume dogrulamasi
         self._restart_needed = False
         self._bucket = TokenBucket(spec.limit or cfg.get("speed_limit", 0))
         # Turbo: daha derin okuma blogu + daha kucuk bolme esigi = daha
@@ -314,8 +356,14 @@ class DownloadJob:
     def snapshot(self) -> dict:
         with self._lock:
             window = self._window_wait()
+            warnings = []
+            if self.extra.get("sources_dead"):
+                warnings.append("mirror_dead")
+            if self.extra.get("checksum") == "warn":
+                warnings.append("checksum_mismatch")
             return {
-                "id": self.id, "url": self.url, "state": self.state,
+                "id": self.id, "url": util.redact_url(self.url),
+                "state": self.state,
                 "filename": self.final_filename or util.filename_from_url(self.url),
                 "dir": str(self.target_dir),
                 "fullpath": str(self.final_path),
@@ -324,6 +372,8 @@ class DownloadJob:
                 "eta": ((self.total - self.done) / self.speed)
                        if self.total > 0 and self.speed > 1 else -1,
                 "kind": self.kind, "error": self.error,
+                "error_code": self.error_code,
+                "warning_codes": warnings,
                 "category": self.category,
                 "created": self.created,
                 "segments": self._active,          # canli baglanti sayisi
@@ -333,6 +383,11 @@ class DownloadJob:
                 "checksum": self.extra.get("checksum", ""),
                 "verified": list(self.extra.get("verified", [])),
                 "mirrors": len(self.spec.mirrors or []),
+                "mirror_health": [
+                    {"url": util.redact_url(s.url),
+                     "state": "dead" if s.dead else "ok",
+                     "code": s.code if s.dead else ""}
+                    for s in self._srcs if not s.primary],
                 "sources_dead": sum(1 for s in self._srcs if s.dead),
                 "window": window,
                 "sched_wait": bool(window),
@@ -350,23 +405,35 @@ class DownloadJob:
                 return
             self._stop.clear()
             self.error = ""
+            self.error_code = ""
             self.state = JobState.CONNECTING
             self._reset_sources()
         self._changed()
         try:
             self._prepare()
         except Exception as e:
-            self._fail(_describe_error(e))
+            self._fail(_describe_error(e), _code_for(e))
             return
         self.state = JobState.DOWNLOADING
         self._changed()
+        if self.kind == "http":
+            self._start_mirror_probe()
         self._spawn()
 
     def _prepare(self):
         opt = self.spec.options(self.cfg)
         self.target_dir.mkdir(parents=True, exist_ok=True)
-        # HLS / DASH manifest mi?
+        # HLS / DASH manifest mi? (FTP semasi once gelir: ftp://...m3u8
+        # bir FTP dosyasidir, manifest degil)
         resume_meta = util.read_json(self.meta_path) or {}
+        if self.kind == "ftp" or ftp.is_ftp(self.url) or \
+           resume_meta.get("kind") == "ftp":
+            self.kind = "ftp"
+            if not self.final_filename:
+                self.final_filename = util.filename_from_url(self.url)
+            self._meta = resume_meta
+            self._prepare_ftp()
+            return
         if self.kind == "hls" or httpcli.is_hls(self.url, "") or \
            resume_meta.get("kind") == "hls":
             self.kind = "hls"
@@ -416,10 +483,10 @@ class DownloadJob:
                                  count=False)
                 else:
                     self._src_fail(src, "gone" if e.code in (404, 410)
-                                   else "http")
+                                   else "http", code=_code_for(e))
             except Exception as e:
                 last_err = e
-                self._src_fail(src, "conn")
+                self._src_fail(src, "conn", code=_code_for(e))
         if p is None:
             if last_err is None:
                 last_err = RuntimeError("indirme kaynagi kalmadi")
@@ -475,6 +542,36 @@ class DownloadJob:
             self._allowed = 1
             self._min_split = float("inf")
             self.extra["no_ranges"] = True
+
+    def _prepare_ftp(self):
+        """Tek akis FTP: boyut SIZE'dan, kaldigi yer .part boyutundan.
+        Sunucu SIZE vermezse boyut bilinmez (-1); EOF gercek sondur.
+        MDTM varsa onceki denetim noktasiyla karsilastirilir: kaynak
+        degismisse bastan indirilir (HTTP'deki If-Range karsiligi)."""
+        opt = self.spec.options(self.cfg)
+        try:
+            self._stall = max(5, min(120, int(self.cfg.get("stall_timeout", 20))))
+        except (TypeError, ValueError):
+            self._stall = 20
+        self._allowed = 1                 # FTP tek baglanti; governor yok
+        size, mtime = ftp.probe_meta(
+            self.url, timeout=max(1, int(opt.timeout)),
+            insecure=opt.insecure, stall=self._stall,
+            user=self.spec.user, password=self.spec.password)
+        self._fd = os.open(self.part_path, os.O_RDWR | os.O_CREAT, 0o644)
+        part = self.part_path.stat().st_size if self.part_path.exists() else 0
+        if size >= 0 and part > size:
+            # yerel dosya sunucudakinden buyuk: ayna/eski kalinti, bastan
+            os.ftruncate(self._fd, 0)
+            part = 0
+        old = (self._meta or {}).get("ftp_mtime")
+        if part > 0 and mtime and old and old != mtime:
+            # kaynak degismis: yarim dosya yeni icerikle karistirilamaz
+            os.ftruncate(self._fd, 0)
+            part = 0
+        self._ftp_mtime = mtime
+        self.total = size
+        self.done = part if size < 0 else min(part, size)
 
     # ---------------------------------------------------------------- workers
     def _spawn(self):
@@ -701,7 +798,8 @@ class DownloadJob:
         s.cur = 0.0
         self.extra["sources_dead"] = sum(1 for x in self._srcs if x.dead)
 
-    def _src_fail(self, s: _Src, kind: str, cooldown: bool = True) -> None:
+    def _src_fail(self, s: _Src, kind: str, cooldown: bool = True,
+                  code: str = "") -> None:
         """Kaynak basarisizligi: secim agirligi yariya iner, ardisik
         basarisizlik sayisi artar; tekrar sayisini asarsa (ya da kaynak bu
         is icin gecersizse: 'gone') kaynak bu is icin olu sayilir.
@@ -712,11 +810,21 @@ class DownloadJob:
             s.ema *= 0.5
             s.cur = 0.0
             s.reason = kind
+            s.code = code or _SRC_CODES.get(kind, "unknown")
             if kind == "gone" or s.streak > self._retries:
                 self._mark_dead_locked(s)
             elif cooldown:
                 base = min(2.0 * (2 ** (s.streak - 1)), 30.0)
                 s.cooldown = time.monotonic() + base * (0.5 + self._rand.random())
+            self._cond.notify_all()
+
+    def _src_kill(self, s: _Src, kind: str, code: str) -> None:
+        """Yoklama kesin bir sorun gordu: kaynak hemen olu isaretlenir."""
+        with self._cond:
+            s.reason = kind
+            s.code = code
+            s.fails += 1
+            self._mark_dead_locked(s)
             self._cond.notify_all()
 
     def _demote(self, s: _Src, reason: str, wait: float,
@@ -732,6 +840,7 @@ class DownloadJob:
             s.ema *= 0.5
             s.cur = 0.0
             s.reason = reason
+            s.code = "rate_limited"
             if count:
                 s.streak += 1
                 s.fails += 1
@@ -744,6 +853,7 @@ class DownloadJob:
         sagladi: basarisizlik serisi sifirlanir (ilerleyen kaynak olmez)."""
         with self._lock:
             src.streak = 0
+            src.code = ""
 
     def _src_rate(self, s: _Src, nbytes: int, secs: float) -> None:
         """Kaynagin baglanti basi hizini gunceller: bayt agirlikli ortalama
@@ -770,12 +880,90 @@ class DownloadJob:
     def _dead_reason(self) -> str:
         names = {"conn": "baglanti hatasi", "http": "HTTP hatasi",
                  "gone": "dosya yok", "stall": "akis durdu",
-                 "reset": "baglanti kesildi", "read": "okuma hatasi"}
+                 "reset": "baglanti kesildi", "read": "okuma hatasi",
+                 "size": "farkli dosya"}
         with self._lock:
             why = sorted({names.get(s.reason, s.reason)
                           for s in self._srcs if s.dead and s.reason})
         return ("tum kaynaklar erisilemiyor"
                 + (f" ({', '.join(why)})" if why else ""))
+
+    # ------------------------------------------------- arka plan ayna yoklamasi
+    def _start_mirror_probe(self):
+        """Aynalari is baslar baslamaz arka planda yoklar: erisilemeyen ya
+        da baska dosya veren ayna bir isci ona baglanmadan isaretlenir.
+        Birincil kaynak ve su an hizmet veren kaynak yoklanmaz; yoklama isi
+        asla yavaslatmaz, basarisizligi isi bitirmez. Ayni anda tek yoklama
+        calisir; kaynak listesi (kusak) kimligi yakalanir."""
+        t = self._probe_t
+        if t is not None and t.is_alive():
+            return
+        srcs = self._srcs
+        if self._stop.is_set() or not any(
+                not s.primary and not s.dead for s in srcs):
+            return
+        self._probe_t = threading.Thread(
+            target=self._probe_mirrors, args=(srcs,), daemon=True,
+            name=f"ferdim-{self.id}-probe")
+        self._probe_t.start()
+
+    def _probe_valid(self, srcs) -> bool:
+        """Yoklama hala guncel kaynak kusagina mi bakiyor? Is durdurulduysa
+        (duraklat/iptal) ya da yeni baslatma kaynak listesini degistirdiyse
+        (devam) eski kayitlara dokunulmaz."""
+        with self._lock:
+            return not self._stop.is_set() and self._srcs is srcs
+
+    def _probe_apply(self, srcs, fn, *args, **kwargs) -> None:
+        """Yoklama sonucunu kaynak kilidi altinda uygular; kosullar arada
+        degistiyse (stop / yeni kusak) sessizce vazgecer."""
+        with self._cond:
+            if self._stop.is_set() or self._srcs is not srcs:
+                return
+            fn(*args, **kwargs)
+
+    def _probe_mirrors(self, srcs=None):
+        """Aynalari sirayla yoklar (HEAD yerine 1 baytlik Range: Range
+        destegini de dogrular). Yalniz kesin kanit (404/410, ayna icin
+        401/403, Range yok, baska boyut) kaynagi hemen oldurur; diger HTTP
+        5xx, zaman asimi ve baglanti hatalari normal basarisizliktir
+        (seri + cooldown), 429/503 ise yalnizca cezadir."""
+        srcs = self._srcs if srcs is None else srcs
+        opt = replace(self.spec.options(self.cfg),
+                      timeout=min(max(int(self.cfg.get("timeout", 30)), 2), 10))
+        for s in list(srcs):
+            if not self._probe_valid(srcs):
+                return
+            if s.primary or s.dead or s.url == self._vsrc:
+                continue
+            try:
+                p = httpcli.probe(s.url, opt)
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 503):
+                    self._probe_apply(srcs, self._demote, s, f"HTTP {e.code}",
+                                      _retry_after(e), count=False)
+                elif e.code in (401, 403):
+                    self._probe_apply(srcs, self._src_kill, s, "http",
+                                      _code_for(e))
+                elif e.code in (404, 410):
+                    self._probe_apply(srcs, self._src_kill, s, "gone",
+                                      _code_for(e))
+                else:
+                    self._probe_apply(srcs, self._src_fail, s, "http",
+                                      code=_code_for(e))
+                continue
+            except Exception as e:
+                self._probe_apply(srcs, self._src_fail, s, "conn",
+                                  code=_code_for(e))
+                continue
+            if not self._probe_valid(srcs):
+                return
+            if not p.accept_ranges:
+                self._probe_apply(srcs, self._src_kill, s, "size",
+                                  "incompatible")
+            elif self.total > 0 and p.total > 0 and p.total != self.total:
+                self._probe_apply(srcs, self._src_kill, s, "size",
+                                  "size_mismatch")
 
     # ------------------------------------------------- adaptif isci havuzu
     def _acquire(self, wid: int) -> tuple[int, int] | None:
@@ -837,8 +1025,8 @@ class DownloadJob:
         return e
 
     def _worker(self, wid: int, gen: int | None = None):
-        if self.kind == "hls":
-            return  # HLS kendi havuzunu yonetir
+        if self.kind in ("hls", "ftp"):
+            return  # HLS havuzunu, FTP tek akisi kendi yonetir
         if gen is None:
             gen = self._gen
         opt = self.spec.options(self.cfg)
@@ -881,7 +1069,7 @@ class DownloadJob:
         except httpcli.RangeInvalid:
             if src.primary:
                 raise
-            raise SourceInvalid("Range desteklenmiyor") from None
+            raise SourceInvalid("Range desteklenmiyor", "incompatible") from None
         m = re.match(r"bytes\s+(\d+)-\d+(?:/(\d+|\*))?",
                      resp.headers.get("Content-Range") or "")
         if m:
@@ -893,7 +1081,7 @@ class DownloadJob:
                 resp.close()
                 if src.primary:
                     raise httpcli.RangeInvalid("Content-Range uyusmuyor")
-                raise SourceInvalid("farkli dosya (boyut/aralik)")
+                raise SourceInvalid("farkli dosya (boyut/aralik)", "size_mismatch")
         return resp
 
     def _process_range(self, rng, opt, wid: int = -1,
@@ -933,7 +1121,7 @@ class DownloadJob:
             if src is None:
                 if not self._stop.is_set() and gen == self._gen:
                     requeue()
-                    self._fail(self._dead_reason())
+                    self._fail(self._dead_reason(), "no_sources")
                 return (0.0, True)
             try:
                 resp = self._open(src, opt, cursor, e)
@@ -941,11 +1129,11 @@ class DownloadJob:
                 # ayna baska dosya veriyor / Range desteklemiyor: isi bastan
                 # baslatmak YANLIS olur (sonsuz restart dongusu); ayna elenir,
                 # kalan kaynaklar surdurur
-                self._src_fail(src, "gone")
+                self._src_fail(src, "gone", code=ex.code)
                 if self._others_alive(src):
                     continue
                 requeue()
-                self._fail(f"ayna gecersiz: {ex}")
+                self._fail(f"ayna gecersiz: {ex}", ex.code)
                 return (0.0, True)
             except httpcli.RangeInvalid:
                 # birincil kaynak degismis (If-Range 200 / 416) -> bastan indir
@@ -965,7 +1153,7 @@ class DownloadJob:
                     if limit_hits > 40 or self._limit_events > 200:
                         requeue()
                         self._fail(f"sunucu surekli limit donduruyor "
-                                   f"(HTTP {err.code})")
+                                   f"(HTTP {err.code})", "rate_limited")
                         return (0.0, True)
                     self._shrink(f"HTTP {err.code}", src)
                     requeue()
@@ -974,12 +1162,12 @@ class DownloadJob:
                 kind = "gone" if err.code in (404, 410) or (
                     not src.primary and err.code in (401, 403)) else "http"
                 if self._others_alive(src):
-                    self._src_fail(src, kind)
+                    self._src_fail(src, kind, code=_code_for(err))
                     continue
                 requeue()
-                self._src_fail(src, kind, cooldown=False)
+                self._src_fail(src, kind, cooldown=False, code=_code_for(err))
                 if fatal or attempt >= opt.retries:
-                    self._fail(_describe_error(err))
+                    self._fail(_describe_error(err), _code_for(err))
                     return (0.0, True)
                 backoff()
                 continue
@@ -989,7 +1177,7 @@ class DownloadJob:
                     if self._crowded():
                         self._demote(src, "baglanti reddedildi (limit?)", 2.0)
                     else:
-                        self._src_fail(src, "conn")
+                        self._src_fail(src, "conn", code=_code_for(ex))
                     continue
                 if self._crowded():
                     # sunucu eszamanli baglantiyi kisitliyor olabilir
@@ -997,20 +1185,20 @@ class DownloadJob:
                     requeue()
                     return (2.0, False)
                 requeue()
-                self._src_fail(src, "conn", cooldown=False)
+                self._src_fail(src, "conn", cooldown=False, code=_code_for(ex))
                 if attempt >= opt.retries:
-                    self._fail(_describe_error(ex))
+                    self._fail(_describe_error(ex), _code_for(ex))
                     return (0.0, True)
                 backoff()
                 continue
             except Exception as ex:
                 if self._others_alive(src):
-                    self._src_fail(src, "conn")
+                    self._src_fail(src, "conn", code=_code_for(ex))
                     continue
                 requeue()
-                self._src_fail(src, "conn", cooldown=False)
+                self._src_fail(src, "conn", cooldown=False, code=_code_for(ex))
                 if attempt >= opt.retries:
-                    self._fail(_describe_error(ex))
+                    self._fail(_describe_error(ex), _code_for(ex))
                     return (0.0, True)
                 backoff()
                 continue
@@ -1085,7 +1273,7 @@ class DownloadJob:
                 requeue()
                 self._src_fail(src, "stall", cooldown=False)
                 if attempt >= opt.retries:
-                    self._fail("okuma hatasi: akis durdu (zaman asimi)")
+                    self._fail("okuma hatasi: akis durdu (zaman asimi)", "stall")
                     return (0.0, True)
                 backoff()
                 continue
@@ -1096,27 +1284,29 @@ class DownloadJob:
                     if self._crowded():
                         self._demote(src, "aktarim kesildi (limit?)", 1.5)
                     else:
-                        self._src_fail(src, "reset")
+                        self._src_fail(src, "reset", code=_code_for(ex))
                     continue
                 if self._crowded():
                     self._shrink("aktarim kesildi (limit?)", src)
                     requeue()
                     return (1.5, False)
                 requeue()
-                self._src_fail(src, "reset", cooldown=False)
+                self._src_fail(src, "reset", cooldown=False, code=_code_for(ex))
                 if attempt >= opt.retries:
-                    self._fail(f"okuma hatasi: {_describe_error(ex)}")
+                    self._fail(f"okuma hatasi: {_describe_error(ex)}",
+                               _code_for(ex))
                     return (0.0, True)
                 backoff()
                 continue
             except Exception as ex:
                 if self._others_alive(src):
-                    self._src_fail(src, "read")
+                    self._src_fail(src, "read", code=_code_for(ex))
                     continue
                 requeue()
-                self._src_fail(src, "read", cooldown=False)
+                self._src_fail(src, "read", cooldown=False, code=_code_for(ex))
                 if attempt >= opt.retries:
-                    self._fail(f"okuma hatasi: {_describe_error(ex)}")
+                    self._fail(f"okuma hatasi: {_describe_error(ex)}",
+                               _code_for(ex))
                     return (0.0, True)
                 backoff()
                 continue
@@ -1175,11 +1365,29 @@ class DownloadJob:
 
     # --------------------------------------------------------------- monitor
     def _monitor_loop(self):
-        if self.kind in ("hls", "dash"):
-            runner = self._run_hls if self.kind == "hls" else self._run_dash
+        if self.kind in ("hls", "dash", "ftp"):
+            if self.kind == "hls":
+                runner = self._run_hls
+            elif self.kind == "dash":
+                runner = self._run_dash
+            else:
+                runner = self._run_ftp
+            gen = self._gen
             t = threading.Thread(target=runner, daemon=True)
             t.start()
+            self._runner = t
             t.join()
+            if self.kind == "ftp":
+                if gen != self._gen:
+                    return  # duraklat/devam: eski kosu yeni kusaga karismaz
+                if self._stop.is_set():
+                    # pause() bu noktayi bekler: nokta yazilir, durum paused
+                    self._checkpoint(force=True)
+                    with self._lock:
+                        if self.state == JobState.DOWNLOADING:
+                            self.state = JobState.PAUSED
+                    self._changed()
+                    return
             self._after_run()
             return
         while True:
@@ -1215,7 +1423,7 @@ class DownloadJob:
             self.total = self.done = int(meta.get("tail", 0))
             util.atomic_write_json(self.meta_path, meta)
         except Exception as ex:
-            self._fail(str(ex))
+            self._fail(str(ex), _code_for(ex))
 
     def _run_dash(self):
         opt = self.spec.options(self.cfg)
@@ -1236,7 +1444,82 @@ class DownloadJob:
             self.total = self.done = int(meta.get("tail", 0))
             util.atomic_write_json(self.meta_path, meta)
         except Exception as ex:
-            self._fail(str(ex))
+            self._fail(str(ex), _code_for(ex))
+
+    def _run_ftp(self):
+        """Tek akis indirme, geri cekilmeli yeniden deneme ile. Durdurma
+        geldiginde yazilan baytlar .part'ta kalir; devam REST ile olur.
+        Gecici hatalar (ag, stall, 4xx) opt.retries kez denenir; kalici
+        5xx (530/550...) hemen isi bitirir."""
+        gen = self._gen
+        opt = self.spec.options(self.cfg)
+        retries = max(0, int(opt.retries))
+        attempt = 0
+        mark = self.done          # ilerleme isareti: basarili bayt -> butce sifir
+        verify = False            # son aktarim son yanitla dogrulanmadi
+
+        def run(offset: int):
+            def prog(n):
+                with self._lock:
+                    self.done += n
+                self._maybe_checkpoint()
+
+            return ftp.download(
+                self.url, self._fd, offset, stop=self._stop,
+                bucket=self._bucket, progress=prog, stalled=self._stall,
+                insecure=opt.insecure, timeout=max(1, int(opt.timeout)),
+                halted=lambda: gen != self._gen,
+                user=self.spec.user, password=self.spec.password)
+
+        while True:
+            try:
+                if verify or not (self.total >= 0
+                                  and self.done >= self.total):
+                    try:
+                        run(self.done)
+                    except ftp.RestUnsupported:
+                        if self._stop.is_set() or gen != self._gen:
+                            return
+                        # sunucu REST bilmiyor: tek care bastan indirmek
+                        with self._lock:
+                            os.ftruncate(self._fd, 0)
+                            self.done = 0
+                        mark = 0
+                        verify = False
+                        run(0)
+                if gen != self._gen:
+                    return
+                if self._stop.is_set():
+                    return          # monitor noktayi yazar ve durumu paused yapar
+                if self.total < 0:
+                    with self._lock:
+                        self.total = self.done
+                self._checkpoint(force=True)
+                if self.total >= 0 and self.done != self.total:
+                    raise ftp.FtpError(
+                        "eksik veri" if self.done < self.total
+                        else "boyut uyusmuyor", "size_mismatch")
+                return
+            except ftp.FtpError as ex:
+                if gen != self._gen or self._stop.is_set():
+                    return
+                if self.done > mark:
+                    mark = self.done
+                    attempt = 0      # onceki deneme ilerledi: butce tazelenir
+                if not ex.transient or attempt >= retries:
+                    self._fail(str(ex), ex.code)
+                    return
+                if self.total >= 0 and self.done >= self.total:
+                    # baytlar tamam ama son yanit gelmedi: bos REST ile dogrula
+                    verify = True
+                attempt += 1
+                self._checkpoint(force=True)
+                if self._stop.wait(backoff_delay(attempt, rng=self._rand)):
+                    return
+            except Exception as ex:
+                if gen == self._gen:
+                    self._fail(_describe_error(ex), _code_for(ex))
+                return
 
     def _after_run(self):
         if self.state == JobState.ERROR:
@@ -1246,13 +1529,21 @@ class DownloadJob:
         self._finalize_file()
 
     def _join_threads(self, timeout: float) -> None:
-        """Tum iscileri ORTAK bir sure icinde bekler: her isciye ayri sure
-        degil (32 takili isci 32 x 3 sn degil, en cok 'timeout' sn)."""
+        """Tum iscileri ve hls/dash/ftp kosucusunu ORTAK bir sure icinde
+        bekler: her isciye ayri sure degil (32 takili isci 32 x 3 sn degil,
+        en cok 'timeout' sn). Kosucu de katilir; cancel fd'yi ancak bu
+        beklemeden sonra kapatir."""
         deadline = time.monotonic() + timeout
-        for t in list(self._threads):
+        cur = threading.current_thread()
+        threads = list(self._threads)
+        if self._runner is not None and self._runner is not cur:
+            threads.append(self._runner)
+        for t in threads:
             left = deadline - time.monotonic()
             if left <= 0:
                 break
+            if t.ident is None:      # henuz baslamamis: join beklemesin
+                continue
             t.join(left)
 
     def _fold_threads(self):
@@ -1278,7 +1569,8 @@ class DownloadJob:
         if self._restarts > 3:
             # kaynak surekli degisiyor (tutarsiz sunucu/yuk dengeleyici):
             # sonsuz bastan-indirme dongusune girmeyelim
-            self._fail("kaynak surekli degisiyor (tutarsiz sunucu)")
+            self._fail("kaynak surekli degisiyor (tutarsiz sunucu)",
+                       "source_changed")
             return
         self.state = JobState.DOWNLOADING
         self._changed()
@@ -1287,7 +1579,7 @@ class DownloadJob:
     def _finish(self):
         with self._lock:
             if self.total >= 0 and self.done < self.total:
-                self._fail("eksik veri")
+                self._fail("eksik veri", "size_mismatch")
                 return
         self._finalize_file()
 
@@ -1327,7 +1619,7 @@ class DownloadJob:
                 self.state = JobState.DONE
         except Exception as ex:
             self.extra.pop("verifying", None)
-            self._fail(str(ex))
+            self._fail(str(ex), _code_for(ex))
         self._changed()
 
     def _verify(self, dest: Path, found: dict | None = None) -> None:
@@ -1353,6 +1645,7 @@ class DownloadJob:
             self.error = ("saglama uyusmazi: beklenen "
                           f"{explicit[a][:12]}..., gelen "
                           f"{(got.get(a) or '')[:12]}... ({a})")
+            self.error_code = "checksum_mismatch"
             self.extra["checksum"] = "mismatch"
         elif bad_found:
             self.extra["checksum"] = "warn"
@@ -1382,12 +1675,13 @@ class DownloadJob:
                     set(self.extra.get("verified", [])) | set(got))
         self._changed()
 
-    def _fail(self, msg: str):
+    def _fail(self, msg: str, code: str = "unknown"):
         with self._lock:
             if self.state == JobState.CANCELED:
                 return
             self.state = JobState.ERROR
             self.error = msg
+            self.error_code = code
             self.speed = 0
         self._stop.set()  # diger iscalar kalan araliklari katlasin
         with self._cond:
@@ -1406,6 +1700,13 @@ class DownloadJob:
         m = self._monitor
         if m is not None and m is not threading.current_thread():
             m.join(timeout=8.0)
+        if self.kind == "ftp" and self.state == JobState.DOWNLOADING:
+            # FTP tek akis: 8 sn icinde donmemis olabilir (yavas baglanti);
+            # akis dur sinyalini gorur ve yazmaz, nokta burada tamamlanir.
+            self._checkpoint(force=True)
+            with self._lock:
+                if self.state == JobState.DOWNLOADING:
+                    self.state = JobState.PAUSED
         self._changed()
 
     def resume(self):
@@ -1459,6 +1760,7 @@ class DownloadJob:
                 "kind": self.kind,
                 "allowed": self._allowed,
                 "validator_src": self._vsrc,
+                "ftp_mtime": self._ftp_mtime,
             })
 
     def update_speed(self):

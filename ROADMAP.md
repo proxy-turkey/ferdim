@@ -38,18 +38,18 @@ Shipped in **1.4.1** (2026-11-23):
       migration spike to stay ahead of MV2 deprecation.
 - [ ] More locales: German, French, Portuguese (Brazil), Arabic —
       community-reviewed.
-- [ ] FTP/FTPS downloads via stdlib `ftplib`.
+- [x] FTP/FTPS downloads via stdlib `ftplib`.
 - [ ] SOCKS5 proxy support as an optional pure-Python extra
       (engine default remains stdlib-only).
-- [ ] Web UI speed graph (per-job and aggregate) and a live
+- [x] Web UI speed graph (per-job and aggregate) and a live
       connection-count timeline; canvas-based, no dependencies.
 - [ ] Queue history in SQLite: search, re-download, aggregate
       statistics (bytes served, average link counts per host).
-- [ ] Carried over from 1.4.1: probe mirrors in the background (not only
+- [x] Carried over from 1.4.1: probe mirrors in the background (not only
       when a worker first needs them) so an unreachable mirror is reported
       before it slows anything down; error codes in the API so the UIs can
       translate engine messages (the engine's own strings are Turkish).
-- [ ] GTK front-end: migrate the add dialog from the deprecated
+- [x] GTK front-end: migrate the add dialog from the deprecated
       `Gtk.Dialog` to `AdwDialog` / `Gtk.AlertDialog` and add a settings
       window on par with the web UI.
 

@@ -246,7 +246,8 @@ def handle(ctx, cmd: str, params: dict) -> dict:
                 "filename": job.final_filename}
     if cmd == "add":
         url = params.get("url", "")
-        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        if not isinstance(url, str) or not url.startswith(
+                ("http://", "https://", "ftp://", "ftps://")):
             return {"ok": False, "error": "gecersiz URL"}
         if _bad_checksum(params):
             return {"ok": False, "error": "gecersiz saglama degeri"}

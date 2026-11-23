@@ -69,6 +69,16 @@ select:disabled,input:disabled{opacity:.5}
   font:inherit;font-size:12px;cursor:pointer;padding:6px 10px;border-radius:8px}
 .tabs .mini:hover{background:var(--panel2);color:var(--text)}
 
+/* ---------------------------------------------------------------- grafikler */
+.graphs{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
+.graphs figure{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:7px 10px 8px;min-width:0}
+.graphs figcaption{display:flex;justify-content:space-between;gap:8px;font-size:12px;
+  color:var(--dim);margin-bottom:4px}
+.graphs .gval{color:var(--acc);font-variant-numeric:tabular-nums;font-weight:600}
+.graphs figure:last-child .gval{color:var(--ok-text)}
+.graphs canvas{display:block;width:100%;height:54px}
+
 /* -------------------------------------------------------------------- tablo */
 main{flex:1;overflow:auto;padding:10px 16px}
 .table{min-width:880px}
@@ -101,6 +111,7 @@ main{flex:1;overflow:auto;padding:10px 16px}
   overflow:hidden;text-overflow:ellipsis}
 .c-size,.c-speed,.c-eta{font-variant-numeric:tabular-nums;font-size:13px;
   white-space:nowrap}
+.c-speed .spark{display:block;width:64px;height:16px;margin-top:2px}
 .c-act{text-align:right;white-space:nowrap}
 .act{background:transparent;border:0;color:var(--dim);cursor:pointer;font-size:15px;
   padding:4px 7px;border-radius:6px}
@@ -149,6 +160,7 @@ dialog select,dialog textarea{width:100%;margin-top:4px}
 .adv summary{cursor:pointer;font-size:13px;color:var(--dim);padding:4px 0}
 
 @media (max-width: 840px){
+  .graphs{grid-template-columns:1fr}
   .table{min-width:0}
   .row{grid-template-columns:minmax(126px,1fr) minmax(110px,1fr) 100px 80px 52px 132px;
     gap:8px;padding:8px 6px}

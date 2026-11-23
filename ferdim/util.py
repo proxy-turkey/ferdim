@@ -1,6 +1,7 @@
 """Dosya adi, kategori ve bicimlendirme yardimcilari."""
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -8,6 +9,10 @@ import time
 import unicodedata
 from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
+
+# disk kaynakli OSError'lar: API'de "disk" kodu, yeniden denemek anlamsiz
+DISK_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EACCES,
+                         errno.EROFS, errno.ENAMETOOLONG})
 
 CATEGORIES = {
     "video": ".mp4 .mkv .webm .flv .avi .mov .wmv .mpg .mpeg .ts .m4v .3gp",
@@ -72,8 +77,29 @@ def unique_path(directory: Path, name: str) -> Path:
 
 
 def atomic_write_json(path: Path, obj) -> None:
+    """Atomik JSON yazimi. Gecici dosya 0600 ile acilir: is/kuyruk
+    dosyalari kimlik bilgisi tasiyan URL'ler icerebilir, dosya izinleri
+    umask'tan bagimsiz olarak kullaniciya ozel kalsin."""
+    data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False), "utf-8")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        fd = os.open(tmp, flags, 0o600)
+    except FileExistsError:
+        # onceki cokme/eski surumden kalan gecici dosya: temizle ve dene
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        fd = os.open(tmp, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            fd = -1
+            f.write(data)
+    finally:
+        if fd >= 0:
+            os.close(fd)
     tmp.replace(path)
 
 
@@ -231,6 +257,33 @@ def url_sibling(url: str, suffix: str) -> str:
     ('/a/f.iso?x=1' + '.sha256' -> '/a/f.iso.sha256?x=1')."""
     parts = urlsplit(url)
     return urlunsplit(parts._replace(path=parts.path + suffix))
+
+
+def redact_url(url: str) -> str:
+    """Sifre iceren URL'leri arayuzlere sizdirmadan gosterir:
+    'ftp://kullanici:gizli@host/a' -> 'ftp://kullanici@host/a'.
+    Sifre yoksa URL aynen doner; ic kayit (spec.url) degismez."""
+    try:
+        parts = urlsplit(url)
+        password = parts.password
+    except ValueError:
+        return re.sub(r"(://[^/@:]+):[^/@]*@", r"\1@", url)
+    if password is None:
+        return url
+    host = parts.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"                 # IPv6
+    netloc = f"{parts.username}@{host}" if parts.username else host
+    try:
+        port = parts.port
+    except ValueError:
+        # bozuk port: sifreyi yine de gizle, portu at
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query,
+                           parts.fragment))
+    if port is not None:
+        netloc += f":{port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query,
+                       parts.fragment))
 
 
 def _hm(s) -> int:

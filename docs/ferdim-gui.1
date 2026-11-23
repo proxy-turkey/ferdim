@@ -3,10 +3,15 @@
 ferdim-gui \- GTK 4 front-end for the FerDim download manager
 .SH DESCRIPTION
 Desktop application showing the FerDim download queue with per-job controls
-and a maximum-power toggle. The add dialog accepts a URL, optional mirrors,
-an optional checksum and a "start immediately" switch; icon-only buttons
-carry accessible names and labels are keyboard mnemonics, so the window is
-fully usable with a screen reader. Talks to the
+and a maximum-power toggle. The add window accepts a URL, optional mirrors,
+an optional checksum and a "start immediately" switch; it is modal, Enter
+activates the default "Download" button and Escape closes it. A settings
+window mirrors the web UI: downloads folder, language, connections and
+concurrent jobs, turbo, speed limit, night schedule and per-category
+windows, watched folders, clipboard watching, sidecar verification and
+advanced retries/timeouts. Icon-only buttons carry accessible names and
+labels are keyboard mnemonics, so the window is fully usable with a screen
+reader. Talks to the
 .BR ferdim (1)
 daemon over its local socket and starts it on demand. Requires
 python3-gobject.

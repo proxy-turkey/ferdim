@@ -810,7 +810,8 @@ class QueueRoadmapTests(unittest.TestCase):
                 "// yorum\nftp://c/z\nhttp://a/x.iso\n"
                 "aria2c -x8 https://d/w(v).zip)\nhttps://e/end.")
         self.assertEqual(parse_url_list(text), [
-            "http://a/x.iso", "https://b/y.iso", "https://d/w(v).zip", "https://e/end"])
+            "http://a/x.iso", "https://b/y.iso", "ftp://c/z",
+            "https://d/w(v).zip", "https://e/end"])
         self.assertEqual(len(parse_url_list("\n".join(f"http://x/{i}" for i in range(50)),
                                             limit=10)), 10)
 

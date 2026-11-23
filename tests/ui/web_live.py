@@ -104,6 +104,14 @@ with sync_playwright() as p:
     check("satirlar role=row + hucreler",
           q('#jobList [role="row"]') == 5 and q('#jobList [role="cell"]') == 30)
     check("ilerleme cubuklari progressbar", q('[role="progressbar"]') == 5)
+    check("hiz/baglanti grafigi canvaslari cizilir", page.evaluate("""() =>
+          [document.querySelector('#speedGraph'), document.querySelector('#connGraph')]
+            .every(c => c && c.getBoundingClientRect().width > 100
+                     && c.getBoundingClientRect().height >= 40
+                     && c.width >= c.getBoundingClientRect().width)"""))
+    check("grafik aria-label degeri tasir", page.evaluate(
+        """() => /[0-9]/.test(document.querySelector('#speedGraph')
+             .getAttribute('aria-label') || '')"""))
     check("simge dugmelerinin adi var",
           page.evaluate("""() => [...document.querySelectorAll('#jobList .act')]
              .filter(b => !b.hidden && !(b.getAttribute('aria-label') || '').trim()).length""") == 0)
@@ -180,6 +188,8 @@ with sync_playwright() as p:
     while time.monotonic() - t0 < 10 and "/sn" not in rowx.inner_text():
         page.wait_for_timeout(150)
     check(" hiz gosterilir", "/sn" in rowx.inner_text(), rowx.inner_text())
+    check(" is basina mini grafik", rowx.locator("canvas.spark").is_visible()
+          and rowx.locator("canvas.spark").get_attribute("aria-label"))
     t0 = time.monotonic()
     while time.monotonic() - t0 < 10 and "kaynak erişilemez" not in rowx.inner_text() \
             and jobs().get("dosya.iso", {}).get("state") == "downloading":
@@ -202,10 +212,10 @@ with sync_playwright() as p:
     page.click("#addBtn")
     check(" ekleme kapanisi acilir", page.evaluate("document.querySelector('#addDlg').open"))
     check(" odak adres alaninda", page.evaluate("document.activeElement.id") == "addUrl")
-    page.fill("#addUrl", "ftp://x/y")
+    page.fill("#addUrl", "gopher://x/y")
     page.click("#addOk")
     check(" gecersiz adres hatasi", page.is_visible("#addError")
-          and page.inner_text("#addError") == "Geçerli bir http:// ya da https:// adresi girin.")
+          and page.inner_text("#addError") == "Geçerli bir http(s):// ya da ftp(s):// adresi girin.")
     page.fill("#addUrl", f"{SRV}/sarki.mp3")
     page.fill("#addChk", "zzz")
     page.click("#addOk")

@@ -36,7 +36,7 @@ class ClipboardWatcher:
         return ""
 
     def _interesting(self, url: str) -> bool:
-        if not url.startswith(("http://", "https://")):
+        if not url.startswith(("http://", "https://", "ftp://", "ftps://")):
             return False
         exts = [e.strip().lower() for e in
                 (self.cfg.get("clipboard_extensions") or "").split()]

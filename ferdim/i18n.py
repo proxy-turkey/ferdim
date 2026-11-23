@@ -51,6 +51,20 @@ S = {
     "unlimited":     {"en": "Unlimited", "tr": "Sınırsız", "es": "Sin límite", "ru": "Без ограничений"},
     "total_speed":   {"en": "Total speed", "tr": "Toplam hız", "es": "Velocidad total", "ru": "Общая скорость"},
     "active_jobs":   {"en": "Active", "tr": "Eşzamanlı", "es": "Activas", "ru": "Активных"},
+    # ---------------------------------------------------------------- grafikler
+    "graph_title":   {"en": "Speed and connection graphs", "tr": "Hız ve bağlantı grafikleri", "es": "Gráficas de velocidad y conexiones", "ru": "Графики скорости и соединений"},
+    "graph_conn":    {"en": "Connections", "tr": "Bağlantılar", "es": "Conexiones", "ru": "Соединения"},
+    "graph_speed_a11y": {
+        "en": "Throughput over the last {sec} s: now {cur}, peak {peak}",
+        "tr": "Son {sec} sn hız grafiği: şu an {cur}, tepe {peak}",
+        "es": "Rendimiento en los últimos {sec} s: ahora {cur}, máximo {peak}",
+        "ru": "Скорость за последние {sec} с: сейчас {cur}, пик {peak}"},
+    "graph_conn_a11y": {
+        "en": "Open connections over the last {sec} s: now {cur}, peak {peak}",
+        "tr": "Son {sec} sn bağlantı grafiği: şu an {cur}, tepe {peak}",
+        "es": "Conexiones abiertas en los últimos {sec} s: ahora {cur}, máximo {peak}",
+        "ru": "Открытые соединения за последние {sec} с: сейчас {cur}, пик {peak}"},
+    "spark_a11y":    {"en": "Recent speed: {cur}", "tr": "Son hız: {cur}", "es": "Velocidad reciente: {cur}", "ru": "Недавняя скорость: {cur}"},
     "folder_label":  {"en": "FOLDER", "tr": "KLASÖR", "es": "CARPETA", "ru": "ПАПКА"},
     "sched_active":  {"en": "schedule window active", "tr": "zamanlama penceresi aktif", "es": "ventana de horario activa", "ru": "окно расписания активно"},
     # ----------------------------------------------------------------- sekmeler
@@ -160,7 +174,7 @@ S = {
     "win_start":      {"en": "window start", "tr": "pencere başlangıcı", "es": "inicio de ventana", "ru": "начало окна"},
     "win_stop":       {"en": "window end", "tr": "pencere bitişi", "es": "fin de ventana", "ru": "конец окна"},
     "per_sec":        {"en": "/s", "tr": "/sn", "es": "/s", "ru": "/с"},
-    "err_url":        {"en": "Enter a valid http:// or https:// address.", "tr": "Geçerli bir http:// ya da https:// adresi girin.", "es": "Introduce una dirección http:// o https:// válida.", "ru": "Введите корректный адрес http:// или https://."},
+    "err_url":        {"en": "Enter a valid http(s):// or ftp(s):// address.", "tr": "Geçerli bir http(s):// ya da ftp(s):// adresi girin.", "es": "Introduce una dirección http(s):// o ftp(s):// válida.", "ru": "Введите корректный адрес http(s):// или ftp(s)://."},
     "ext_state":      {"en": "Add-on", "tr": "Eklenti", "es": "Extensión", "ru": "Расширение"},
     "add_failed":     {"en": "Could not add:", "tr": "Eklenemedi:", "es": "No se pudo añadir:", "ru": "Не удалось добавить:"},
     "warn_dir":       {"en": "Downloads folder could not be created; the default folder is used.", "tr": "İndirme dizini oluşturulamadı; varsayılan dizin kullanılıyor.", "es": "No se pudo crear la carpeta de descargas; se usa la carpeta predeterminada.", "ru": "Не удалось создать папку загрузок; используется папка по умолчанию."},
@@ -174,6 +188,103 @@ S = {
     # ------------------------------------------------- 1.5: hiz grafigi (B)
     # ------------------------------------------------- 1.5: gecmis (C)
     # ------------------------------------------------- 1.5: gtk (D)
+    # ------------------------------------------------- GTK ayar penceresi (1.5)
+    "lang_auto": {
+        "en": "Auto (system)",
+        "tr": "Otomatik (sistem)",
+        "es": "Automático (sistema)",
+        "ru": "Авто (система)"},
+    "err_time": {
+        "en": "Enter times as HH:MM.",
+        "tr": "Saatleri SS:DD biçiminde girin.",
+        "es": "Introduce las horas como HH:MM.",
+        "ru": "Введите время в формате ЧЧ:ММ."},
+    "lang_restart": {
+        "en": "The language applies to new windows; restart FerDim to refresh every label.",
+        "tr": "Dil yeni pencerelerde geçerli; tüm etiketler için FerDim'i yeniden başlatın.",
+        "es": "El idioma se aplica a las ventanas nuevas; reinicia FerDim para actualizar todas las etiquetas.",
+        "ru": "Язык применяется к новым окнам; перезапустите FerDim, чтобы обновить все подписи."},
+    "lbl_clipboard": {
+        "en": "Watch the clipboard for download links",
+        "tr": "Panoyu indirme bağlantıları için izle",
+        "es": "Vigilar el portapapeles en busca de enlaces de descarga",
+        "ru": "Следить за буфером обмена на ссылки для скачивания"},
+    "save_failed": {
+        "en": "Settings could not be saved:",
+        "tr": "Ayarlar kaydedilemedi:",
+        "es": "No se pudieron guardar los ajustes:",
+        "ru": "Не удалось сохранить настройки:"},
+    # ------------------------------------------- kararli hata kodlari (API)
+    "err_not_found": {
+        "en": "the file was not found on the server",
+        "tr": "dosya sunucuda bulunamadı",
+        "es": "el archivo no se encontró en el servidor",
+        "ru": "файл не найден на сервере"},
+    "err_forbidden": {
+        "en": "the server denied access to the file",
+        "tr": "sunucu dosyaya erişimi engelledi",
+        "es": "el servidor denegó el acceso al archivo",
+        "ru": "сервер запретил доступ к файлу"},
+    "err_auth": {
+        "en": "the server requires authentication",
+        "tr": "sunucu kimlik doğrulama istiyor",
+        "es": "el servidor requiere autenticación",
+        "ru": "сервер требует аутентификации"},
+    "err_source_changed": {
+        "en": "the server keeps changing the file (inconsistent server)",
+        "tr": "kaynak sürekli değişiyor (tutarsız sunucu)",
+        "es": "el servidor cambia el archivo continuamente (servidor inconsistente)",
+        "ru": "сервер постоянно меняет файл (несогласованный сервер)"},
+    "err_no_sources": {
+        "en": "all sources are unreachable",
+        "tr": "tüm kaynaklar erişilemiyor",
+        "es": "no se puede acceder a ningún origen",
+        "ru": "все источники недоступны"},
+    "err_checksum_mismatch": {
+        "en": "checksum mismatch: the file does not match the expected digest",
+        "tr": "sağlama uyuşmadı: dosya beklenen özetle eşleşmiyor",
+        "es": "la suma no coincide: el archivo no coincide con la suma esperada",
+        "ru": "контрольная сумма не совпала: файл не соответствует ожидаемому хешу"},
+    "err_disk": {
+        "en": "could not write the file to disk (space or permissions)",
+        "tr": "dosya diske yazılamadı (alan ya da izin)",
+        "es": "no se pudo escribir el archivo en disco (espacio o permisos)",
+        "ru": "не удалось записать файл на диск (место или права)"},
+    "err_network": {
+        "en": "could not reach the server (network error)",
+        "tr": "sunucuya ulaşılamadı (ağ hatası)",
+        "es": "no se pudo acceder al servidor (error de red)",
+        "ru": "не удалось связаться с сервером (сетевая ошибка)"},
+    "err_stall": {
+        "en": "the transfer stalled (no data for too long)",
+        "tr": "aktarım durdu (uzun süre veri gelmedi)",
+        "es": "la transferencia se detuvo (sin datos demasiado tiempo)",
+        "ru": "передача остановилась (данные долго не поступали)"},
+    "err_size_mismatch": {
+        "en": "the source serves a file of a different size",
+        "tr": "kaynak farklı boyutta bir dosya veriyor",
+        "es": "el origen sirve un archivo de otro tamaño",
+        "ru": "источник отдаёт файл другого размера"},
+    "err_incompatible": {
+        "en": "the source does not support resumable (range) requests",
+        "tr": "kaynak aralıklı (Range) istekleri desteklemiyor",
+        "es": "el origen no admite peticiones por rangos",
+        "ru": "источник не поддерживает запросы диапазонами"},
+    "err_rate_limited": {
+        "en": "the server keeps rate-limiting the download",
+        "tr": "sunucu indirmeyi sürekli sınırlıyor",
+        "es": "el servidor limita la descarga continuamente",
+        "ru": "сервер постоянно ограничивает загрузку"},
+    "err_mirror_dead": {
+        "en": "one or more mirrors are unavailable",
+        "tr": "bir ya da daha çok ayna erişilemez",
+        "es": "uno o más espejos no están disponibles",
+        "ru": "один или несколько зеркал недоступны"},
+    "err_unknown": {
+        "en": "the download failed (unknown reason)",
+        "tr": "indirme başarısız oldu (bilinmeyen neden)",
+        "es": "la descarga falló (motivo desconocido)",
+        "ru": "загрузка не удалась (неизвестная причина)"},
 }
 
 
@@ -211,3 +322,12 @@ def t(key: str, lang: str | None = None, **kw) -> str:
 def dict_for(lang: str) -> dict:
     lang = lang if lang in LANGS else "tr"
     return {k: (v.get(lang) or v.get("en") or k) for k, v in S.items()}
+
+
+def error_text(code: str, fallback: str = "", lang: str | None = None) -> str:
+    """Arayuzler icin: kararli hata/warning kodu varsa cevirisi, yoksa
+    motorun ham (Turkce) mesaji. Sozlukte olmayan kod ham metne duser."""
+    key = f"err_{code}" if code else ""
+    if key and key in S:
+        return t(key, lang)
+    return fallback

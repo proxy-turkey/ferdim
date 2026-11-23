@@ -8,7 +8,7 @@ import time
 
 from . import __version__, util
 from .client import FerdimClient, ensure_daemon
-from .i18n import detect_lang, t as _
+from .i18n import detect_lang, error_text, t as _
 from .paths import AppEnv
 
 
@@ -107,7 +107,8 @@ def _wait(c, job_id):
         sys.stdout.flush()
         if job["state"] in ("done", "error", "canceled", "paused"):
             if job["state"] == "error":
-                print(_("st_error") + ":", job["error"])
+                print(_("st_error") + ":",
+                      error_text(job.get("error_code", ""), job.get("error", "")))
             print(_("cli_file") + ":", job["fullpath"] if job["state"] == "done" else "-")
             return 0 if job["state"] == "done" else 1
 
