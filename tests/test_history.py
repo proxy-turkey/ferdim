@@ -36,13 +36,15 @@ def wait_state(job, states, timeout=25):
 def make_job(env, cfg, jid, *, url="https://example.org/dosya.iso",
              filename="dosya.iso", state=JobState.DONE, size=1000, done=None,
              links=(2, 4), created_ago=12.0, error_code="", checksum="ok",
-             **spec_kw):
+             active_ago=None, **spec_kw):
     spec = JobSpec(url=url, filename=filename, **spec_kw)
     job = DownloadJob(env, cfg, spec, job_id=jid)
     job.state = state
     job.total = size
     job.done = size if done is None else done
     job.created = time.time() - created_ago
+    # aktif sure (gecmis 'duration'): varsayilan created_ago kadar
+    job._active_secs = float(created_ago if active_ago is None else active_ago)
     job.error_code = error_code
     job.extra["checksum"] = checksum
     job._links_sum, job._links_peak = links
@@ -134,9 +136,12 @@ class SchemaTests(HistoryBase):
 class RecordTests(HistoryBase):
     def test_04_record_fields_and_redaction(self):
         url = "ftp://kullanici:gizli@ftp.example.com/arsiv.zip"
+        # 60 sn once olusturuldu ama yalniz 12 sn AKTIF kaldi: kuyrukta
+        # bekleme/duraklama 'sure' alanina girmemeli
         job = make_job(self.env, self.cfg, "f1", url=url, filename="arsiv.zip",
                        state=JobState.CANCELED, size=500, done=120,
-                       links=(3, 6), error_code="")
+                       links=(3, 6), error_code="", created_ago=60.0,
+                       active_ago=12.0)
         self.hist.record(job)
         found = self.hist.search("arsiv")
         row = found["items"][0]
@@ -152,6 +157,33 @@ class RecordTests(HistoryBase):
         # opts (yalniz sunucu ici) sifreyi yeniden indirme icin tasir
         rec = self.hist.get("f1")
         self.assertEqual(rec["opts"].get("password"), "gizli")
+
+    def test_04b_duration_counts_only_active_time(self):
+        """'sure' = connecting/downloading saniyeleri; kuyrukta bekleme ve
+        duraklama eklenmez (eski hesap bitis-olusturma idi)."""
+        job = make_job(self.env, self.cfg, "d1", created_ago=100.0,
+                       active_ago=0.0)
+        job.state = JobState.CONNECTING
+        job._active_mark -= 21.0          # 21 sn aktif kaldi
+        job.state = JobState.PAUSED       # sayac burada durur
+        self.assertAlmostEqual(job.active_seconds(), 21.0, delta=0.2)
+        job.state = JobState.PAUSED       # duraklamada gecen sure eklenmez
+        self.assertAlmostEqual(job.active_seconds(), 21.0, delta=0.2)
+        job.state = JobState.DONE
+        self.hist.record(job)
+        row = self.hist.get("d1")
+        self.assertAlmostEqual(row["duration"], 21.0, delta=0.3)
+
+    def test_04c_finished_job_keeps_active_time(self):
+        """Is bitince (done) sayac durur; sonradan gecen sure eklenmez."""
+        job = make_job(self.env, self.cfg, "d2", created_ago=10.0,
+                       active_ago=0.0)
+        job.state = JobState.DOWNLOADING
+        job._active_mark -= 3.0
+        job.state = JobState.DONE
+        got = job.active_seconds()
+        self.assertAlmostEqual(got, 3.0, delta=0.2)
+        self.assertAlmostEqual(job.active_seconds(), got, delta=0.05)
 
     def test_05_error_and_checksum_recorded(self):
         job = make_job(self.env, self.cfg, "e1", state=JobState.ERROR,
@@ -293,6 +325,7 @@ class QueueRecordTests(unittest.TestCase):
         self.assertEqual(row["host"], "127.0.0.1")
         self.assertIn(row["checksum"], ("", "ok"))
         self.assertGreaterEqual(row["peak_links"], 0)
+        self.assertGreater(row["duration"], 0, "aktif sure kaydedilmeli")
         self.assertNotIn("password", json.dumps(row, ensure_ascii=False))
 
     def test_14_error_job_is_recorded(self):
@@ -381,6 +414,27 @@ class QueueRecordTests(unittest.TestCase):
         found = api.handle(self.ctx, "history", {"state": "done"})
         self.assertTrue(found["ok"])
         self.assertEqual([i["filename"] for i in found["items"]], ["tiny.bin"])
+
+    def test_18b_active_time_survives_queue_restart(self):
+        """Aktif sure queue.json'a yazilir: daemon yeniden baslayinca onceki
+        turlarin connecting/downloading saniyeleri kaybolmaz."""
+        self.qm.shutdown()                  # bu test kendi kuyrugunu kurar
+        qm = QueueManager(self.env, self.cfg)
+        try:
+            job = qm.add(JobSpec(url="https://ornek.example/x.iso"))
+            job.state = JobState.DOWNLOADING
+            job._active_mark -= 7.0
+            job.state = JobState.PAUSED
+            qm._save()
+        finally:
+            qm.shutdown()
+        qm2 = QueueManager(self.env, self.cfg)
+        try:
+            got = [j for j in qm2.jobs if j.id == job.id][0]
+            self.assertEqual(got.state, JobState.PAUSED)
+            self.assertAlmostEqual(got.active_seconds(), 7.0, delta=0.2)
+        finally:
+            qm2.shutdown()
 
 
 class CliTests(unittest.TestCase):

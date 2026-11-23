@@ -282,6 +282,9 @@ class QueueManager:
                 "proxy": j.spec.proxy, "insecure": j.spec.insecure,
                 "referer": j.spec.referer, "ua": j.spec.user_agent,
                 "kind": j.kind, "state": j.state, "created": j.created,
+                # gecmis 'sure' alani aktif saniyeleri tasir: daemon yeniden
+                # baslarsa onceki turlarin suresi kaybolmaz
+                "active": round(j.active_seconds(), 2),
                 # aynalar, saglamalar ve is hiz limiti daemon yeniden
                 # baslasa da kaybolmasin
                 "mirrors": list(j.spec.mirrors or []),
@@ -318,6 +321,7 @@ class QueueManager:
             job = DownloadJob(self.env, self.cfg, spec, job_id=item.get("id"))
             job.kind = item.get("kind", "http")
             job.created = item.get("created", time.time())
+            job._active_secs = max(0.0, float(item.get("active", 0) or 0))
             st = item.get("state")
             if st in (JobState.DONE,):
                 # dosya yerinde mi?

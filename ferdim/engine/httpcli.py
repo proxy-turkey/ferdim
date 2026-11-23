@@ -98,7 +98,9 @@ class FastHTTPHandler(urllib.request.HTTPHandler):
 
 class FastHTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, req):
-        return self.do_open(FastHTTPSConnection, req)
+        # baglam verilmezse --insecure/verify_tls=false sessizce yok sayilir
+        return self.do_open(FastHTTPSConnection, req,
+                            context=self._context)
 
 
 class RangeInvalid(Exception):

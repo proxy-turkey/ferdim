@@ -814,7 +814,7 @@ class QueueRoadmapTests(unittest.TestCase):
     def test_06_parse_url_list(self):
         text = ("# y\n\nhttp://a/x.iso\nhttps://b/y.iso, \n; yorum\n"
                 "// yorum\nftp://c/z\nhttp://a/x.iso\n"
-                "aria2c -x8 https://d/w(v).zip)\nhttps://e/end.")
+                "dl -x8 https://d/w(v).zip)\nhttps://e/end.")
         self.assertEqual(parse_url_list(text), [
             "http://a/x.iso", "https://b/y.iso", "ftp://c/z",
             "https://d/w(v).zip", "https://e/end"])

@@ -243,7 +243,12 @@ class DownloadJob:
         self.cfg = cfg
         self.spec = spec
         self.id = job_id or uuid.uuid4().hex[:10]
-        self.state = JobState.QUEUED
+        # kilit ve durum sayaci 'state' ozelliginden ONCE kurulur
+        self._lock = threading.RLock()
+        self._cond = threading.Condition(self._lock)
+        self._state = JobState.QUEUED
+        self._active_secs = 0.0       # connecting+downloading toplam saniye
+        self._active_mark: float | None = None
         self.on_change = on_change or (lambda job: None)
 
         self.url = spec.url
@@ -256,8 +261,6 @@ class DownloadJob:
         self.created = time.time()
         self.final_filename = spec.filename
 
-        self._lock = threading.RLock()
-        self._cond = threading.Condition(self._lock)
         self._stop = threading.Event()
         # start() penceresi: _prepare + monitor yayini bitene kadar temiz.
         # pause()/cancel() bunu bekler; yoksa monitor henuz yayinlanmamisken
@@ -324,6 +327,33 @@ class DownloadJob:
         self._rand = random.Random()
         self._limit_mark = 0       # limit sayacini sifirlayan ilerleme isareti
         self._reset_sources()
+
+    # ----------------------------------------------------------------- durum
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @state.setter
+    def state(self, value: str) -> None:
+        """Durum gecisi aktif sureyi biriktirir. Gecmis istatistigindeki
+        'sure' yalniz connecting/downloading saniyeleridir: kuyrukta bekleme
+        ve duraklama sayilmaz (eski kayit bitisten olusturulma zamanini
+        cikariyordu, duraklatilan is oldugundan uzun gorunuyordu)."""
+        now = time.monotonic()
+        with self._lock:
+            if self._active_mark is not None:
+                self._active_secs += max(0.0, now - self._active_mark)
+                self._active_mark = None
+            if value in (JobState.CONNECTING, JobState.DOWNLOADING):
+                self._active_mark = now
+            self._state = value
+
+    def active_seconds(self, now: float | None = None) -> float:
+        """Aktif gecen toplam sure (suren dilim dahil)."""
+        mark = self._active_mark
+        if mark is None:
+            return self._active_secs
+        return self._active_secs + max(0.0, (now or time.monotonic()) - mark)
 
     # ------------------------------------------------------------------ path
     @property
@@ -476,9 +506,20 @@ class DownloadJob:
             self._checkpoint(force=True)
         self._changed()
 
+    def _close_fd(self) -> None:
+        """Acik .part taniticiyi kapatir. Her hazirlik ONCE kapatir: duraklat
+        /devam dongusunde her turda bir fd acikta kaliyordu (sizinti)."""
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
     def _prepare(self):
         opt = self.spec.options(self.cfg)
         self.target_dir.mkdir(parents=True, exist_ok=True)
+        self._close_fd()             # onceki kosudan acik kalan fd kapatilir
         # HLS / DASH manifest mi? (FTP semasi once gelir: ftp://...m3u8
         # bir FTP dosyasidir, manifest degil)
         resume_meta = util.read_json(self.meta_path) or {}
@@ -1446,17 +1487,19 @@ class DownloadJob:
             t.start()
             self._runner = t
             t.join()
-            if self.kind == "ftp":
-                if gen != self._gen:
-                    return  # duraklat/devam: eski kosu yeni kusaga karismaz
-                if self._stop.is_set():
-                    # pause() bu noktayi bekler: nokta yazilir, durum paused
-                    self._checkpoint(force=True)
-                    with self._lock:
-                        if self.state == JobState.DOWNLOADING:
-                            self.state = JobState.PAUSED
-                    self._changed()
-                    return
+            if gen != self._gen:
+                return  # duraklat/devam: eski kosu yeni kusaga karismaz
+            if self._stop.is_set():
+                # duraklat/iptal: nokta yazilir, durum 'paused'. Tek akisli
+                # aile (ftp/hls/dash) icin ORTAK sozlesme: eskiden yalniz ftp
+                # katlaniyordu, hls/dash 'downloading' kaliyordu ve resume()
+                # no-op oluyordu.
+                self._checkpoint(force=True)
+                with self._lock:
+                    if self.state == JobState.DOWNLOADING:
+                        self.state = JobState.PAUSED
+                self._changed()
+                return
             self._after_run()
             return
         while True:
@@ -1489,8 +1532,11 @@ class DownloadJob:
             hls.download_hls(self.url, opt, self._fd, meta, self._stop,
                              self._bucket, prog, self.extra,
                              meta_path=self.meta_path)
-            self.total = self.done = int(meta.get("tail", 0))
-            util.atomic_write_json(self.meta_path, meta)
+            # duraklatma/iptal sonrasi 'tail' yarim dosyanin sonudur: toplami
+            # ona esitlemek isi 'eksik veri' ya da erken 'done' yapardi
+            if not self._stop.is_set():
+                self.total = self.done = int(meta.get("tail", 0))
+                util.atomic_write_json(self.meta_path, meta)
         except Exception as ex:
             self._fail(str(ex), _code_for(ex))
 
@@ -1510,8 +1556,9 @@ class DownloadJob:
             hls.segments.assemble(opt, self._fd, meta, self._stop,
                                   self._bucket, prog, self.meta_path,
                                   init_url, seg_urls)
-            self.total = self.done = int(meta.get("tail", 0))
-            util.atomic_write_json(self.meta_path, meta)
+            if not self._stop.is_set():
+                self.total = self.done = int(meta.get("tail", 0))
+                util.atomic_write_json(self.meta_path, meta)
         except Exception as ex:
             self._fail(str(ex), _code_for(ex))
 
@@ -1779,6 +1826,17 @@ class DownloadJob:
             if self._monitor is m:
                 return
 
+    def _run_ended(self) -> bool:
+        """Kosu gercekten bitti mi: monitor olu, canli isci yok, kosucu yok.
+        HLS/DASH/FTP akislarinda isci listesi bostur; kosucu ayri izlenir."""
+        m = self._monitor
+        if m is not None and m.is_alive():
+            return False
+        r = self._runner
+        if r is not None and r.is_alive():
+            return False
+        return not any(t.is_alive() for t in list(self._threads))
+
     def pause(self):
         """Durdurur ve (en cok ~8 sn) havuzun kapanmasini bekler: komut
         dondugunde kalan araliklar kuyruktadir, denetim noktasi
@@ -1788,10 +1846,11 @@ class DownloadJob:
         gelen duraklatma, isi 'downloading' durumda birakmaz (eskiden monitor
         henuz yayinlanmadigi icin olu/None monitor join edilip donuluyordu).
         """
-        self._stop.set()
         with self._cond:
+            # dur sinyali AYNI kilit altinda kurulur: start() _stop'u kilit
+            # altinda temizledigi icin araya giren bir pause kaybolmaz
+            self._stop.set()
             self._cond.notify_all()       # park etmis iscalar uyansin
-        with self._lock:
             queued = self.state == JobState.QUEUED
             if queued:
                 # zamanlayicinin baslatmasini bekle: start(queued_only=True)
@@ -1800,9 +1859,11 @@ class DownloadJob:
             self._changed()
             return
         self._await_run(time.monotonic() + 8.0)
-        if self.kind == "ftp" and self.state == JobState.DOWNLOADING:
-            # FTP tek akis: 8 sn icinde donmemis olabilir (yavas baglanti);
-            # akis dur sinyalini gorur ve yazmaz, nokta burada tamamlanir.
+        # Kosu gercekten bittiyse durum 'paused' olmali. HLS/DASH/FTP'de
+        # monitor durunca durum 'downloading' kaliyordu (isci listesi bos,
+        # kosucu ayri izlenir) ve resume() no-op oluyordu: duraklatma
+        # etkisiz gorunuyordu.
+        if self.state == JobState.DOWNLOADING and self._run_ended():
             self._checkpoint(force=True)
             with self._lock:
                 if self.state == JobState.DOWNLOADING:
@@ -1814,19 +1875,14 @@ class DownloadJob:
             self.start()
 
     def cancel(self, delete_files: bool = False):
-        self._stop.set()
         with self._cond:
+            self._stop.set()
             self._cond.notify_all()
         # fd ancak start() penceresi ve monitor kapandiktan sonra kapatilir:
         # yoksa baslatma ortasindaki isciler kapali fd'ye yazardi.
         self._await_run(time.monotonic() + 5.0)
         self._join_threads(2.0)
-        try:
-            if self._fd is not None:
-                os.close(self._fd)
-                self._fd = None
-        except Exception:
-            pass
+        self._close_fd()
         with self._lock:
             self.state = JobState.CANCELED
         self.meta_path.unlink(missing_ok=True)
@@ -1845,7 +1901,9 @@ class DownloadJob:
         if not force and now - self._last_checkpoint < CHECKPOINT_INTERVAL:
             return
         self._last_checkpoint = now
-        if self.kind == "hls" or self._fd is None:
+        # hls/dash meta dosyasi segment ilerlemesini tasir (segments.py
+        # yazar); aralik bicimli bir nokta onu ezerdi
+        if self.kind in ("hls", "dash") or self._fd is None:
             return
         with self._lock:
             util.atomic_write_json(self.meta_path, {

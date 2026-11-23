@@ -396,5 +396,83 @@ class SocksTests(unittest.TestCase):
         self.assertIn("SOCKS5", job.error)
 
 
+    def test_11_ftp_proxy_auth_failure_fails_fast(self):
+        """Gecit kimlik dogrulamasi FTP'de de kalicidir: is tek denemede
+        'auth' koduyla biter (HTTP ile ayni; geri cekilme butcesi yakilmaz)."""
+        ftp = FtpServer({"/dosya.bin": FTP_DATA})
+        self.addCleanup(ftp.close)
+        srv = self.proxy(user="u", password="p")
+        cfg = dict(self.cfg)
+        cfg["retries"] = 5                     # terminal hata yine tek deneme
+        job = self._job(f"{ftp.base}/dosya.bin",
+                        srv.url(user="u", password="yanlis"), cfg=cfg)
+        t0 = time.monotonic()
+        job.start()
+        self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR), 60),
+                        f"suren durum: {job.state} {job.error}")
+        dt = time.monotonic() - t0
+        self.assertEqual(job.state, JobState.ERROR)
+        self.assertEqual(job.error_code, "auth", job.error)
+        self.assertIn("SOCKS5", job.error)
+        self.assertLess(dt, 5.0, f"auth hatasi {dt:.1f} sn surdu (tekrar var)")
+        self.assertEqual(len(srv.auths), 1, "tek kimlik denemesi olmali")
+
+    def test_12_ftp_proxy_denied_fails_fast(self):
+        """Gecit CONNECT'i reddederse FTP isi 'forbidden' ile hemen biter."""
+        ftp = FtpServer({"/dosya.bin": FTP_DATA})
+        self.addCleanup(ftp.close)
+        srv = self.proxy(deny=True)
+        cfg = dict(self.cfg)
+        cfg["retries"] = 5
+        job = self._job(f"{ftp.base}/dosya.bin", srv.url(), cfg=cfg)
+        t0 = time.monotonic()
+        job.start()
+        self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR), 60),
+                        f"suren durum: {job.state} {job.error}")
+        dt = time.monotonic() - t0
+        self.assertEqual(job.state, JobState.ERROR)
+        self.assertEqual(job.error_code, "forbidden", job.error)
+        self.assertLess(dt, 5.0, f"forbidden {dt:.1f} sn surdu (tekrar var)")
+        self.assertEqual(len(srv.requests), 1, "tek CONNECT denemesi olmali")
+
+    def test_13_fast_https_handler_passes_insecure_context(self):
+        """--insecure/verify_tls=false: FastHTTPSHandler TLS baglamini
+        baglantiya gecirmeli. Eskiden https_open baglami yok sayiyordu,
+        sertifika dogrulamasi sessizce acik kaliyordu."""
+        import ssl
+
+        def captured(insecure: bool):
+            opt = httpcli.DlOptions(insecure=insecure)
+            for handler in httpcli._make_opener(opt).handlers:
+                if isinstance(handler, httpcli.FastHTTPSHandler):
+                    break
+            else:
+                self.fail("opener'da FastHTTPSHandler yok")
+            seen = {}
+
+            def spy(_self, http_class, req, **kw):
+                seen["class"] = http_class
+                seen["context"] = kw.get("context")
+                raise RuntimeError("yakalandi")
+
+            with mock.patch.object(type(handler), "do_open", spy):
+                with self.assertRaises(RuntimeError):
+                    handler.https_open(httpcli.urllib.request.Request(
+                        "https://ornek.test/x.bin"))
+            return seen, handler
+
+        seen, handler = captured(True)
+        self.assertIs(seen["class"], httpcli.FastHTTPSConnection)
+        ctx = seen["context"]
+        self.assertIs(ctx, handler._context, "TLS baglami gecirilmedi")
+        self.assertFalse(ctx.check_hostname)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_NONE)
+        # dogrulama acikken: handler'in kendi (dogrulayan) baglami gecer
+        seen, handler = captured(False)
+        self.assertIs(seen["context"], handler._context)
+        self.assertTrue(seen["context"].check_hostname)
+        self.assertEqual(seen["context"].verify_mode, ssl.CERT_REQUIRED)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -138,6 +138,12 @@ def _row(job) -> tuple:
     if done > 0:
         peak_links = max(peak_links, 1)
     extra = getattr(job, "extra", None) or {}
+    # sure: yalniz AKTIF saniyeler (connecting/downloading). Kuyrukta bekleme
+    # ve duraklama sayilmaz; eski hesap (bitis - olusturma) duraklatilan isi
+    # oldugundan cok uzun gosteriyordu.
+    active = getattr(job, "active_seconds", None)
+    duration = float(active()) if callable(active) \
+        else max(0.0, finished - created)
     return (
         str(getattr(job, "id", "")),
         url,
@@ -145,7 +151,7 @@ def _row(job) -> tuple:
         host_of(url),
         max(0, size),
         done,
-        max(0.0, finished - created),
+        duration,
         round(avg_links, 2),
         peak_links,
         str(getattr(job, "state", "")),
