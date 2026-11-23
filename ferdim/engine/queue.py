@@ -362,7 +362,7 @@ class QueueManager:
                         size = _ftp.probe_size(
                             url, timeout=min(max(1, int(opt.timeout)), 5),
                             insecure=opt.insecure, user=cand.spec.user,
-                            password=cand.spec.password)
+                            password=cand.spec.password, proxy=opt.proxy)
                         if size > 0:
                             with cand._lock:
                                 if cand.state == JobState.QUEUED:

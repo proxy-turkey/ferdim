@@ -42,6 +42,7 @@ front-ends: CLI, web UI, and GTK 4.
 | **HLS assembler** | Picks the best variant, fetches segments in parallel (1–8 workers), assembles in order, resumes per segment. |
 | **DASH (MPD)** | Selects the best representation by resolution/bandwidth, resolves SegmentTemplate (`$Number$`/`$Time$`/SegmentTimeline) and SegmentList, then drives the same parallel-segment pipeline. |
 | **FTP / FTPS** | Single-stream downloads over `ftplib`: credentials from the URL, the add form or anonymous; passive mode; `SIZE` for progress/ETA and `REST` for resuming a partial `.part` after a pause or crash, validated with the server's `MDTM` when offered. Transient failures retry from the last checkpoint. `ftps://` negotiates explicit TLS with an encrypted data channel. The same stall timeout, speed limit, checksum and verification rules apply. |
+| **Proxies** | `--proxy` accepts `http(s)://` and `socks5://` / `socks5h://` (RFC 1928 with optional RFC 1929 username/password). SOCKS5 is pure stdlib: each connection gets its own tunnel, TLS keeps its SNI and verification against the target host, and stall detection still runs per read. `socks5h://` leaves DNS to the proxy (no local leak); FTP/FTPS control **and** passive data connections share the same tunnel. Proxy passwords never appear in job snapshots or error messages. |
 | **Mirrors & metalink** | Repeatable `--mirror` URLs are blended into one job; `.metalink` / `.meta4` documents expand into queued files with preference-sorted mirrors and checksums. |
 | **Source health** | Work is balanced across the primary URL and mirrors by measured per-connection throughput (smooth weighted round-robin). A source that fails, stalls (no data for `stall_timeout` s) or serves a different file (`Content-Range` is checked on every response) is demoted, and the interrupted byte range **continues from another source** — one dead mirror never fails a job. Retries back off exponentially with jitter. |
 | **Integrity** | Per-job `--sha256` / `--md5` / `--sha1` / `--sha512` / `--checksum algo:digest`, all computed in one pass. Checksum sidecar files next to the URL (`.sha256`, `.md5`, …) are discovered automatically. Verification completes **before** a job is reported as finished; an explicit mismatch fails the job while keeping the data for inspection. |
@@ -51,7 +52,7 @@ front-ends: CLI, web UI, and GTK 4.
 
 Also included: queue with concurrency limits and a night-window scheduler,
 watched folders, global + per-job speed limits, clipboard watching (event-driven on Wayland),
-proxy and Basic-Auth support, custom headers/cookies/referer/UA passthrough
+HTTP and SOCKS5 proxy support, Basic-Auth, custom headers/cookies/referer/UA passthrough
 from the browser extension, ZIP preview from the queue view, and graceful
 single-stream fallback for servers without byte ranges.
 
@@ -60,7 +61,9 @@ downloaded; site-specific scraping is out of scope (generic media sniffing
 only); `blob:` URLs are not reachable from outside the browser; FTP/FTPS is
 single-stream (no segmentation or mirror blending) and its resume checks the
 server's `MDTM` only when the server offers it — otherwise a remote file
-replaced with the same size cannot be detected.
+replaced with the same size cannot be detected; SOCKS5 proxies carry TCP
+transfers only, and FTP over SOCKS5 requires passive mode (active mode
+cannot traverse a CONNECT tunnel).
 
 ## Installation
 
@@ -153,6 +156,8 @@ ferdim add https://example.com/distro.iso --checksum sha512:<digest> \
         --mirror https://mirror1.example.org/distro.iso --mirror https://mirror2.example.org/distro.iso
 ferdim add @liste.txt                           # queue every URL in a file
 ferdim add ftp://example.org/pub/distro.iso --wait       # FTP or ftps:// (anonymous or user:pass in URL)
+ferdim add https://example.com/big.iso --proxy socks5h://user:pass@127.0.0.1:1080
+                                                        # HTTP(S)/FTP(S) through a SOCKS5 proxy
 ferdim config --set '{"language":"ru"}'
 ferdim config --set '{"watch_dirs":["~/İndirilenler/ferdim-kuyruk"]}'   # auto-queue dropped lists
 ```

@@ -4,6 +4,24 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [Unreleased]
+
+### Added
+- SOCKS5 proxy support (`--proxy socks5://…` and `socks5h://…`) in pure
+  standard-library Python — no extra package, so it ships by default while
+  the engine keeps its stdlib-only rule. RFC 1928 CONNECT plus optional
+  RFC 1929 username/password; credentials may come from the proxy URL
+  (percent-decoded). `socks5h://` sends the hostname to the proxy so DNS
+  does not leak locally, `socks5://` resolves it first. Each HTTP(S)
+  connection opens its own tunnel; TLS keeps SNI and certificate
+  verification against the target host, and per-read stall detection still
+  applies inside the tunnel. FTP and FTPS route both the control connection
+  and passive data connections through the same tunnel (active FTP is not
+  possible over SOCKS and is rejected with a clear message). A proxy
+  authentication or permission failure fails the job at once with the
+  stable `auth` / `forbidden` error code instead of burning retries, and
+  proxy passwords never appear in snapshots, logs or error messages.
+
 ## [1.5.0] — 2026-11-24
 
 First 1.5 release; it also ships the 1.4.2 fixes below (1.4.2 was never

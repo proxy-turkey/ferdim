@@ -23,7 +23,7 @@ from pathlib import Path
 from .. import util
 from ..paths import AppEnv
 from ..ratelimit import TokenBucket
-from . import dash, ftp, hls, httpcli
+from . import dash, ftp, hls, httpcli, socks
 
 CHUNK = 1 << 16            # 64 KB okuma blogu
 MIN_SPLIT = 1 << 20        # 1 MB'dan kucuk aralik bolunmez
@@ -69,9 +69,11 @@ def _describe_error(e: BaseException) -> str:
     if isinstance(e, (TimeoutError, ConnectionError)):
         return "baglanti zaman asimi" if isinstance(e, TimeoutError) else \
             f"sunucuya baglanilamadi: {e.strerror or e}"
+    if isinstance(e, socks.SocksError):
+        return str(e)
     if isinstance(e, urllib.error.URLError):
         r = e.reason
-        if isinstance(r, (TimeoutError, ConnectionError)):
+        if isinstance(r, (TimeoutError, ConnectionError, socks.SocksError)):
             return _describe_error(r)
         import ssl
         if isinstance(r, ssl.SSLError):
@@ -130,7 +132,7 @@ def _code_for(e: BaseException) -> str:
     if isinstance(e, urllib.error.URLError):
         r = e.reason
         return _code_for(r) if isinstance(r, BaseException) else "network"
-    if isinstance(e, (SourceInvalid, ftp.FtpError)):
+    if isinstance(e, (SourceInvalid, ftp.FtpError, socks.SocksError)):
         return e.code
     if isinstance(e, (TimeoutError, ConnectionError)):
         return "network"
@@ -139,6 +141,14 @@ def _code_for(e: BaseException) -> str:
             return "disk"
         return "network"
     return "unknown"
+
+
+def _socks_auth_error(e: BaseException) -> bool:
+    """Gecit kimlik/izin hatasi kalicidir: parola degismedikce tekrar
+    denemek yalnizca geri cekilme gecikmesi ekler."""
+    if isinstance(e, urllib.error.URLError):
+        e = e.reason
+    return isinstance(e, socks.SocksError) and e.code in ("auth", "forbidden")
 
 
 class _Src:
@@ -486,7 +496,10 @@ class DownloadJob:
                                    else "http", code=_code_for(e))
             except Exception as e:
                 last_err = e
-                self._src_fail(src, "conn", code=_code_for(e))
+                if _socks_auth_error(e):
+                    self._src_kill(src, "conn", _code_for(e))
+                else:
+                    self._src_fail(src, "conn", code=_code_for(e))
         if p is None:
             if last_err is None:
                 last_err = RuntimeError("indirme kaynagi kalmadi")
@@ -557,7 +570,8 @@ class DownloadJob:
         size, mtime = ftp.probe_meta(
             self.url, timeout=max(1, int(opt.timeout)),
             insecure=opt.insecure, stall=self._stall,
-            user=self.spec.user, password=self.spec.password)
+            user=self.spec.user, password=self.spec.password,
+            proxy=opt.proxy)
         self._fd = os.open(self.part_path, os.O_RDWR | os.O_CREAT, 0o644)
         part = self.part_path.stat().st_size if self.part_path.exists() else 0
         if size >= 0 and part > size:
@@ -1196,6 +1210,11 @@ class DownloadJob:
                     self._src_fail(src, "conn", code=_code_for(ex))
                     continue
                 requeue()
+                if _socks_auth_error(ex):
+                    self._src_fail(src, "gone", cooldown=False,
+                                   code=_code_for(ex))
+                    self._fail(_describe_error(ex), _code_for(ex))
+                    return (0.0, True)
                 self._src_fail(src, "conn", cooldown=False, code=_code_for(ex))
                 if attempt >= opt.retries:
                     self._fail(_describe_error(ex), _code_for(ex))
@@ -1469,7 +1488,8 @@ class DownloadJob:
                 bucket=self._bucket, progress=prog, stalled=self._stall,
                 insecure=opt.insecure, timeout=max(1, int(opt.timeout)),
                 halted=lambda: gen != self._gen,
-                user=self.spec.user, password=self.spec.password)
+                user=self.spec.user, password=self.spec.password,
+                proxy=opt.proxy)
 
         while True:
             try:

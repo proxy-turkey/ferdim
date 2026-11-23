@@ -199,7 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-r", "--referer", help="Referer")
     sp.add_argument("-u", "--user", help="HTTP kullanicisi")
     sp.add_argument("-p", "--password", help="HTTP sifresi")
-    sp.add_argument("--proxy", help="proxy URL")
+    sp.add_argument("--proxy", help="proxy URL (http, https, socks5, socks5h)")
     sp.add_argument("--limit", help="is basina hiz limiti (orn 2MB)")
     sp.add_argument("-k", "--insecure", action="store_true",
                     help="TLS sertifikasi dogrulama")
