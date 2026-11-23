@@ -310,6 +310,8 @@ class SocksTests(unittest.TestCase):
 
         class Ctx:
             seen = ""
+            check_hostname = True            # 3.11 HTTPSConnection okur
+            verify_mode = 2                  # ssl.CERT_REQUIRED
 
             def wrap_socket(self, sock, server_hostname=None):
                 Ctx.seen = server_hostname

@@ -170,8 +170,9 @@ def _make_opener(opt: DlOptions):
         else:
             # cevre degiskenlerindeki proxy'yi koru (urllib varsayilani)
             handlers.append(urllib.request.ProxyHandler())
-        handlers.append(FastHTTPSHandler(
-            context=_tls_context(True) if opt.insecure else None))
+        # baglam her zaman acik verilir: 3.11'de context=None varsayilan
+        # baglam uretmez (3.13+ uretir), iki yol ayni davranmali
+        handlers.append(FastHTTPSHandler(context=_tls_context(opt.insecure)))
         handlers.append(FastHTTPHandler())
     return urllib.request.build_opener(*handlers)
 

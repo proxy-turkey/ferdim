@@ -25,3 +25,4 @@ state/
 .vscode/
 *.swp
 .DS_Store
+extension/.amo-upload-uuid
