@@ -17,6 +17,8 @@ BuildRequires:  desktop-file-utils
 %if 0%{?suse_version}
 # OBS: ikon dizinlerinin sahibi derleme kokunde olmali
 BuildRequires:  hicolor-icon-theme
+# python3-base sqlite3 icermez (gecmis veritabani)
+BuildRequires:  python3
 %endif
 Requires:       python3 >= 3.9
 Requires:       hicolor-icon-theme
