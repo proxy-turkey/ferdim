@@ -65,7 +65,7 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(wait_state(job, (JobState.PAUSED,)), "pause olmadi")
         mid = job.done
         self.assertGreater(mid, 0)
-        time.sleep(1.0)
+        # pause senkron: komut dondugunde ilerleme DURMUS olmali (beklemeden)
         self.assertEqual(job.done, mid, "pause sonrasi ilerleme var!")
         job.resume()
         self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR)),
