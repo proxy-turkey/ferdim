@@ -33,7 +33,8 @@ Shipped in **1.4.1** (2026-11-23):
       `dnf copr enable` as the one-liner install.
 - [ ] Official Fedora package submission completed (sponsor found;
       `docs/fedora-submission.md` has the template).
-- [ ] openSUSE OBS and Arch AUR community packages.
+- [ ] openSUSE OBS and Arch AUR community packages. (OBS done:
+      `home:proxy-turkey/ferdim`; AUR pending an AUR account SSH key.)
 - [ ] Extension published on AMO (signed) with an update URL; MV3
       migration spike to stay ahead of MV2 deprecation.
 - [ ] More locales: German, French, Portuguese (Brazil), Arabic —

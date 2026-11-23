@@ -33,7 +33,7 @@ jobs:
           spec_ver=$(awk '/^Version:/{print $2}' packaging/ferdim.spec)
           test "$ver" = "$spec_ver" || { echo "tag $TAG != spec $spec_ver"; exit 1; }
           mkdir -p ~/rpmbuild/SOURCES ~/rpmbuild/SPECS
-          curl -fsSL -o ~/rpmbuild/SOURCES/"$TAG".tar.gz \
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o ~/rpmbuild/SOURCES/"$TAG".tar.gz \
             "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/$TAG.tar.gz"
           cp packaging/ferdim.spec ~/rpmbuild/SPECS/
           rpmbuild -bs ~/rpmbuild/SPECS/ferdim.spec

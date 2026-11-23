@@ -6,6 +6,10 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to submit (e.g. v1.5.1)"
+        required: true
 
 permissions:
   contents: read
@@ -13,8 +17,13 @@ permissions:
 jobs:
   sign:
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      WEB_EXT: web-ext@10.8.0
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -22,15 +31,15 @@ jobs:
         run: |
           set -euo pipefail
           mver=$(python3 -c "import json;print(json.load(open('extension/manifest.json'))['version'])")
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            test "${GITHUB_REF_NAME#v}" = "$mver" || { echo "tag ${GITHUB_REF_NAME} != manifest $mver"; exit 1; }
-          fi
+          pver=$(python3 -c "import ferdim;print(ferdim.__version__)")
+          test "${TAG#v}" = "$mver" || { echo "tag $TAG != manifest $mver"; exit 1; }
+          test "$mver" = "$pver" || { echo "manifest $mver != package $pver"; exit 1; }
       - name: Lint
-        run: npx -y web-ext lint --source-dir extension --warnings-as-errors
+        run: npx -y "$WEB_EXT" lint --source-dir extension --warnings-as-errors
       - name: Submit to AMO
         env:
           WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
           WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
         run: >
-          npx -y web-ext sign --source-dir extension --artifacts-dir dist
+          npx -y "$WEB_EXT" sign --source-dir extension --artifacts-dir dist
           --channel listed --approval-timeout 0
