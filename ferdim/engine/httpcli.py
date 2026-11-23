@@ -145,8 +145,13 @@ def probe(url: str, opt: DlOptions) -> ProbeResult:
 
 
 def open_range(url: str, opt: DlOptions, start: int, end: int,
-               etag: str = "", last_modified: str = ""):
-    """Tek Range baglantisi acar. 200 donerse RangeInvalid firlatir."""
+               etag: str = "", last_modified: str = "",
+               timeout: int | None = None):
+    """Tek Range baglantisi acar. 200 donerse RangeInvalid firlatir.
+
+    timeout hem baglanti kurulumuna hem her okumaya uygulanir; veri
+    akisi bu sure boyunca durursa okuma TimeoutError ile kesilir (stall).
+    """
     opener = _make_opener(opt)
     h = opt.base_headers()
     h["Range"] = f"bytes={start}-{end}"
@@ -154,7 +159,7 @@ def open_range(url: str, opt: DlOptions, start: int, end: int,
         h["If-Range"] = etag or last_modified
     req = urllib.request.Request(url, headers=h)
     try:
-        resp = opener.open(req, timeout=opt.timeout)
+        resp = opener.open(req, timeout=timeout or opt.timeout)
     except urllib.error.HTTPError as e:
         if e.code == 416:
             raise RangeInvalid("416") from e
@@ -167,6 +172,22 @@ def open_range(url: str, opt: DlOptions, start: int, end: int,
 
 def request_of(url: str, opt: DlOptions) -> urllib.request.Request:
     return urllib.request.Request(url, headers=opt.base_headers())
+
+
+def fetch_small(url: str, opt: DlOptions, timeout: float = 8.0,
+                limit: int = 65536, allow_html: bool = False) -> str:
+    """Kucuk bir metin kaynagi ceker (saglama yan dosyasi vb.). HTML sayfa
+    (yumusak 404) ya da limitin uzerinde govde reddedilir; allow_html yalniz
+    yanlis Content-Type ile servis edilen belgeler icin."""
+    opener = _make_opener(opt)
+    with opener.open(request_of(url, opt), timeout=timeout) as r:
+        if not allow_html and \
+                "html" in (r.headers.get("Content-Type") or "").lower():
+            raise ValueError("html yanit")
+        data = r.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("govde cok buyuk")
+        return data.decode("utf-8", "replace")
 
 
 def is_hls(url: str, content_type: str) -> bool:

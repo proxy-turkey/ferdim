@@ -1,6 +1,6 @@
 """Metalink / .meta4 (RFC 5854/6249) ayristirici.
 
-Amaç: tek dosyaya ait URL listesi + saglama degerini JobSpec'e cevirmek.
+Amac: tek dosyaya ait URL listesi + saglama degerini JobSpec'e cevirmek.
 """
 from __future__ import annotations
 
@@ -34,29 +34,33 @@ def parse(text: str) -> list[dict]:
         if size_el and (size_el[0].text or "").strip().isdigit():
             size = int(size_el[0].text.strip())
         urls = []
-        sha256 = md5 = ""
+        hashes: dict[str, str] = {}     # algoritma -> ozet (desteklenenler)
         for c in f.iter():
             t = tag(c)
             if t == "url":
                 u = (c.text or "").strip()
-                if u.startswith(("http://", "https://", "ftp://")):
+                if u.startswith(("http://", "https://")):
                     # tercih sirasi: en dusuk preference once
                     urls.append((int(c.get("preference", "99999") or 99999), u))
             elif t == "hash":
-                htype = (c.get("type") or "").lower().replace("-", "")
                 val = (c.text or "").strip().lower()
-                if htype == "sha256" and len(val) == 64:
-                    sha256 = val
-                elif htype == "md5" and len(val) == 32:
-                    md5 = val
-        urls = [u for _, u in sorted(urls)]
+                got = _norm({(c.get("type") or "").lower(): val})
+                hashes.update(got)
+        urls = [u for _, u in sorted(urls, key=lambda p: p[0])]
         if not urls:
             continue
         files.append({"filename": name, "size": size, "urls": urls,
-                      "sha256": sha256, "md5": md5})
+                      "sha256": hashes.get("sha256", ""),
+                      "md5": hashes.get("md5", ""),
+                      "hashes": hashes})
     if not files:
         raise ValueError("metalink icinde dosya/url bulunamadi")
     return files
+
+
+def _norm(d: dict) -> dict:
+    from .util import normalize_checksums
+    return normalize_checksums(d)
 
 
 def looks_like_metalink(url: str, content_type: str = "") -> bool:

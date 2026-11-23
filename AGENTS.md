@@ -5,9 +5,10 @@ Fedora-first, with a Firefox WebExtension. The engine, CLI and daemon
 are **Python stdlib only** — no pip dependencies, ever. The web UI is
 dependency-free vanilla JS. The extension is Manifest V2.
 
-State at authorship: **1.4.0 released**; test suite green, `web-ext
-lint` 0 errors, `rpmlint` 0/0, `fedora-review` no failed checks, mock
-builds cleanly on Fedora 43 and rawhide.
+State at authorship: **1.4.1 released**; test suite green (79 tests),
+`web-ext lint` 0 errors / 0 warnings, UI smoke checks green
+(`bash tests/ui/run.sh all`), `rpmlint` 0/0, `fedora-review` no failed
+checks, mock builds cleanly on Fedora 43.
 
 > Path tip for this machine: the repo lives at
 > `~/.zcode/workspace/7e483cf8-f9d2-44df-a23e-2b69c52213e0/ferdim`.
@@ -41,23 +42,25 @@ builds cleanly on Fedora 43 and rawhide.
 
 | Path | Role |
 |---|---|
-| `ferdim/engine/job.py` | The core: segmented multi-connection engine, throughput governor, adaptive server limits, parked worker pool, work stealing, dynamic range sizing, end-game donation, crash-safe resume, mirrors, checksum verify, DASH dispatch |
+| `ferdim/engine/job.py` | The core: segmented multi-connection engine, throughput governor, adaptive server limits, parked worker pool, work stealing, dynamic range sizing, end-game donation, crash-safe resume, source health (mirrors, fail-over, stall), checksum + sidecar verify, DASH dispatch |
 | `ferdim/engine/segments.py` | Shared HLS/DASH pipeline: parallel segment fetch to temp files, ordered assembly, per-segment resume |
 | `ferdim/engine/hls.py` | m3u8 parsing (variants/master), thin wrapper over `segments.assemble` |
 | `ferdim/engine/dash.py` | MPD parsing: best-representation selection, SegmentTemplate (`$Number$`/`$Time$`/SegmentTimeline) and SegmentList |
-| `ferdim/engine/queue.py` | QueueManager: concurrency, night scheduler, smart queue (background size prober, smallest-first), persistence |
-| `ferdim/engine/httpcli.py` | Probe/download primitives, headers, auth, proxy, cookies |
+| `ferdim/engine/queue.py` | QueueManager: concurrency, night scheduler + per-category windows, smart queue (background size prober, smallest-first), persistence (mirrors, checksums and per-job limits survive restarts) |
+| `ferdim/engine/httpcli.py` | Probe/download primitives (per-read timeout ⇒ stall detection), `fetch_small` for sidecars, headers, auth, proxy, cookies |
 | `ferdim/metalink.py` | `.metalink` / `.meta4` (RFC 5854) parsing |
-| `ferdim/api.py` | Unix-socket JSON-RPC + localhost HTTP API, token auth, metalink expansion, ZIP preview |
+| `ferdim/api.py` | Command handlers shared by socket and HTTP: token-auth API, metalink expansion (remote + local `add-file`), config sanitising (`_sanitize_config`), turbo/limit consistency, ZIP preview |
+| `ferdim/watch.py` | Watched folders: `.metalink`/`.meta4` and URL-list files are queued, then deleted / renamed `.done` / kept |
 | `ferdim/server/web.py` | HTTP server; serves `web/` with the token injected into `index.html` |
 | `ferdim/cli.py`, `ferdim/gui/` | CLI front-end; GTK 4 app (`app.py`, `__main__.py`) |
 | `ferdim/nativehost.py`, `bin/ferdim-nm` | Firefox native messaging bridge (4-byte LE length + JSON frames) |
 | `ferdim/clipboard.py` | Clipboard watching: `wl-paste --watch` event mode, polling fallback |
-| `ferdim/util.py`, `ferdim/i18n.py`, `ferdim/ratelimit.py` | Helpers, 4-language strings, token bucket |
-| `web/` | Vanilla-JS web UI (no build step) |
+| `ferdim/util.py`, `ferdim/i18n.py`, `ferdim/ratelimit.py` | Helpers (digests, checksum-text parsing, **1024-based** size parsing, schedule windows), 4-language strings, token bucket |
+| `web/` | Vanilla-JS web UI (no build step). **No `innerHTML`**: server data is written with `textContent`; rows are keyed by job id and updated in place so keyboard focus survives the 500 ms polling (a static test enforces both) |
 | `extension/` | Firefox MV2 WebExtension + `_locales` |
 | `packaging/ferdim.spec` | Fedora spec — `%check` runs the full suite at build time |
-| `tests/` | stdlib unittest; `tests/helpers.py` has counting HTTP servers, DASH/manifest fixtures, `FakeTime` for governor determinism |
+| `tests/` | stdlib unittest; `tests/helpers.py` has counting HTTP servers, DASH/manifest fixtures, `FakeTime` for governor determinism. `tests/test_roadmap.py` covers source health, checksums, watch folders, API behaviour and static UI rules |
+| `tests/ui/run.sh` | Optional UI gates (not part of `unittest`): live web UI in headless Chromium (Playwright) + GTK smoke under Xvfb, against an isolated daemon |
 | `scripts/build_srpm.sh`, `scripts/install.sh` | SRPM builder (tarball matches the GitHub tag archive layout), user-level installer |
 | `docs/` | Man pages, `fedora-submission.md` (paste-ready review request), screenshots |
 
@@ -85,8 +88,48 @@ Read `job.py` before touching the engine. The invariants that matter:
 - Servers without byte ranges degrade to a single stream
   (`_min_split = inf`, segments = 1) — splitting them causes an
   infinite 200-restart loop.
-- Resume is validated with ETag/Last-Modified via If-Range; with
-  mirrors in play the validator is only sent to the primary source.
+- Resume is validated with ETag/Last-Modified via If-Range. The
+  validator is only sent to the source that provided it (`_vsrc`,
+  persisted as `validator_src`); more than 3 restarts of one job fails
+  it ("kaynak surekli degisiyor").
+- **Source health** (primary + mirrors are `_Src` records): selection is
+  smooth weighted round-robin over measured per-connection throughput
+  (`_pick_locked`); every source has a soft `cap` (halved by `_demote`
+  on 429/503, doubled back after 60 s) and a failure `streak`.
+  `kind == "gone"` (404/410, mirror auth errors, `SourceInvalid`) kills
+  a source at once, other kinds need `streak > retries`. A failing
+  source hands its range to another one (fail-over); the job fails only
+  when no source is alive (`_dead_reason()`).
+- `_open` validates the `Content-Range` start and total of every
+  response: a mirror that ignores `Range` or serves another file is
+  dropped, never a reason to restart the job.
+- `open_range(timeout=self._stall)` applies the timeout to every read:
+  `stall_timeout` seconds (default 20) without data ⇒ `TimeoutError` ⇒
+  range requeued, source failed as `stall`.
+- Retries back off with `backoff_delay` (2ⁿ s capped at 15, ×0.5–1.5
+  jitter). A range is requeued only when its worker gives up, so the
+  same range is never processed twice.
+- **Verification runs before DONE.** `_finalize_file` verifies while the
+  state is still `downloading` (`extra["verifying"] = True`) and only
+  then sets `done`; anything that sees `done` may trust the file. A
+  sidecar that arrives after that goes through `_verify_late` (the
+  `_finalized`/`_sc_lock` handshake closes the race) and can only add a
+  warning. Explicit mismatch ⇒ `error` with the file kept; sidecar-only
+  mismatch ⇒ `done` + `checksum = "warn"`.
+- Size units are 1024-based end to end (`parse_size` ↔ `human_size`,
+  the web limit options and the extension thresholds agree): `2MB` is
+  shown as `2.0 MB`.
+- Turbo and limits never contradict each other: setting a speed limit
+  (`limit` command or the web select) leaves turbo; `config-set` keeps
+  `turbo_prev` in sync so a concurrency value chosen during turbo
+  survives turning turbo off.
+- The downloads folder is resolved from the live config
+  (`AppEnv.reload_download_dir(cfg)` sets `_dir_cfg`); an unusable
+  folder falls back to the default with a `download_dir` warning code.
+  `AppEnv(root=...)` pins the folder (`_fixed_dir`) so tests never
+  write into the real one.
+- Jobs added with `paused=True` stay paused until the user resumes;
+  `schedule.categories` windows gate only that category.
 - HLS and DASH never go through the range engine; they call
   `segments.assemble` (parallel fetch, ordered assembly, per-segment
   checkpointing).
@@ -95,7 +138,8 @@ Read `job.py` before touching the engine. The invariants that matter:
 
 ```bash
 python3 -m unittest discover -s tests        # full suite (must be green)
-npx -y web-ext lint --source-dir extension   # 0 errors required
+npx -y web-ext lint --source-dir extension   # 0 errors and 0 warnings required
+bash tests/ui/run.sh all                     # optional UI gates: web (Playwright) + GTK (Xvfb)
 bash scripts/build_srpm.sh                   # SRPM; tarball mirrors tag archive
 rpmlint ~/rpmbuild/SRPMS/ferdim-*.src.rpm packaging/ferdim.spec
 sudo mock -r fedora-43-x86_64 --clean --rebuild ~/rpmbuild/SRPMS/ferdim-X.Y.Z-1.fc43.src.rpm
@@ -119,8 +163,13 @@ background task; it will fail on the password prompt.
    `packaging/ferdim.spec` (`Version:` + `%changelog` entry),
    `docs/ferdim.1` / `ferdim-nm.1` / `ferdim-gui.1` (`.TH` string),
    `extension/manifest.json`, `CHANGELOG.md`.
-2. Gates: tests green, web-ext lint 0 errors, rpmlint 0/0, mock build
-   OK (its `%check` re-runs the suite).
+2. Gates: tests green, web-ext lint 0/0, `bash tests/ui/run.sh all`
+   green, rpmlint 0/0, mock build OK (its `%check` re-runs the suite),
+   `fedora-review` clean.
+2b. Docs travel with the code: README feature rows + usage block,
+   `ROADMAP.md` ticks, `CHANGELOG.md` entry, man pages (`man --warnings
+   -l docs/ferdim.1` must be silent) and the state line at the top of
+   this file.
 3. Commit, push `main`, tag `vX.Y.Z`, push the tag. **Never
    force-push an existing tag** — GitHub rejects it; bump the version
    instead.
@@ -151,6 +200,30 @@ background task; it will fail on the password prompt.
   systemd's restart take over.
 - GitHub tag archives extract as `<repo>-<version>/` (the leading `v`
   is stripped from the directory name).
+- A line starting with `.metalink` / `.meta4` is a troff macro call —
+  escape it as `\&.metalink` in man pages.
+- GTK 4 via PyGObject 3.54 (the installed GTK is 4.20): mnemonic labels
+  use `use_underline` + `set_label("_…")` + `mnemonic_widget` (there is
+  no `use_mnemonic` / `set_label_with_mnemonic`); `update_relation`
+  from Python emits a GLib warning, so label↔field relations come from
+  mnemonics only; `Gtk.ScrolledWindow` takes `hscrollbar_policy` /
+  `vscrollbar_policy` (not `policy`); `Gtk.AlertDialog` is not a
+  `Gtk.Window` (absent from `list_toplevels`); `Gtk.Dialog.response` is
+  deprecated. Do not guess GTK names — `dir(Gtk.Label)` first.
+- Playwright (Python) here has no `page.accessibility`; assert
+  accessibility through the DOM (`aria-*` attributes) instead.
+- `ensure_daemon()` called from a UI test spawns a detached daemon. Run
+  UI tests with temporary `XDG_STATE_HOME` / `XDG_CONFIG_HOME` and
+  `PYTHONPATH=<repo>` (otherwise the *installed* daemon starts) and
+  kill it through `state/ferdim/ferdim.pid`; `tests/ui/run.sh` does all
+  of this.
+- Multi-step edit scripts must assert every marker **before** writing
+  anything. A half-applied run once left a function with a docstring but
+  no body (`_bad_checksum` returned `None`), and a hand-typed 8-space
+  marker silently matched inside a 12-space line.
+- Timing-sensitive assertions are a smell: if a test can pass or fail
+  depending on poll timing, the state machine is wrong (that is how
+  "done before verify" was found). Fix the ordering, do not add sleeps.
 
 ## Fedora submission status
 

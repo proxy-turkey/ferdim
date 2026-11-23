@@ -1,7 +1,7 @@
 %global srcname ferdim
 
 Name:           %{srcname}
-Version:        1.4.0
+Version:        1.4.1
 Release:        1%{?dist}
 Summary:        Dynamic self-tuning download manager with Firefox integration
 
@@ -100,6 +100,12 @@ python3 -m unittest discover -s tests -v
 # the user unit dir, so explicit scriptlets are unnecessary.
 
 %changelog
+* Mon Nov 23 2026 Enes Aksu <eaksu@pm.me> - 1.4.1-1
+- source health model for mirrors: throughput-weighted balancing, fail-over,
+- stall detection, Content-Range validation, jittered exponential backoff
+- SHA-1/SHA-512 and sidecar checksum auto-discovery, verified before "done"
+- per-category schedule windows, watched folders, add-file / add @list.txt
+- web UI and GTK accessibility pass, consistent 1024-based size units
 * Wed Oct 21 2026 Enes Aksu <eaksu@pm.me> - 1.4.0-1
 - DASH (MPD) downloads, multi-mirror blending, metalink/.meta4 expansion,
 - per-job SHA-256/MD5 verification, ZIP preview, size-probing smart queue,

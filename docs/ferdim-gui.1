@@ -1,9 +1,12 @@
-.TH FERDIM-GUI 1 "2026-10-21" "ferdim 1.4.0" "User Commands"
+.TH FERDIM-GUI 1 "2026-11-23" "ferdim 1.4.1" "User Commands"
 .SH NAME
 ferdim-gui \- GTK 4 front-end for the FerDim download manager
 .SH DESCRIPTION
 Desktop application showing the FerDim download queue with per-job controls
-and a maximum-power toggle. Talks to the
+and a maximum-power toggle. The add dialog accepts a URL, optional mirrors,
+an optional checksum and a "start immediately" switch; icon-only buttons
+carry accessible names and labels are keyboard mnemonics, so the window is
+fully usable with a screen reader. Talks to the
 .BR ferdim (1)
 daemon over its local socket and starts it on demand. Requires
 python3-gobject.

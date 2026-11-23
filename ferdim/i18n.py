@@ -20,6 +20,7 @@ S = {
     "st_done":       {"en": "Done", "tr": "Tamam", "es": "Completado", "ru": "Готово"},
     "st_error":      {"en": "Error", "tr": "Hata", "es": "Error", "ru": "Ошибка"},
     "st_canceled":   {"en": "Canceled", "tr": "İptal", "es": "Cancelado", "ru": "Отменено"},
+    "st_verifying":   {"en": "Verifying", "tr": "Doğrulanıyor", "es": "Verificando", "ru": "Проверка"},
     "remaining":     {"en": "left", "tr": "kaldı", "es": "restante", "ru": "осталось"},
     "unknown_size":  {"en": "unknown size", "tr": "bilinmeyen boyut", "es": "tamaño desconocido", "ru": "размер неизвестен"},
     # --------------------------------------------------------------- baslik
@@ -124,6 +125,52 @@ S = {
     "zip_title": {"en": "Archive contents", "tr": "Arşiv içeriği", "es": "Contenido del archivo", "ru": "Содержимое архива"},
     "zip_empty": {"en": "No entries.", "tr": "Kayıt yok.", "es": "Sin entradas.", "ru": "Нет записей."},
     "cat_other":     {"en": "file", "tr": "dosya", "es": "archivo", "ru": "файл"},
+    # ----------------------------------------------------- saglama rozeti
+    "chk_ok":        {"en": "verified: {a}", "tr": "doğrulandı: {a}", "es": "verificado: {a}", "ru": "проверено: {a}"},
+    "chk_warn":      {"en": "checksum mismatch (sidecar file); file kept", "tr": "sağlama uyuşmadı (yan dosya); dosya korundu", "es": "la suma no coincide (archivo auxiliar); archivo conservado", "ru": "контрольная сумма не совпала (файл-спутник); файл сохранён"},
+    "lbl_checksum":  {"en": "Checksum (optional)", "tr": "Sağlama (isteğe bağlı)", "es": "Suma de verificación (opcional)", "ru": "Контрольная сумма (необязательно)"},
+    "ph_checksum":   {"en": "digest or algo:digest", "tr": "özet ya da algo:özet", "es": "suma o algo:suma", "ru": "сумма или алг:сумма"},
+    "lbl_sidecar":   {"en": "Auto-verify checksums (.sha256 / .md5 sidecar files)", "tr": "Sağlamaları otomatik doğrula (.sha256 / .md5 yan dosyaları)", "es": "Verificar sumas automáticamente (archivos .sha256 / .md5)", "ru": "Автопроверка контрольных сумм (файлы .sha256 / .md5)"},
+    # --------------------------------------------------- aynalar ve pencereler
+    "lbl_mirrors":   {"en": "Mirrors (one URL per line, optional)", "tr": "Aynalar (her satıra bir URL, isteğe bağlı)", "es": "Espejos (una URL por línea, opcional)", "ru": "Зеркала (по одному URL в строке, необязательно)"},
+    "mirrors_dead":  {"en": "{n} source(s) unavailable", "tr": "{n} kaynak erişilemez", "es": "{n} origen(es) sin acceso", "ru": "недоступно источников: {n}"},
+    "lbl_cat_sched": {"en": "Per-category schedule windows", "tr": "Kategori bazlı zamanlama", "es": "Horario por categoría", "ru": "Расписание по категориям"},
+    "lbl_only_window": {"en": "only in window", "tr": "sadece pencerede", "es": "solo en su ventana", "ru": "только в своём окне"},
+    "sched_wait":    {"en": "waits for its window {w}", "tr": "penceresini bekliyor: {w}", "es": "espera su ventana {w}", "ru": "ждёт своего окна {w}"},
+    # ------------------------------------------------------ izlenen klasorler
+    "lbl_watch_dirs": {"en": "Watched folders (one per line)", "tr": "İzlenen klasörler (her satıra bir)", "es": "Carpetas vigiladas (una por línea)", "ru": "Отслеживаемые папки (по одной в строке)"},
+    "lbl_watch_done": {"en": "After queueing a file", "tr": "Kuyruğa aldıktan sonra", "es": "Tras añadir a la cola", "ru": "После добавления в очередь"},
+    "watch_delete":  {"en": "Delete", "tr": "Sil", "es": "Eliminar", "ru": "Удалить"},
+    "watch_keep":    {"en": "Keep in place", "tr": "Yerinde bırak", "es": "Conservar", "ru": "Оставить на месте"},
+    "watch_rename":  {"en": "Rename to .done", "tr": ".done olarak yeniden adlandır", "es": "Renombrar a .done", "ru": "Переименовать в .done"},
+    # --------------------------------------------------------------- gelismis
+    "lbl_advanced":  {"en": "Advanced", "tr": "Gelişmiş", "es": "Avanzado", "ru": "Дополнительно"},
+    "lbl_retries":   {"en": "Retries", "tr": "Yeniden deneme", "es": "Reintentos", "ru": "Повторные попытки"},
+    "lbl_timeout":   {"en": "Connect timeout (s)", "tr": "Bağlantı zaman aşımı (sn)", "es": "Tiempo de conexión (s)", "ru": "Таймаут соединения (с)"},
+    "lbl_stall":     {"en": "Stall timeout (s)", "tr": "Akış durma sınırı (sn)", "es": "Tiempo sin datos (s)", "ru": "Таймаут остановки (с)"},
+    # ------------------------------------------------------------ erisilebilirlik
+    "daemon_lost":   {"en": "Connection lost", "tr": "Bağlantı koptu", "es": "Conexión perdida", "ru": "Соединение потеряно"},
+    "skip_to_list":  {"en": "Skip to downloads", "tr": "İndirmelere atla", "es": "Saltar a las descargas", "ru": "Перейти к загрузкам"},
+    "a11y_progress": {"en": "progress", "tr": "ilerleme", "es": "progreso", "ru": "прогресс"},
+    "a11y_tabs":     {"en": "Categories", "tr": "Kategoriler", "es": "Categorías", "ru": "Категории"},
+    "a11y_table":    {"en": "Downloads", "tr": "İndirmeler", "es": "Descargas", "ru": "Загрузки"},
+    "done_announce": {"en": "{name}: {state}", "tr": "{name}: {state}", "es": "{name}: {state}", "ru": "{name}: {state}"},
+    "cli_added_n":   {"en": "{n} added", "tr": "{n} eklendi", "es": "{n} añadidas", "ru": "добавлено: {n}"},
+    "lbl_actions":    {"en": "Actions", "tr": "İşlemler", "es": "Acciones", "ru": "Действия"},
+    "win_start":      {"en": "window start", "tr": "pencere başlangıcı", "es": "inicio de ventana", "ru": "начало окна"},
+    "win_stop":       {"en": "window end", "tr": "pencere bitişi", "es": "fin de ventana", "ru": "конец окна"},
+    "per_sec":        {"en": "/s", "tr": "/sn", "es": "/s", "ru": "/с"},
+    "err_url":        {"en": "Enter a valid http:// or https:// address.", "tr": "Geçerli bir http:// ya da https:// adresi girin.", "es": "Introduce una dirección http:// o https:// válida.", "ru": "Введите корректный адрес http:// или https://."},
+    "ext_state":      {"en": "Add-on", "tr": "Eklenti", "es": "Extensión", "ru": "Расширение"},
+    "add_failed":     {"en": "Could not add:", "tr": "Eklenemedi:", "es": "No se pudo añadir:", "ru": "Не удалось добавить:"},
+    "warn_dir":       {"en": "Downloads folder could not be created; the default folder is used.", "tr": "İndirme dizini oluşturulamadı; varsayılan dizin kullanılıyor.", "es": "No se pudo crear la carpeta de descargas; se usa la carpeta predeterminada.", "ru": "Не удалось создать папку загрузок; используется папка по умолчанию."},
+    "warn_dir":       {"en": "Downloads folder could not be created; the default folder is used.", "tr": "İndirme dizini oluşturulamadı; varsayılan dizin kullanılıyor.", "es": "No se pudo crear la carpeta de descargas; se usa la carpeta predeterminada.", "ru": "Не удалось создать папку загрузок; используется папка по умолчанию."},
+    "limit_custom":   {"en": "custom", "tr": "özel", "es": "personalizado", "ru": "свой"},
+    "cli_bad_checksum": {
+        "en": "invalid checksum (use algo:digest or a hex digest)",
+        "tr": "geçersiz sağlama (algo:özet ya da onaltılık özet kullanın)",
+        "es": "suma no válida (usa algo:suma o una suma hexadecimal)",
+        "ru": "неверная контрольная сумма (алг:сумма или шестнадцатеричная сумма)"},
 }
 
 

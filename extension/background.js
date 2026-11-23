@@ -101,7 +101,8 @@ async function onDownloadCreated(item) {
   const media = looksMedia(url, mime);
   if (opts.takeover === "media" && !media) return;
   if (opts.takeover === "media" && media === "audio" && !opts.includeAudio) return;
-  const minBytes = (opts.minTakeoverMB || 0) * 1e6;
+  // MB = 1024^2 (panoda gosterilen boyutlarla ayni birim)
+  const minBytes = (opts.minTakeoverMB || 0) * 1048576;
   const known = item.totalBytesSuggested || item.totalBytes || 0;
   if (minBytes && known && known < minBytes) return;
 
@@ -168,7 +169,7 @@ function onHeaders(details) {
   const kind = looksMedia(url, ct);
   if (!kind) return;
   if (kind === "audio" && !opts.includeAudio) return;
-  if (kind === true && size && size < (opts.minMediaMB || 0) * 1e6) return;
+  if (kind === true && size && size < (opts.minMediaMB || 0) * 1048576) return;
   // sayfa icerigi degil, indirme amacli oge olmali (ana cerceve harici)
   let filename = nameFromUrl(url);
   const m = /filename="?([^";]+)"?/i.exec(cd || "");

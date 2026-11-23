@@ -1,7 +1,7 @@
 """DASH (MPD) VOD indirici: en iyi temsili secer, init + segmentleri
 paralel cekip sirayla birlestirir (HLS ile ayni assembler).
 
-Kapsam: on-demand/statik MPD — SegmentTemplate ($Number$ ya da
+Kapsam: on-demand/statik MPD - SegmentTemplate ($Number$ ya da
 SegmentTimeline) veya SegmentList. Canli (dynamic) MPD desteklenmez.
 """
 from __future__ import annotations

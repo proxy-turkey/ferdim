@@ -40,21 +40,54 @@ def cmd_turbo(a, env):
     return 0
 
 
+def _add_file(c, path: str) -> int:
+    """Yerel baglanti listesini / metalink belgesini kuyruga ekler;
+    eklenen is sayisini dondurur."""
+    r = c.request("add-file", path=path)
+    if not r.get("ok"):
+        print(f"{_('cli_error')}: {path}: {r.get('error', '')}", file=sys.stderr)
+        return 0
+    n = int(r.get("count") or len(r.get("ids") or []))
+    print(f"{path}: " + _("cli_added_n", n=n))
+    return n
+
+
 def cmd_add(a, env):
+    if a.url.startswith("@"):          # ferdim add @liste.txt
+        with _client(env) as c:
+            return 0 if _add_file(c, a.url[1:]) else 1
+    checks = {}
+    if a.checksum:
+        algo, digest = util.parse_checksum_spec(a.checksum)
+        if not algo:
+            print(_("cli_error") + ": " + _("cli_bad_checksum"), file=sys.stderr)
+            return 2
+        checks[algo] = digest
     with _client(env) as c:
         r = c.request("add", url=a.url, filename=a.output, dir=a.dir,
                       segments=a.segments, headers=a.header, cookies=a.cookie,
                       user=a.user, password=a.password, proxy=a.proxy,
                       insecure=a.insecure, referer=a.referer,
                       limit=a.limit, mirrors=a.mirror,
-                      sha256=a.sha256, md5=a.md5)
+                      sha256=a.sha256, md5=a.md5,
+                      sha1=a.sha1, sha512=a.sha512, checksums=checks)
         if not r.get("ok"):
             print(_("cli_error") + ":", r.get("error"), file=sys.stderr)
             return 1
+        ids = r.get("ids") or []
+        if len(ids) > 1:                # metalink: birden fazla dosya
+            print(_("cli_added_n", n=len(ids)))
+            return 0
         print(f"{_('cli_added')}: {r['id']}  ->  {r['filename']}")
         if a.wait:
             return _wait(c, r["id"])
     return 0
+
+
+def cmd_add_file(a, env):
+    with _client(env) as c:
+        total = sum(_add_file(c, f) for f in a.files)
+    return 0 if total else 1
 
 
 def _wait(c, job_id):
@@ -172,9 +205,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--wait", action="store_true", help="bitmesini bekle")
     sp.add_argument("--sha256", help="bitiste SHA-256 dogrulamasi")
     sp.add_argument("--md5", help="bitiste MD5 dogrulamasi")
+    sp.add_argument("--sha1", help="bitiste SHA-1 dogrulamasi")
+    sp.add_argument("--sha512", help="bitiste SHA-512 dogrulamasi")
+    sp.add_argument("--checksum",
+                    help="algo:ozet (orn sha256:abc...) ya da uzunlugundan "
+                         "anlasilan ozet")
     sp.add_argument("--mirror", action="append", default=[],
                     help="aynak URL (tekrarlanabilir; .metalink otomatik)")
     sp.set_defaults(fn=cmd_add)
+
+    sp = sub.add_parser("add-file",
+                        help="dosyadaki URL'leri ya da metalink belgesini "
+                             "kuyruga ekle")
+    sp.add_argument("files", nargs="+")
+    sp.set_defaults(fn=cmd_add_file)
 
     sp = sub.add_parser("list", aliases=["ls"], help="kuyrugu listele")
     sp.add_argument("--json", action="store_true")

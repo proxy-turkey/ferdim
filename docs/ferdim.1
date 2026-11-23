@@ -1,4 +1,4 @@
-.TH FERDIM 1 "2026-10-21" "ferdim 1.4.0" "User Commands"
+.TH FERDIM 1 "2026-11-23" "ferdim 1.4.1" "User Commands"
 .SH NAME
 ferdim \- dynamic, self-tuning download manager
 .SH SYNOPSIS
@@ -15,7 +15,12 @@ checksums, and finished ZIP archives can be previewed in place.
 Downloads are crash-safe
 (sparse part files with periodic metadata checkpoints and ETag/If-Range
 validation), adapt gracefully to server throttling (HTTP 429/503), and
-resume after restarts. A daemon exposes a Unix-socket JSON-RPC API plus a
+resume after restarts. Sources (the primary URL and its mirrors) are
+health-scored: work is balanced by measured per-connection throughput, a
+source that fails, stalls or serves a different file is demoted and the
+interrupted byte range continues from another source. Checksum sidecar files
+(.sha256, .md5, .sha512, .sha1) next to the URL are picked up automatically,
+and verification completes before a job is reported as finished. A daemon exposes a Unix-socket JSON-RPC API plus a
 token-protected localhost HTTP API; front-ends include this CLI, a web UI
 (http://127.0.0.1:8378) and a GTK 4 application. A Firefox WebExtension
 hands browser downloads and detected media over to the daemon.
@@ -40,18 +45,27 @@ HTTP Basic authentication,
 .BI \-\-proxy " URL"
 proxy,
 .BI \-\-mirror " URL"
-additional mirror for the same file (repeatable; primary and mirrors
-are blended round-robin),
-.BI \-\-sha256 " HEX"
-verify the finished file against a SHA-256 digest,
-.BI \-\-md5 " HEX"
-verify the finished file against an MD5 digest,
+additional mirror for the same file (repeatable; primary and mirrors are
+blended by measured throughput, failing sources are demoted),
+.BI \-\-sha256 " HEX" " / " \-\-md5 " / " \-\-sha1 " / " \-\-sha512
+verify the finished file against a digest (all given digests are computed
+in one pass; an invalid value is rejected),
+.BI \-\-checksum " ALGO:HEX"
+any supported digest (sha256, sha512, md5, sha1); the algorithm may be
+omitted when it is unambiguous from the digest length,
 .BI \-\-limit " RATE"
-per-job speed limit (e.g. 2MB),
+per-job speed limit (e.g. 2MB; KB, MB and GB are 1024-based),
 .B \-k
 skip TLS verification,
 .B \-\-wait
-follow progress until completion.
+follow progress until completion; returns only after verification.
+.IP
+A URL starting with \fB@\fR names a local text file with one URL per line
+(comments start with #).
+.TP
+.BI add-file " FILE..."
+Queue every URL listed in a text file, or every file described by a local
+\&.metalink / .meta4 document.
 .TP
 .BI list
 Show the queue.
@@ -60,13 +74,19 @@ Show the queue.
 Control jobs; \fBremove \-\-delete\-files\fR also discards partial data.
 .TP
 .BI limit " RATE"
-Global speed limit (\fB0\fR disables).
+Global speed limit (\fB0\fR disables). KB, MB and GB are 1024-based.
+Setting a limit while turbo mode is on leaves turbo mode, so the applied
+limit and the turbo state never disagree.
 .TP
 .BI turbo " on|off|status"
 Toggle maximum-power defaults (32 links, unlimited speed, 8 concurrent jobs).
 .TP
 .BI config " [\-\-set JSON]"
-Show or change settings (segments, concurrency, scheduler window, language).
+Show or change settings: segments, concurrency, scheduler window and
+per-category windows (\fIschedule.categories\fR), language, watched
+folders (\fIwatch_dirs\fR, \fIwatch_done\fR = delete | rename | keep),
+automatic sidecar verification (\fIchecksum_sidecar\fR), retries and
+timeouts (\fItimeout\fR, \fIstall_timeout\fR).
 .TP
 .BI daemon
 Run the RPC/HTTP daemon in the foreground (normally started via the
@@ -80,7 +100,12 @@ Open the web UI in the default browser.
 Socket, token, PID, queue state and job metadata.
 .TP
 .I ~/.config/ferdim/config.json
-User configuration.
+User configuration (see \fBferdim config\fR; invalid values are reset to
+their defaults at start).
+.TP
+Files dropped into a watched folder are queued automatically: .metalink /
+\&.meta4 documents and .txt / .urls / .list text files with one URL per line.
+By default the file is deleted after it is queued.
 .TP
 .I ~/.local/share/ferdim/ferdim-extension.zip
 Unsigned Firefox extension bundle; sign once with

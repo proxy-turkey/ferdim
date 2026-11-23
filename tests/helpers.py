@@ -189,6 +189,50 @@ class Handler(BaseHTTPRequestHandler):
         elif p.startswith("/dash-seg-"):
             i = int(p.rsplit("-", 1)[1].split(".")[0]) - 1
             self._send(200, DASH_SEGS[i], ctype="video/mp4")
+        elif p == "/file.bin.sha256":     # dogru saglama yan dosyasi (coreutils)
+            self._send(200, f"{hashlib.sha256(DATA).hexdigest()}  dosya.bin\n".encode(),
+                       ctype="text/plain")
+        elif p == "/file2.bin.md5":       # YANLIS yan dosya (bayat) -> uyari
+            self._send(200, ("0" * 32 + "  b\n").encode(), ctype="text/plain")
+        elif p == "/tiny.bin.sha256":     # ikili mod biçimi (*ad)
+            self._send(200,
+                       f"{hashlib.sha256(TINY).hexdigest()} *tiny.bin\n".encode(),
+                       ctype="text/plain")
+        elif p in ("/lazy.bin", "/lazyno.bin"):
+            # kesif aninda ulasilamayan (503) ama sonra calisan ayna taklidi
+            rng = self.headers.get("Range") or ""
+            if rng.startswith("bytes=0-0"):
+                self.send_response(503)
+                self.send_header("Retry-After", "1")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            elif p == "/lazy.bin":        # gercek araliklari dogru verir
+                a, b = rng[6:].split("-", 1)
+                a = int(a)
+                b = min(int(b), len(DATA) - 1)
+                self._send(206, DATA[a:b + 1], extra=[
+                    ("Content-Range", f"bytes {a}-{b}/{len(DATA)}"),
+                    ("Accept-Ranges", "bytes"), ("ETag", ETAG_V1)])
+            else:                         # Range'i yok sayar: 200 + tam govde
+                self._send(200, DATA[:1 << 20])
+        elif p == "/trickle.bin":
+            # biraz yollayip sonsuza dek susan (stall) kaynak taklidi
+            rng = self.headers.get("Range") or ""
+            if rng.startswith("bytes="):
+                a, b = rng[6:].split("-", 1)
+            else:
+                a, b = 0, len(DATA) - 1
+            a, b = int(a), int(b)
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {a}-{b}/{len(DATA)}")
+            self.send_header("Content-Length", str(b - a + 1))
+            self.end_headers()
+            try:
+                self.wfile.write(DATA[a:min(a + 65536, b + 1)])
+                self.wfile.flush()
+                time.sleep(40)
+            except Exception:
+                pass
         elif p == "/redir":
             self.send_response(302)
             self.send_header("Location", "/file.bin")

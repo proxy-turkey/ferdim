@@ -41,12 +41,14 @@ front-ends: CLI, web UI, and GTK 4.
 | **Big sockets** | Every connection requests a large `SO_RCVBUF` so the kernel keeps deep receive queues per link. |
 | **HLS assembler** | Picks the best variant, fetches segments in parallel (1–8 workers), assembles in order, resumes per segment. |
 | **DASH (MPD)** | Selects the best representation by resolution/bandwidth, resolves SegmentTemplate (`$Number$`/`$Time$`/SegmentTimeline) and SegmentList, then drives the same parallel-segment pipeline. |
-| **Mirrors & metalink** | Repeatable `--mirror` URLs are blended round-robin into one job; `.metalink` / `.meta4` documents expand into queued files with preference-sorted mirrors and checksums. |
-| **Integrity** | Optional per-job `--sha256` / `--md5` verification; a mismatch fails the job while keeping the data for inspection. |
+| **Mirrors & metalink** | Repeatable `--mirror` URLs are blended into one job; `.metalink` / `.meta4` documents expand into queued files with preference-sorted mirrors and checksums. |
+| **Source health** | Work is balanced across the primary URL and mirrors by measured per-connection throughput (smooth weighted round-robin). A source that fails, stalls (no data for `stall_timeout` s) or serves a different file (`Content-Range` is checked on every response) is demoted, and the interrupted byte range **continues from another source** — one dead mirror never fails a job. Retries back off exponentially with jitter. |
+| **Integrity** | Per-job `--sha256` / `--md5` / `--sha1` / `--sha512` / `--checksum algo:digest`, all computed in one pass. Checksum sidecar files next to the URL (`.sha256`, `.md5`, …) are discovered automatically. Verification completes **before** a job is reported as finished; an explicit mismatch fails the job while keeping the data for inspection. |
+| **Automation** | Watched folders queue `.metalink` / `.meta4` documents and URL-list text files automatically; schedule windows can be set per category; `ferdim add @list.txt` queues a whole list. |
 | **Smart queue** | A background prober learns the size of queued files and runs smallest-first, so a 2 MB PDF never waits behind a 4 GB ISO. |
 
 Also included: queue with concurrency limits and a night-window scheduler,
-global + per-job speed limits, clipboard watching (event-driven on Wayland),
+watched folders, global + per-job speed limits, clipboard watching (event-driven on Wayland),
 proxy and Basic-Auth support, custom headers/cookies/referer/UA passthrough
 from the browser extension, ZIP preview from the queue view, and graceful
 single-stream fallback for servers without byte ranges.
@@ -142,11 +144,16 @@ ferdim web                                      # open the web UI
 ferdim add https://example.com/big.iso --mirror https://mirror.example.com/big.iso
 ferdim add https://example.com/data.metalink             # mirrors + checksums
 ferdim add https://example.com/big.iso --sha256 <digest> # verify when done
+ferdim add https://example.com/distro.iso --checksum sha512:<digest> \
+        --mirror https://mirror1.example.org/distro.iso --mirror https://mirror2.example.org/distro.iso
+ferdim add @liste.txt                           # queue every URL in a file
 ferdim config --set '{"language":"ru"}'
+ferdim config --set '{"watch_dirs":["~/İndirilenler/ferdim-kuyruk"]}'   # auto-queue dropped lists
 ```
 
 - **Web UI** — `http://127.0.0.1:8378`: live queue, categories, speed/ETA,
-  per-job controls, settings, scheduler, language picker.
+  per-job controls, settings, scheduler (global and per-category), watched
+  folders, language picker. Fully keyboard- and screen-reader-friendly.
 - **GTK 4 app** — `ferdim-gui` or from your app menu.
 - **CLI** — full control; `ferdim --help`.
 
@@ -199,6 +206,10 @@ tests/             unittest suite + local HTTP fixtures
 - [x] ZIP preview in the web UI
 - [x] Metalink / mirror blending
 - [x] Wayland clipboard deep integration (`wl-paste --watch`)
+- [x] Mirror health scoring, fail-over, stall detection (1.4.1)
+- [x] Sidecar checksum discovery, SHA-1 / SHA-512 (1.4.1)
+- [x] Per-category schedule windows and watched folders (1.4.1)
+- [x] Web UI + GTK accessibility pass (1.4.1)
 
 The forward plan — distribution (COPR, official Fedora), desktop
 integration (D-Bus, GNOME Shell), and research items (HTTP/3,

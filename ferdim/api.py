@@ -1,10 +1,20 @@
 """Komut tasiyicilari: socket ve HTTP sunucularinin ortak API katmani."""
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from .engine.job import JobSpec
 from . import util
 from .i18n import detect_lang, dict_for
 from . import metalink as _ml
+from .watch import MAX_FILE, parse_url_list
+
+MAX_MIRRORS = 24              # metalink belgeleri sikca 10-20 ayna listeler
+MAX_METALINK_FILES = 64
+_MAX_INT = {"segments": (1, 32, 8), "max_concurrent": (1, 32, 8),
+            "retries": (0, 20, 5), "timeout": (5, 300, 30),
+            "stall_timeout": (5, 120, 20), "web_port": (1024, 65535, 8378)}
 
 
 def _default_segments(cfg: dict) -> int:
@@ -16,21 +26,33 @@ def _default_segments(cfg: dict) -> int:
 def _spec_from(params: dict, cfg: dict) -> JobSpec:
     headers = {}
     for h in params.get("headers") or []:
-        if ":" in h:
+        if isinstance(h, str) and ":" in h:
             k, v = h.split(":", 1)
             headers[k.strip()] = v.strip()
-    sha = (params.get("sha256") or "").strip().lower()
-    md5v = (params.get("md5") or "").strip().lower()
+    # saglamalar: sha256/md5/sha1/sha512 alanlari + checksums sozlugu +
+    # 'algo:ozet' ya da uzunlugundan anlasilan tek giris (checksum)
+    checks = util.normalize_checksums(params.get("checksums") or {})
+    algo, digest = util.parse_checksum_spec(params.get("checksum") or "")
+    if algo:
+        checks[algo] = digest
+    for a in ("sha256", "md5", "sha1", "sha512"):
+        checks.update(util.normalize_checksums({a: params.get(a) or ""}))
+    try:
+        segments = int(params.get("segments") or _default_segments(cfg))
+    except (TypeError, ValueError):
+        segments = _default_segments(cfg)
     return JobSpec(
         url=params.get("url", ""),
         filename=util.sanitize_filename(params["filename"])
         if params.get("filename") else "",
         mirrors=[u for u in (params.get("mirrors") or [])
-                 if isinstance(u, str) and u.startswith(("http://", "https://"))][:6],
-        sha256=sha if len(sha) == 64 else "",
-        md5=md5v if len(md5v) == 32 else "",
+                 if isinstance(u, str)
+                 and u.startswith(("http://", "https://"))][:MAX_MIRRORS],
+        sha256=checks.pop("sha256", ""),
+        md5=checks.pop("md5", ""),
+        checksums=checks,
         directory=params.get("dir") or params.get("directory") or "",
-        segments=int(params.get("segments") or _default_segments(cfg)),
+        segments=max(1, min(32, segments)),
         headers=headers,
         cookies=params.get("cookies") or "",
         user=params.get("user") or "",
@@ -41,6 +63,153 @@ def _spec_from(params: dict, cfg: dict) -> JobSpec:
         user_agent=params.get("ua") or params.get("user_agent") or "",
         limit=util.parse_size(params.get("limit")) if params.get("limit") else 0,
     )
+
+
+def _sanitize_config(cfg: dict, env=None) -> None:
+    """Yapilandirmayi guvenli araliga ceker: bozuk bir deger (el ile
+    duzenlenmis config.json, bozuk API cagrisi) daemon'u devirmemeli.
+    env verilirse indirme dizini de denenir; acilamiyorsa varsayilan."""
+    for key, (lo, hi, default) in _MAX_INT.items():
+        try:
+            cfg[key] = max(lo, min(hi, int(cfg.get(key, default))))
+        except (TypeError, ValueError):
+            cfg[key] = default
+    cfg["stall_timeout"] = min(cfg["stall_timeout"], cfg["timeout"])
+    try:
+        cfg["speed_limit"] = max(0, int(cfg.get("speed_limit", 0) or 0))
+    except (TypeError, ValueError):
+        cfg["speed_limit"] = 0
+    try:
+        cfg["watch_interval"] = max(1.0, min(60.0, float(cfg.get("watch_interval", 3))))
+    except (TypeError, ValueError):
+        cfg["watch_interval"] = 3
+    if cfg.get("watch_done") not in ("delete", "rename", "keep"):
+        cfg["watch_done"] = "delete"
+    dirs = cfg.get("watch_dirs")
+    cfg["watch_dirs"] = [d for d in dirs if isinstance(d, str) and d.strip()] \
+        if isinstance(dirs, list) else []
+    sch = cfg.get("schedule")
+    if not isinstance(sch, dict):
+        sch = cfg["schedule"] = {}
+    if not isinstance(sch.get("categories", {}), dict):
+        sch["categories"] = {}
+    hm = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+    for name in list(sch.get("categories") or {}):
+        w = sch["categories"].get(name)
+        if not isinstance(w, dict) or not (hm.match(str(w.get("start", "")))
+                                           and hm.match(str(w.get("stop", "")))):
+            del sch["categories"][name]     # bozuk pencere = kisit yok
+    d = cfg.get("download_dir")
+    cfg["download_dir"] = d if isinstance(d, str) and d.strip() else None
+    if env is not None:
+        _recheck_download_dir({"env": env, "cfg": cfg})
+
+
+def _recheck_download_dir(ctx) -> str:
+    """Indirme dizini ayari degisti: onbellegi bosa cikarir. Dizin
+    olusturulamiyorsa (yetki yok, dosya uzerinde yol) varsayilana doner ve
+    'download_dir' uyari kodunu dondurur; yoksa bos."""
+    env, cfg = ctx["env"], ctx["cfg"]
+    env.reload_download_dir(cfg)      # dizin cfg'den okunur (dosyadan degil)
+    try:
+        env.download_dir
+    except OSError:
+        cfg["download_dir"] = None
+        env.reload_download_dir(cfg)
+        return "download_dir"
+    return ""
+
+
+def _bad_checksum(params: dict) -> bool:
+    """Kullanicinin elle verdigi saglama degerlerinden biri gecersiz mi?
+    (metalink belgesinden gelenler degil: onlar yalniz elenir.) Seslice
+    yok sayilsaydi kullanici dogrulamanin yapildigini sanirdi."""
+    chk = params.get("checksum")
+    if isinstance(chk, str) and chk.strip() and \
+            not util.parse_checksum_spec(chk)[0]:
+        return True
+    for algo in ("sha256", "md5", "sha1", "sha512"):
+        v = params.get(algo)
+        if isinstance(v, str) and v.strip() and \
+                not util.normalize_checksums({algo: v}):
+            return True
+    return False
+
+
+def _add_metalink_items(ctx, items: list, base: dict) -> dict:
+    """Ayristirilmis metalink dosyalarini kuyruga ekler. 'base' icindeki
+    dizin, kimlik, hiz limiti gibi ayarlar her dosyaya tasinir."""
+    keep = {k: v for k, v in (base or {}).items()
+            if k not in ("url", "filename", "mirrors", "sha256", "md5",
+                         "sha1", "sha512", "checksums", "checksum")}
+    ids, first = [], None
+    for it in items[:MAX_METALINK_FILES]:
+        r = handle(ctx, "add", {
+            **keep, "url": it["urls"][0],
+            "mirrors": it["urls"][1:MAX_MIRRORS],
+            "filename": it["filename"],
+            "checksums": it.get("hashes") or {"sha256": it.get("sha256", ""),
+                                              "md5": it.get("md5", "")}})
+        if r.get("ok"):
+            ids.append(r["id"])
+            first = first or r
+    if not first:
+        return {"ok": False, "error": "metalink bos"}
+    return {**first, "ids": ids, "metalink": len(items)}
+
+
+def _add_remote_metalink(ctx, params: dict) -> dict:
+    from .engine import httpcli as _hc
+    cfg = ctx["cfg"]
+    try:
+        opt = _spec_from(params, cfg).options(cfg)
+        # metalink belgeleri bazi sunucularda yanlis Content-Type ile gelir
+        text = _hc.fetch_small(params["url"], opt, allow_html=True,
+                               timeout=min(max(int(opt.timeout), 2), 30),
+                               limit=MAX_FILE)
+    except Exception as e:
+        return {"ok": False, "error": f"metalink: {e}"}
+    try:
+        items = _ml.parse(text)
+    except ValueError as e:
+        return {"ok": False, "error": f"metalink: {e}"}
+    return _add_metalink_items(ctx, items, params)
+
+
+def _add_local_file(ctx, path) -> dict:
+    """Yerel dosyayi kuyruga ekler: .metalink/.meta4 belgesi ya da her
+    satirinda URL olan metin. Dosya icerigi disari verilmez; yalniz
+    kuyruga eklenen islerin kimlikleri doner."""
+    try:
+        p = Path(str(path)).expanduser()
+        if not p.is_file():
+            return {"ok": False, "error": "dosya yok"}
+        if p.stat().st_size > MAX_FILE:
+            return {"ok": False, "error": "dosya cok buyuk"}
+        text = p.read_text("utf-8", errors="replace")
+    except OSError as e:
+        return {"ok": False, "error": f"dosya okunamadi: {e}"}
+    if p.suffix.lower() in (".metalink", ".meta4") \
+            or "<metalink" in text[:4096].lower():
+        try:
+            items = _ml.parse(text)
+        except ValueError as e:
+            return {"ok": False, "error": f"metalink: {e}"}
+        r = _add_metalink_items(ctx, items, {})
+        if r.get("ok"):
+            r["count"] = len(r["ids"])
+        return r
+    urls = parse_url_list(text)
+    if not urls:
+        return {"ok": False, "error": "gecerli URL yok"}
+    ids = []
+    for u in urls:
+        r = handle(ctx, "add", {"url": u})
+        if r.get("ok"):
+            ids.append(r["id"])
+    if not ids:
+        return {"ok": False, "error": "eklenemedi"}
+    return {"ok": True, "ids": ids, "count": len(ids)}
 
 
 def handle(ctx, cmd: str, params: dict) -> dict:
@@ -76,43 +245,25 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         return {"ok": True, "entries": entries, "note": note,
                 "filename": job.final_filename}
     if cmd == "add":
-        if not params.get("url", "").startswith(("http://", "https://")):
+        url = params.get("url", "")
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
             return {"ok": False, "error": "gecersiz URL"}
-        # metalink / .meta4: icindeki dosyalara ac
-        try:
-            from .engine import httpcli as _hc
-            if _ml.looks_like_metalink(params["url"]):
-                opt = _hc.DlOptions(
-                    user_agent=params.get("ua") or cfg.get("user_agent", ""),
-                    headers={}, timeout=int(cfg.get("timeout", 30)))
-                opener = _hc._make_opener(opt)
-                with opener.open(_hc.request_of(params["url"], opt),
-                                 timeout=opt.timeout) as _r:
-                    _text = _r.read().decode("utf-8", "replace")
-                items = _ml.parse(_text)
-                ids = []
-                first = None
-                for it in items[:16]:
-                    r2 = handle(ctx, "add", {
-                        "url": it["urls"][0],
-                        "mirrors": it["urls"][1:],
-                        "filename": it["filename"],
-                        "sha256": it["sha256"], "md5": it["md5"]})
-                    if r2.get("ok"):
-                        ids.append(r2["id"])
-                        first = first or r2
-                return first and {**first, "ids": ids,
-                                  "metalink": len(items)} or {
-                    "ok": False, "error": "metalink bos"}
-        except Exception as e:
-            return {"ok": False, "error": f"metalink: {e}"}
+        if _bad_checksum(params):
+            return {"ok": False, "error": "gecersiz saglama degeri"}
+        # metalink / .meta4: icindeki dosyalara ac (aynalar + saglamalar)
+        if _ml.looks_like_metalink(url):
+            return _add_remote_metalink(ctx, params)
         spec = _spec_from(params, cfg)
-        job = qm.add(spec)
+        job = qm.add(spec, paused=bool(params.get("paused")))
         qm._tick()
         return {"ok": True, "id": job.id, "filename": job.snapshot()["filename"]}
+    if cmd == "add-file":
+        return _add_local_file(ctx, params.get("path", ""))
     if cmd == "add-batch":
         ids = []
-        for item in params.get("items", []):
+        for item in params.get("items") or []:
+            if not isinstance(item, dict):
+                continue
             p = dict(params)
             p.update(item)
             r = handle(ctx, "add", p)
@@ -133,21 +284,37 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         val = params.get("value", 0)
         if isinstance(val, str):
             val = util.parse_size(val)
-        qm.set_speed_limit(int(val or 0))
+        val = int(val or 0)
+        # turbo "limitsiz" demek: kullanici limit sectiginde turbo kapanir,
+        # yoksa dugme TURBO ACIK gorunurken limit uygulanirdi
+        if val > 0 and cfg.get("turbo_mode"):
+            qm.set_turbo(False)
+        qm.set_speed_limit(val)
         return {"ok": True, "speed_limit": qm.cfg["speed_limit"]}
     if cmd == "config-get":
         return {"ok": True, "config": cfg}
     if cmd == "config-set":
-        new = params.get("config") or {}
+        new = params.get("config")
+        new = new if isinstance(new, dict) else {}
         for k, v in new.items():
             if k in cfg:
                 cfg[k] = v
+        _sanitize_config(cfg)
+        # turbo acikken girilen limit / eszamanlilik, turbo kapaninca da
+        # (turbo_prev geri yuklemesiyle) kaybolmasin
+        prev = cfg.get("turbo_prev")
+        if cfg.get("turbo_mode") and isinstance(prev, dict):
+            for k in ("speed_limit", "max_concurrent"):
+                if k in new:
+                    prev[k] = cfg[k]
+        warning = _recheck_download_dir(ctx) if "download_dir" in new else ""
         ctx["set_cfg"](cfg)
         if "speed_limit" in new:
             qm.set_speed_limit(int(cfg.get("speed_limit") or 0))
-        if "segments" in new:
-            cfg["segments"] = max(1, min(32, int(cfg["segments"])))
-        return {"ok": True, "config": cfg}
+        out = {"ok": True, "config": cfg}
+        if warning:
+            out["warning"] = warning
+        return out
     if cmd == "nm-ping":
         import time as _t
         qm.last_nm_ping = _t.time()

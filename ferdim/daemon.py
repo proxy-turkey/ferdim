@@ -15,7 +15,15 @@ from .server import SockServer, make_server
 
 def main() -> int:
     env = AppEnv()
-    cfg = env.load_config()
+    raw = env.load_config()
+    cfg = dict(raw)
+    # el ile duzenlenmis config.json'daki bozuk degerler (ya da acilamayan
+    # indirme dizini) daemon'u devirmesin: guvenli araliga cekilir
+    from . import api
+    api._sanitize_config(cfg, env)
+    if cfg != raw:
+        env.save_config(cfg)
+    env.reload_download_dir(cfg)    # indirme dizini canli cfg'den cozulur
 
     logging.basicConfig(
         filename=env.log_path, level=logging.INFO,
@@ -64,6 +72,15 @@ def main() -> int:
             ClipboardWatcher(qm, cfg).start()
         except Exception as e:
             log.warning("pano izleyici baslatilamadi: %s", e)
+
+    # izlenen klasorler: baglanti listesi / metalink dosyasi birakilinca
+    # otomatik kuyruga eklenir (cfg'de klasor yokken neredeyse masrafsiz)
+    try:
+        from .watch import FolderWatcher
+        FolderWatcher(qm, cfg, env,
+                      lambda p: api.handle(ctx, "add-file", {"path": p})).start()
+    except Exception as e:
+        log.warning("klasor izleyici baslatilamadi: %s", e)
 
     stop = threading.Event()
 

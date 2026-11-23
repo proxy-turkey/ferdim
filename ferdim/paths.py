@@ -31,6 +31,12 @@ DEFAULTS = {
     "turbo_segments": 32,
     "turbo_concurrency": 8,
     "language": "auto",
+    # --- saglamlik / otomasyon (1.4.1) ---
+    "stall_timeout": 20,           # sn: bu kadar sure bayt gelmezse akis durdu
+    "checksum_sidecar": True,      # <url>.sha256/.md5 yan dosyasini otomatik dogrula
+    "watch_dirs": [],              # izlenen klasorler (baglanti listesi / metalink)
+    "watch_done": "delete",        # kuyruga alinan dosya: delete | rename | keep
+    "watch_interval": 3,           # tarama araligi (sn)
 }
 
 
@@ -81,16 +87,28 @@ class AppEnv:
         self.jobs_dir = self.state_dir / "jobs"
         self.log_path = self.state_dir / "ferdim.log"
         self.web_dir = Path(__file__).resolve().parent.parent / "web"
+        self._fixed_dir = root is not None   # test koku: dizin sabittir
+        self._dir_cfg: dict | None = None     # daemon'in canli yapilandirmasi
 
     # --- indirme dizini -------------------------------------------------
     @property
     def download_dir(self) -> Path:
         if self._download_dir is None:
-            cfg = self.load_config()
-            d = cfg.get("download_dir")
+            d = (self._dir_cfg if self._dir_cfg is not None
+                 else self.load_config()).get("download_dir")
             self._download_dir = Path(d).expanduser() if d else default_download_dir()
             self._download_dir.mkdir(parents=True, exist_ok=True)
         return self._download_dir
+
+    def reload_download_dir(self, cfg: dict | None = None) -> None:
+        """Indirme dizini yeniden cozulur: onbellegi bosa cikarir. cfg
+        verilirse dizin bu canli sozlukten okunur (config dosyasi kaydedilmemis
+        olabilir); test kokunde sabit dizin dokunulmaz."""
+        if self._fixed_dir:
+            return
+        if isinstance(cfg, dict):
+            self._dir_cfg = cfg
+        self._download_dir = None
 
     # --- config ----------------------------------------------------------
     def load_config(self) -> dict:

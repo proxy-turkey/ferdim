@@ -1,7 +1,6 @@
 """QueueManager: eszamanli is siniri, zamanlama penceresi, kalici kuyruk."""
 from __future__ import annotations
 
-import datetime as _dt
 import threading
 import time
 
@@ -53,9 +52,13 @@ class QueueManager:
                 pass
 
     # ----------------------------------------------------------------- jobs
-    def add(self, spec: JobSpec, job_id: str | None = None) -> DownloadJob:
+    def add(self, spec: JobSpec, job_id: str | None = None,
+            paused: bool = False) -> DownloadJob:
+        """paused=True: is kuyruga 'durdurulmus' girer, tick baslatmaz."""
         job = DownloadJob(self.env, self.cfg, spec, job_id=job_id,
                           on_change=lambda j: self._notify(j))
+        if paused:
+            job.state = JobState.PAUSED
         with self._lock:
             self.jobs.append(job)
             self._save()
@@ -121,19 +124,25 @@ class QueueManager:
 
     # ------------------------------------------------------------- schedule
     def _schedule_active(self) -> bool:
-        sch = self.cfg.get("schedule", {})
-        if not sch.get("enabled"):
+        """Genel gece penceresi (schedule.enabled); kapaliysa hep acik."""
+        sch = self.cfg.get("schedule")
+        if not (isinstance(sch, dict) and sch.get("enabled")):
             return True
+        return util.window_open(sch.get("start", "02:00"),
+                                sch.get("stop", "08:00"))
+
+    def _in_job_window(self, job) -> bool:
+        """Kategoriye ozgu pencere (schedule.categories): o kategoriden bir
+        is yalniz kendi penceresinde baslar; digerleri kisitlanmaz."""
         try:
-            now = _dt.datetime.now()
-            cur = now.hour * 60 + now.minute
-            s = _map_hm(sch.get("start", "02:00"))
-            e = _map_hm(sch.get("stop", "08:00"))
-            if s <= e:
-                return s <= cur < e
-            return cur >= s or cur < e  # gece yarisini asan pencere
+            sch = self.cfg.get("schedule") or {}
+            cats = sch.get("categories") if isinstance(sch, dict) else None
+            w = cats.get(job.category) if isinstance(cats, dict) else None
         except Exception:
             return True
+        if not w:
+            return True
+        return util.window_open(w.get("start", ""), w.get("stop", ""))
 
     # ---------------------------------------------------------------- ticker
     def _tick_loop(self):
@@ -152,6 +161,8 @@ class QueueManager:
         started = False
         if self._schedule_active():
             slots = max(0, limit - len(running))
+            # kategori penceresi kapali olan isler siralarini bekler
+            queued = [j for j in queued if self._in_job_window(j)]
             if self.cfg.get("smart_queue", True) and slots:
                 # kucuk dosya once: boyutu bilinmeyenleri yoklayici
                 # isaretleyene kadar beklet, sonra kucukten buyuge basla
@@ -246,12 +257,20 @@ class QueueManager:
                 "proxy": j.spec.proxy, "insecure": j.spec.insecure,
                 "referer": j.spec.referer, "ua": j.spec.user_agent,
                 "kind": j.kind, "state": j.state, "created": j.created,
+                # aynalar, saglamalar ve is hiz limiti daemon yeniden
+                # baslasa da kaybolmasin
+                "mirrors": list(j.spec.mirrors or []),
+                "checksums": j.spec.wanted(),
+                "limit": int(j.spec.limit or 0),
             })
         util.atomic_write_json(self.env.state_dir / QUEUE_FILE, data)
 
     def _load(self):
         data = util.read_json(self.env.state_dir / QUEUE_FILE) or []
         for item in data:
+            if not isinstance(item, dict):
+                continue
+            checks = util.normalize_checksums(item.get("checksums") or {})
             spec = JobSpec(
                 url=item.get("url", ""),
                 filename=item.get("filename", ""),
@@ -262,6 +281,14 @@ class QueueManager:
                 user=item.get("user", ""), password=item.get("password", ""),
                 proxy=item.get("proxy", ""), insecure=bool(item.get("insecure")),
                 referer=item.get("referer", ""), user_agent=item.get("ua", ""),
+                mirrors=[m for m in (item.get("mirrors") or [])
+                         if isinstance(m, str)
+                         and m.startswith(("http://", "https://"))],
+                sha256=checks.get("sha256", ""),
+                md5=checks.get("md5", ""),
+                checksums={a: v for a, v in checks.items()
+                           if a not in ("sha256", "md5")},
+                limit=int(item.get("limit", 0) or 0),
             )
             job = DownloadJob(self.env, self.cfg, spec, job_id=item.get("id"))
             job.kind = item.get("kind", "http")
@@ -292,13 +319,20 @@ class QueueManager:
                           (JobState.CONNECTING, JobState.DOWNLOADING)),
             "speed_limit": self.cfg.get("speed_limit", 0),
             "max_concurrent": self.cfg.get("max_concurrent", 3),
-            "download_dir": str(self.env.download_dir),
+            # dizin acilamiyorsa (kaldirilmis disk) istatistik kirilmasin
+            "download_dir": self._download_dir_text(),
             "schedule_active": self._schedule_active(),
             "nm_connected": (time.time() - self.last_nm_ping) < 120,
             "turbo": bool(self.cfg.get("turbo_mode")),
             "language": self.cfg.get("language", "auto"),
             "version": _version(),
         }
+
+    def _download_dir_text(self) -> str:
+        try:
+            return str(self.env.download_dir)
+        except OSError:
+            return ""
 
     def _prober_loop(self):
         """Kuyrukta bekleyen islerin boyutunu arka planda ogrenir; boylece
@@ -337,11 +371,6 @@ class QueueManager:
             if j.state in STATES_RUNNING:
                 j.pause()
         self._save()
-
-
-def _map_hm(s: str) -> int:
-    h, m = s.split(":")
-    return int(h) * 60 + int(m)
 
 
 def _version():

@@ -11,18 +11,20 @@ reach third, research last.**
 
 ## 1.4.x — robustness polish
 
-- [ ] Mirror health scoring: weight the round-robin by measured
+Shipped in **1.4.1** (2026-11-23):
+
+- [x] Mirror health scoring: weight the round-robin by measured
       throughput; demote mirrors that repeatedly fail or stall.
-- [ ] Retry policy: exponential backoff with jitter across sources;
+- [x] Retry policy: exponential backoff with jitter across sources;
       never retry a dead mirror within a job without penalty.
-- [ ] Checksum sidecar auto-discovery: probe `<url>.sha256` /
+- [x] Checksum sidecar auto-discovery: probe `<url>.sha256` /
       `<url>.md5` before the transfer finishes and verify
       automatically when found.
-- [ ] More digests: SHA-1 and SHA-512 (`--sha1`, `--sha512`).
-- [ ] Per-category scheduler windows (e.g. "ISOs only at night").
-- [ ] Watch folders: auto-queue metalink/URL text files dropped into a
+- [x] More digests: SHA-1 and SHA-512 (`--sha1`, `--sha512`).
+- [x] Per-category scheduler windows (e.g. "ISOs only at night").
+- [x] Watch folders: auto-queue metalink/URL text files dropped into a
       configured directory.
-- [ ] Web UI + GTK accessibility pass: full keyboard navigation,
+- [x] Web UI + GTK accessibility pass: full keyboard navigation,
       reduced-motion preferences, screen-reader labels.
 
 ## 1.5 — distribution & reach
@@ -43,6 +45,13 @@ reach third, research last.**
       connection-count timeline; canvas-based, no dependencies.
 - [ ] Queue history in SQLite: search, re-download, aggregate
       statistics (bytes served, average link counts per host).
+- [ ] Carried over from 1.4.1: probe mirrors in the background (not only
+      when a worker first needs them) so an unreachable mirror is reported
+      before it slows anything down; error codes in the API so the UIs can
+      translate engine messages (the engine's own strings are Turkish).
+- [ ] GTK front-end: migrate the add dialog from the deprecated
+      `Gtk.Dialog` to `AdwDialog` / `Gtk.AlertDialog` and add a settings
+      window on par with the web UI.
 
 ## 1.6 — desktop integration
 
