@@ -18,7 +18,7 @@ from ferdim.engine.job import DownloadJob, JobSpec, JobState
 from ferdim.engine.queue import QueueManager
 from ferdim.paths import AppEnv
 from tests.helpers import (DASH_INIT, DASH_SEGS, DATA, DATA_SHA, REQUEST_COUNTS,
-                           start_server)
+                           start_server, tmp_root)
 
 
 def wait_state(job, states, timeout=60):
@@ -38,7 +38,7 @@ class FeatureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv_a, cls.base_a = start_server()
-        cls.env = AppEnv(root=Path(tempfile.mkdtemp(prefix="ferdim-feat-")))
+        cls.env = AppEnv(root=tmp_root(cls, "ferdim-feat-"))
         cls.cfg = cls.env.load_config()
         cls.cfg["max_concurrent"] = 10
 

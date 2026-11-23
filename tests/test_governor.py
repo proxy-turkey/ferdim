@@ -7,7 +7,6 @@ kesifi senaryolari dogrulanir.
 from __future__ import annotations
 
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -16,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ferdim.engine.job as jobmod
 from ferdim.engine.job import DownloadJob, JobSpec, JobState
 from ferdim.paths import AppEnv
+from tests.helpers import tmp_root
 
 
 class FakeTime:
@@ -32,8 +32,8 @@ class FakeTime:
         self.t += 0.01
 
 
-def make_job(segments=6, allowed=2):
-    env = AppEnv(root=Path(tempfile.mkdtemp(prefix="ferdim-gov-")))
+def make_job(case, segments=6, allowed=2):
+    env = AppEnv(root=tmp_root(case, "ferdim-gov-"))
     cfg = env.load_config()
     job = DownloadJob(env, cfg, JobSpec(url="http://x/f.bin",
                                         segments=segments))
@@ -65,7 +65,7 @@ class GovernorTests(unittest.TestCase):
 
     def test_up_probe_accepted(self):
         """Hiz artiyorsa +1 baglanti kabul edilir ve tirmanma planlanir."""
-        job = make_job(segments=6, allowed=2)
+        job = make_job(self, segments=6, allowed=2)
         self._tick(job, 1_000_000)            # olcum + ilk yukari kesif
         self.assertEqual(job._allowed, 3)     # probe: 2 -> 3
         self._tick(job, 3_000_000)            # 3 baglantiyla hiz 3x -> kabul
@@ -79,7 +79,7 @@ class GovernorTests(unittest.TestCase):
 
     def test_up_probe_rejected_reverts(self):
         """Hiz belirgin dustuyse kesif geri alinir, cooldown konur."""
-        job = make_job(segments=6, allowed=2)
+        job = make_job(self, segments=6, allowed=2)
         self._tick(job, 2_000_000)            # probe -> 3, ref=2MB/s
         self.assertEqual(job._allowed, 3)
         self._tick(job, 200_000)              # ciddi kayip -> geri al
@@ -88,7 +88,7 @@ class GovernorTests(unittest.TestCase):
 
     def test_down_probe_releases_surplus(self):
         """Hiz tavanda sabitken fazla baglanti birakilir."""
-        job = make_job(segments=6, allowed=6)
+        job = make_job(self, segments=6, allowed=6)
         job._gov["best"] = 4_000_000
         job._gov["best_workers"] = 6
         job._gov["next_down"] = 0.0
@@ -104,7 +104,7 @@ class GovernorTests(unittest.TestCase):
 
     def test_down_probe_respects_server_floor(self):
         """Sunucu cezasi tabaninin altina inilmez."""
-        job = make_job(segments=6, allowed=3)
+        job = make_job(self, segments=6, allowed=3)
         job._server_floor = 3                  # ceza tabani 3
         job._gov["best"] = 4_000_000
         job._gov["next_down"] = 0.0
@@ -114,14 +114,14 @@ class GovernorTests(unittest.TestCase):
 
     def test_limit_penalty_blocks_growth(self):
         """429/503 cezasi penceresinde yukari kesif yapilmaz."""
-        job = make_job(segments=6, allowed=2)
+        job = make_job(self, segments=6, allowed=2)
         job._last_limit_ts = self.ft.t         # hemen simdi ceza
         job._gov["next_up"] = 0.0
         self._tick(job, 1_000_000)
         self.assertEqual(job._allowed, 2)      # buyume engellendi
 
     def test_shrink_sets_floor_and_penalty(self):
-        job = make_job(segments=6, allowed=8)
+        job = make_job(self, segments=6, allowed=8)
         job._shrink("HTTP 503")
         self.assertEqual(job._allowed, 4)
         self.assertEqual(job._server_floor, 4)

@@ -10,7 +10,6 @@ import os
 import random
 import re
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -29,7 +28,7 @@ from ferdim.i18n import S
 from ferdim import paths
 from ferdim.paths import AppEnv
 from ferdim.watch import FolderWatcher, parse_url_list
-from tests.helpers import DATA, DATA_SHA, TINY, start_server
+from tests.helpers import DATA, DATA_SHA, TINY, start_server, tmp_root
 
 
 def wait_state(job, states, timeout=60):
@@ -45,9 +44,9 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def dead_job(url, cfg, **kw):
+def dead_job(case, url, cfg, **kw):
     """Ag istemeden _process_range deneysin diye hazirlanmis is."""
-    env = AppEnv(root=Path(tempfile.mkdtemp(prefix="ferdim-unit-")))
+    env = AppEnv(root=tmp_root(case, "ferdim-unit-"))
     job = DownloadJob(env, cfg, JobSpec(url=url, **kw))
     job.state = JobState.DOWNLOADING
     job.total = 1_000_000
@@ -70,7 +69,7 @@ class MirrorHealthTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv, cls.base = start_server()
-        cls.env = AppEnv(root=Path(tempfile.mkdtemp(prefix="ferdim-rm-")))
+        cls.env = AppEnv(root=tmp_root(cls, "ferdim-rm-"))
         cls.cfg = cls.env.load_config()
 
     @classmethod
@@ -238,7 +237,7 @@ class MirrorHealthTests(unittest.TestCase):
             def close(self):
                 pass
 
-        job = dead_job(f"{self.base}/file.bin", cfg)
+        job = dead_job(self, f"{self.base}/file.bin", cfg)
         real = httpcli.open_range
         httpcli.open_range = lambda *a, **k: Boom()
         try:
@@ -296,7 +295,7 @@ class MirrorHealthTests(unittest.TestCase):
         yavas bir baglantida duraklama (ya da cokme) sonrasi o aralik
         kaybolup 'eksik veri' uretmez."""
         cfg = dict(self.cfg)
-        job = dead_job(f"{self.base}/file.bin", cfg, segments=2)
+        job = dead_job(self, f"{self.base}/file.bin", cfg, segments=2)
         job._pending = [(500_000, 700_000)]
         job._inflight[0] = (0, 299_999)
         job._checkpoint(force=True)
@@ -310,7 +309,7 @@ class MirrorHealthTests(unittest.TestCase):
         indirir, eski isci (okumasi bitince) sessizce cekilir - araligi
         ikinci kez kuyruga eklemez, veri yazmaz."""
         cfg = dict(self.cfg)
-        job = dead_job(f"{self.base}/file.bin", cfg, segments=2)
+        job = dead_job(self, f"{self.base}/file.bin", cfg, segments=2)
         t, gate = self._lingering_worker(job)
         job._threads = []              # birlesme beklemesin: isci hala okumada
         job.pause()
@@ -333,7 +332,7 @@ class MirrorHealthTests(unittest.TestCase):
     def test_15_pause_lingering_worker_requeues_when_still_stopped(self):
         """Duraklama surerken okumasi biten isci kalan araligi iade eder."""
         cfg = dict(self.cfg)
-        job = dead_job(f"{self.base}/file.bin", cfg, segments=2)
+        job = dead_job(self, f"{self.base}/file.bin", cfg, segments=2)
         t, gate = self._lingering_worker(job)
         job._stop.set()
         gate.set()
@@ -445,7 +444,7 @@ class ChecksumTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv, cls.base = start_server()
-        cls.env = AppEnv(root=Path(tempfile.mkdtemp(prefix="ferdim-chk-")))
+        cls.env = AppEnv(root=tmp_root(cls, "ferdim-chk-"))
         cls.cfg = cls.env.load_config()
 
     @classmethod
@@ -626,9 +625,9 @@ class ChecksumTests(unittest.TestCase):
         self.assertEqual(job.extra["checksum"], "mismatch")
 
 
-def fresh_env(prefix="ferdim-q-") -> AppEnv:
+def fresh_env(case, prefix="ferdim-q-") -> AppEnv:
     """Her testin kendi kuyruk dosyini almasi icin temiz kok."""
-    return AppEnv(root=Path(tempfile.mkdtemp(prefix=prefix)))
+    return AppEnv(root=tmp_root(case, prefix))
 
 
 class QueueRoadmapTests(unittest.TestCase):
@@ -642,7 +641,7 @@ class QueueRoadmapTests(unittest.TestCase):
 
     def test_01_persistence_roundtrip(self):
         """Ayna, saglama ve hiz limiti daemon yeniden baslasa da kaybolmaz."""
-        env = fresh_env()
+        env = fresh_env(self)
         cfg = env.load_config()
         cfg["max_concurrent"] = 1
         cfg["schedule"] = {"enabled": True, "start": "00:00", "stop": "00:00"}
@@ -677,7 +676,7 @@ class QueueRoadmapTests(unittest.TestCase):
             return (now + _dt.timedelta(hours=delta_h)).strftime("%H:%M")
 
         closed_w = {"start": hm(2), "stop": hm(3)}
-        env = fresh_env()
+        env = fresh_env(self)
         cfg = env.load_config()
         cfg["max_concurrent"] = 4
         cfg["smart_queue"] = False
@@ -708,7 +707,7 @@ class QueueRoadmapTests(unittest.TestCase):
         env._fixed_dir = False
         env._download_dir = None
         env._dir_cfg = None
-        env.state_dir = Path(tempfile.mkdtemp(prefix="ferdim-dir-"))
+        env.state_dir = tmp_root(self, "ferdim-dir-")
         env.jobs_dir = env.state_dir / "jobs"
         env.jobs_dir.mkdir(parents=True)
         env.config_path = env.state_dir / "config.json"
@@ -745,12 +744,12 @@ class QueueRoadmapTests(unittest.TestCase):
         self.assertTrue(util.window_open("", "", noon))
 
     def test_04_watch_folder_queues_and_consumes(self):
-        env = fresh_env()
+        env = fresh_env(self)
         cfg = env.load_config()
         cfg["max_concurrent"] = 2
         qm = QueueManager(env, cfg)
         ctx = {"qm": qm, "env": env, "cfg": cfg, "set_cfg": env.save_config}
-        d = Path(tempfile.mkdtemp(prefix="ferdim-watch-"))
+        d = tmp_root(self, "ferdim-watch-")
         xml = f"""<?xml version="1.0"?><metalink version="3.0"
          xmlns="urn:ietf:params:xml:ns:metalink"><file name="tiny.metalink.bin">
          <hash type="sha-256">{hashlib.sha256(TINY).hexdigest()}</hash>
@@ -784,12 +783,12 @@ class QueueRoadmapTests(unittest.TestCase):
             qm.shutdown()
 
     def test_05_watch_folder_keep_mode(self):
-        env = fresh_env()
+        env = fresh_env(self)
         cfg = env.load_config()
         cfg["max_concurrent"] = 1
         qm = QueueManager(env, cfg)
         ctx = {"qm": qm, "env": env, "cfg": cfg, "set_cfg": env.save_config}
-        d = Path(tempfile.mkdtemp(prefix="ferdim-watch2-"))
+        d = tmp_root(self, "ferdim-watch2-")
         f = d / "x.urls"
         f.write_text(f"{self.base}/tiny.bin?k=1\n", "utf-8")
         os.utime(f, (time.time() - 30,) * 2)
@@ -822,14 +821,14 @@ class QueueRoadmapTests(unittest.TestCase):
                                             limit=10)), 10)
 
     def test_07_add_file_api(self):
-        env = fresh_env()
+        env = fresh_env(self)
         cfg = env.load_config()
         qm = QueueManager(env, cfg)
         ctx = {"qm": qm, "env": env, "cfg": cfg, "set_cfg": env.save_config}
         try:
             r = api.handle(ctx, "add-file", {"path": "/yok/bir/dosya.txt"})
             self.assertFalse(r["ok"])
-            d = Path(tempfile.mkdtemp(prefix="ferdim-addfile-"))
+            d = tmp_root(self, "ferdim-addfile-")
             f = d / "l.txt"
             f.write_text(f"{self.base}/tiny.bin?a=1\nnot a url\n", "utf-8")
             r = api.handle(ctx, "add-file", {"path": str(f)})
@@ -848,7 +847,7 @@ class ApiBehaviorTests(unittest.TestCase):
     gecersiz saglamanin reddi, turbo/limit uyumu, indirme dizini degisimi."""
 
     def setUp(self):
-        self.env = fresh_env("ferdim-api-")
+        self.env = fresh_env(self, "ferdim-api-")
         self.cfg = self.env.load_config()
         self.qm = QueueManager(self.env, self.cfg)
         self.ctx = {"qm": self.qm, "env": self.env, "cfg": self.cfg,
@@ -949,7 +948,7 @@ class ApiBehaviorTests(unittest.TestCase):
         env._fixed_dir = False
         env._download_dir = None
         env._dir_cfg = None
-        d = Path(tempfile.mkdtemp(prefix="ferdim-dl-"))
+        d = tmp_root(self, "ferdim-dl-")
         env.config_path = d / "config.json"
         one, two = d / "bir", d / "iki"
         env.config_path.write_text(json.dumps({"download_dir": str(one)}))

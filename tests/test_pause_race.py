@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -30,7 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ferdim import util
 from ferdim.engine.job import DownloadJob, JobSpec, JobState
 from ferdim.paths import AppEnv
-from tests.helpers import DASH_INIT, DASH_SEGS, DATA, SEG, start_server
+from tests.helpers import (DASH_INIT, DASH_SEGS, DATA, SEG, start_server,
+                           tmp_root)
 
 
 def wait_until(pred, timeout=20.0):
@@ -53,7 +53,7 @@ class PauseRaceTests(unittest.TestCase):
         cls.srv.shutdown()
 
     def _job(self, url, **kw) -> DownloadJob:
-        env = AppEnv(root=Path(tempfile.mkdtemp(prefix="ferdim-pause-")))
+        env = AppEnv(root=tmp_root(self, "ferdim-pause-"))
         return DownloadJob(env, env.load_config(), JobSpec(url=url, **kw))
 
     def _pause_in_start_window(self, job: DownloadJob):

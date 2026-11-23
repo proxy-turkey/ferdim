@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ferdim.engine.job import DownloadJob, JobSpec, JobState
 from ferdim.paths import AppEnv
-from tests.helpers import DATA, DATA_SHA, SEG, start_server
+from tests.helpers import DATA, DATA_SHA, SEG, start_server, tmp_root
 
 
 def wait_state(job, states, timeout=30):
@@ -30,10 +30,9 @@ def sha(path: Path) -> str:
 class EngineTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import tempfile
         cls.srv, cls.base = start_server()
         # her run kendi temiz kokunu alir (stale dosya isim cakismasi olmasin)
-        cls.env = AppEnv(root=Path(tempfile.mkdtemp(prefix="ferdim-engine-")))
+        cls.env = AppEnv(root=tmp_root(cls, "ferdim-engine-"))
 
     @classmethod
     def tearDownClass(cls):

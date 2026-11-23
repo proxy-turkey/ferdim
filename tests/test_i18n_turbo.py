@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ferdim.engine.queue import QueueManager
 from ferdim.i18n import LANGS, S, detect_lang, dict_for, t
 from ferdim.paths import AppEnv
+from tests.helpers import tmp_root
 
 
 class I18nTests(unittest.TestCase):
@@ -39,7 +39,7 @@ class I18nTests(unittest.TestCase):
 
 class TurboTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="ferdim-turbo-"))
+        self.root = tmp_root(self, "ferdim-turbo-")
         self.env = AppEnv(root=self.root)
         self.cfg = self.env.load_config()
         # varsayilan artik azami guc; bu test ac/kapa mantigini izole eder

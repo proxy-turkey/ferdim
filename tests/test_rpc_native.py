@@ -8,7 +8,6 @@ import signal
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 import urllib.request
@@ -18,7 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from ferdim.client import FerdimClient
-from tests.helpers import DATA, DATA_SHA, start_server
+from tests.helpers import DATA, DATA_SHA, start_server, tmp_root
 
 
 def _env(root: Path) -> dict:
@@ -36,7 +35,7 @@ class RpcNativeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv, cls.base = start_server()
-        cls.root = Path(tempfile.mkdtemp(prefix="ferdim-rpc-"))
+        cls.root = tmp_root(cls, "ferdim-rpc-")
         # testler gercek ~/Downloads'a yazmasin
         cfgdir = cls.root / "config" / "ferdim"
         cfgdir.mkdir(parents=True, exist_ok=True)

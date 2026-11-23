@@ -27,6 +27,7 @@ from ferdim.engine.job import DownloadJob, JobSpec, JobState
 from ferdim.engine.queue import QueueManager
 from ferdim.paths import AppEnv
 from ferdim.ratelimit import TokenBucket
+from tests.helpers import tmp_root
 
 DATA = os.urandom(768 * 1024 + 321)
 PAUSE_DATA = os.urandom(1536 * 1024)
@@ -272,7 +273,7 @@ class FtpTests(unittest.TestCase):
         cls.srv.close()
 
     def setUp(self):
-        self.env = AppEnv(root=Path(tempfile.mkdtemp(prefix="ferdim-ftp-")))
+        self.env = AppEnv(root=tmp_root(self, "ferdim-ftp-"))
 
     def _job(self, url: str, **kw) -> DownloadJob:
         return DownloadJob(self.env, self.env.load_config(),

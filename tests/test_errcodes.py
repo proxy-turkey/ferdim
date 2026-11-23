@@ -6,7 +6,6 @@ import errno
 import hashlib
 import os
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -23,7 +22,7 @@ from ferdim.engine.job import (DownloadJob, JobSpec, JobState, SourceInvalid,
 from ferdim.i18n import LANGS, S, error_text
 from ferdim.paths import AppEnv
 from tests import helpers
-from tests.helpers import DATA, DATA_SHA, REQUEST_COUNTS, start_server
+from tests.helpers import DATA, DATA_SHA, REQUEST_COUNTS, start_server, tmp_root
 
 CODES = ("not_found", "forbidden", "auth", "source_changed", "no_sources",
          "checksum_mismatch", "disk", "network", "stall", "size_mismatch",
@@ -80,7 +79,7 @@ class ErrorCodeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv, cls.base = start_server()
-        cls.env = AppEnv(root=Path(tempfile.mkdtemp(prefix="ferdim-err-")))
+        cls.env = AppEnv(root=tmp_root(cls, "ferdim-err-"))
         cls.cfg = cls.env.load_config()
 
     @classmethod
@@ -171,7 +170,7 @@ class MirrorProbeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv, cls.base = start_server()
-        cls.env = AppEnv(root=Path(tempfile.mkdtemp(prefix="ferdim-probe-")))
+        cls.env = AppEnv(root=tmp_root(cls, "ferdim-probe-"))
         cls.cfg = cls.env.load_config()
 
     @classmethod

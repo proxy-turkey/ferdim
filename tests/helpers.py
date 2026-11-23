@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
+import tempfile
 import threading
 import time
 import urllib.parse
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 DATA = os.urandom(4 * 1024 * 1024 + 7777)  # 4 MB + tuhaf kuyruk
 LIMIT_DATA = DATA                          # limitli yol: 4 MB (bolluk icin)
@@ -266,6 +269,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
         else:
             self._send(404, b"yok")
+
+
+def tmp_root(case, prefix: str = "ferdim-test-") -> Path:
+    """Gecici test koku; test (veya sinif) bitince silinir.
+
+    TestCase ornegi de sinif da verilebilir. Silme islemi ilk kaydedilen
+    cleanup oldugu icin LIFO sirasinda en son calisir: isler/sunucular
+    kapanmadan dizin kaldirilmaz.
+    """
+    root = Path(tempfile.mkdtemp(prefix=prefix))
+    if isinstance(case, type):
+        case.addClassCleanup(shutil.rmtree, root, ignore_errors=True)
+    else:
+        case.addCleanup(shutil.rmtree, root, ignore_errors=True)
+    return root
 
 
 def start_server() -> tuple[ThreadingHTTPServer, str]:

@@ -14,7 +14,6 @@ import select
 import socket
 import socketserver
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -30,7 +29,7 @@ from ferdim.engine import httpcli, socks
 from ferdim.engine.job import (DownloadJob, JobSpec, JobState, _code_for,
                                _describe_error)
 from ferdim.paths import AppEnv
-from tests.helpers import DATA_SHA, TINY, start_server
+from tests.helpers import DATA_SHA, TINY, start_server, tmp_root
 from tests.test_ftp import FtpServer
 
 TINY_SHA = hashlib.sha256(TINY).hexdigest()
@@ -190,7 +189,7 @@ class SocksTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.http, cls.base = start_server()
-        cls.env = AppEnv(root=Path(tempfile.mkdtemp(prefix="ferdim-socks-")))
+        cls.env = AppEnv(root=tmp_root(cls, "ferdim-socks-"))
         cls.cfg = cls.env.load_config()
 
     @classmethod
