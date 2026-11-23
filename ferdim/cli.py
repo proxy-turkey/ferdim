@@ -180,6 +180,53 @@ def cmd_remove(a, env):
     return 0 if r.get("ok") else 1
 
 
+def cmd_history(a, env):
+    with _client(env) as c:
+        if a.stats:
+            r = c.request("history-stats")
+            if not r.get("ok"):
+                print(_("cli_error") + ":", r.get("error", ""), file=sys.stderr)
+                return 1
+            print(_("hist_stats", n=r.get("count", 0),
+                    bytes=util.human_size(r.get("bytes", 0))))
+            for h in r.get("hosts", []):
+                print("  " + _("hist_host_line", host=h.get("host", ""),
+                               n=h.get("count", 0),
+                               links=f"{h.get('avg_links') or 0:.1f}",
+                               speed=util.human_size(h.get("avg_speed") or 0)))
+            return 0
+        if a.clear:
+            r = c.request("history-clear", older_than=a.older_than)
+            if not r.get("ok"):
+                print(_("cli_error") + ":", r.get("error", ""), file=sys.stderr)
+                return 1
+            print(_("hist_cleared", n=r.get("removed", 0)))
+            return 0
+        if a.redownload:
+            r = c.request("history-redownload", id=a.redownload)
+            if not r.get("ok"):
+                print(_("cli_error") + ":", r.get("error", ""), file=sys.stderr)
+                return 1
+            print(f"{_('cli_added')}: {r['id']}  ->  {r['filename']}")
+            return 0
+        r = c.request("history", q=a.query or "", state=a.state or "",
+                      limit=a.limit)
+    if not r.get("ok"):
+        print(_("cli_error") + ":", r.get("error", ""), file=sys.stderr)
+        return 1
+    items = r.get("items") or []
+    if not items:
+        print(_("hist_empty"))
+        return 0
+    for it in items:
+        when = time.strftime("%Y-%m-%d %H:%M",
+                             time.localtime(it.get("finished_at") or 0))
+        print(f"{it['id']:<10} {_('st_' + it['state']):<10} "
+              f"{util.human_size(it.get('bytes')):>9}  {when}  "
+              f"{it.get('filename', '')}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ferdim",
@@ -248,6 +295,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("config", help="yapilandirmayi goster/degistir")
     sp.add_argument("--set", help='JSON, orn \'{"segments":16}\'')
     sp.set_defaults(fn=cmd_config)
+
+    sp = sub.add_parser("history",
+                        help="indirme gecmisi: ara, yeniden indir, istatistik")
+    sp.add_argument("query", nargs="?", default="", help="metin aramasi")
+    sp.add_argument("--state", choices=["done", "error", "canceled"],
+                    help="durum suzgeci")
+    sp.add_argument("--limit", type=int, default=50, help="en cok kayit")
+    sp.add_argument("--stats", action="store_true",
+                    help="toplam bayt, kayit ve sunucu basina ortalamalar")
+    sp.add_argument("--redownload", metavar="ID",
+                    help="kaydi ayni URL/ayarlarla yeniden kuyruga al")
+    sp.add_argument("--clear", action="store_true", help="gecmisi sil")
+    sp.add_argument("--older-than", type=int, metavar="DAYS",
+                    help="--clear ile: yalniz bu gunden eski kayitlar")
+    sp.set_defaults(fn=cmd_history)
 
     sp = sub.add_parser("daemon", help="arka plan servisini on planda calistir")
     sp.set_defaults(fn=cmd_daemon)

@@ -289,6 +289,10 @@ class DownloadJob:
         self._last_checkpoint = 0.0
         self._speed_done_mark = 0
         self._speed_mark_ts = time.monotonic()
+        # gecmis icin baglanti sayisi ornekleri (kuyruk tick'i toplar)
+        self._links_sum = 0
+        self._links_samples = 0
+        self._links_peak = 0
         self._meta: dict = {}
         self.extra: dict = {}
         # --- kaynak sagligi (birincil + aynalar) ve yeniden deneme ---
@@ -1764,7 +1768,7 @@ class DownloadJob:
             })
 
     def update_speed(self):
-        """QueueManager ticker'i cagirir."""
+        """QueueManager ticker'i cagirir; hiz ve baglanti ornekleri."""
         now = time.monotonic()
         with self._lock:
             dt = now - self._speed_mark_ts
@@ -1772,6 +1776,11 @@ class DownloadJob:
                 self.speed = (self.done - self._speed_done_mark) / dt
                 self._speed_done_mark = self.done
                 self._speed_mark_ts = now
+                if self.state in (JobState.CONNECTING, JobState.DOWNLOADING):
+                    n = self._active
+                    self._links_sum += n
+                    self._links_samples += 1
+                    self._links_peak = max(self._links_peak, n)
 
 
 def _ensure_ext(name: str) -> str:

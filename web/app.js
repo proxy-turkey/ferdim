@@ -17,6 +17,7 @@ const HIST_SEC = 120;       // HIST_MAX * 0.5 sn
 let T = {};                 // aktif ceviri sozlugu
 let LANG = localStorage.getItem("ferdimLang") || "";
 let jobs = [], cfg = {}, filter = "all", lastStats = {};
+let histTimer = 0;          // gecmis aramasi icin bekleme
 let states = new Map();     // is kimligi -> onceki durum (duyuru icin)
 let primed = false;         // ilk tarama yapildi mi (ilk tarama duyurulmaz)
 let polling = false;
@@ -397,15 +398,19 @@ function renderStatus() {
 }
 
 function announce() {
+  let finished = false;
   if (primed) {
     for (const j of jobs) {
       const old = states.get(j.id);
-      if (old && old !== j.state && FINAL.has(j.state))
+      if (old && old !== j.state && FINAL.has(j.state)) {
         say(trf("done_announce", { name: j.filename, state: tr("st_" + j.state) }));
+        finished = true;
+      }
     }
   }
   states = new Map(jobs.map((j) => [j.id, j.state]));
   primed = true;
+  if (finished) { loadHistory(); loadHistStats(); }
 }
 
 async function poll() {
@@ -456,6 +461,85 @@ async function act(kind, id) {
   poll();
 }
 $("#zipClose").onclick = () => $("#zipDlg").close();
+
+/* --------------------------------------------------------------- gecmis */
+/* Sunucudaki SQLite gecmisi: arama, istatistik ve yeniden indirme. Satirlar
+ * sunucudan gelen metinle kurulur; hepsi textContent ile yazilir. */
+function historyRow(h) {
+  const again = dom("button", {
+    class: "act", type: "button",
+    "aria-label": tr("hist_redownload") + ": " + (h.filename || h.url),
+    title: tr("hist_redownload"), text: "↻",
+  });
+  again.onclick = () => redownload(h.id);
+  const when = h.finished_at
+    ? new Date(h.finished_at * 1000).toLocaleString() : "";
+  return dom("li", { class: "histrow" },
+    dom("div", { class: "hname" },
+      dom("span", { class: "fname", text: h.filename || h.url }), again),
+    dom("div", { class: "url", text: h.url }),
+    dom("div", { class: "dim", text: trf("hist_meta", {
+      state: tr("st_" + h.state), size: human(h.bytes), date: when,
+      host: h.host || "—" }) }),
+    dom("div", { class: "dim", text: trf("hist_links", {
+      avg: Number(h.avg_links || 0).toFixed(1), peak: h.peak_links || 0 }) }));
+}
+
+async function loadHistory() {
+  let r = {};
+  try {
+    r = await api("/api/history", {
+      q: $("#histSearch").value.trim(), state: $("#histState").value,
+      limit: 100 });
+  } catch { r = {}; }
+  const list = $("#histList");
+  const empty = $("#histEmpty");
+  if (!r || !r.ok) {
+    list.replaceChildren();
+    empty.hidden = true;
+    $("#histStats").textContent = tr("hist_failed");
+    return;
+  }
+  list.replaceChildren(...r.items.map(historyRow));
+  empty.textContent = tr($("#histSearch").value.trim() || $("#histState").value
+    ? "hist_none" : "hist_empty");
+  empty.hidden = r.items.length > 0;
+}
+
+async function loadHistStats() {
+  let r = {};
+  try { r = await api("/api/history-stats", {}); } catch { return; }
+  if (!r || !r.ok) return;
+  const out = [trf("hist_stats",
+    { n: r.count || 0, bytes: human(r.bytes || 0) })];
+  for (const h of (r.hosts || []).slice(0, 3))
+    out.push(trf("hist_host_line", {
+      host: h.host, n: h.count || 0,
+      links: Number(h.avg_links || 0).toFixed(1),
+      speed: rate(h.avg_speed || 0) }));
+  $("#histStats").textContent = out.join("  ·  ");
+}
+
+async function redownload(id) {
+  let r = {};
+  try { r = await api("/api/history-redownload", { id }); } catch { r = {}; }
+  if (!r || !r.ok) { notice(tr("add_failed")); return; }
+  notice(trf("hist_redownloaded", { name: r.filename || "" }));
+  poll();
+}
+
+$("#histSearch").addEventListener("input", () => {
+  clearTimeout(histTimer);
+  histTimer = setTimeout(loadHistory, 300);
+});
+$("#histState").onchange = loadHistory;
+$("#histClear").onclick = async () => {
+  if (!confirm(tr("hist_confirm_clear"))) return;
+  let r = {};
+  try { r = await api("/api/history-clear", {}); } catch { r = {}; }
+  if (r && r.ok) notice(trf("hist_cleared", { n: r.removed || 0 }));
+  loadHistory(); loadHistStats();
+};
 
 /* ---- sekmeler (roving tabindex + ok tuslari; odak secimi takip eder) ---- */
 const tablist = $('[role="tablist"]');
@@ -593,6 +677,7 @@ $("#settingsBtn").onclick = async () => {
   $("#setRetries").value = cfg.retries ?? 5;
   $("#setTimeout").value = cfg.timeout ?? 30;
   $("#setStall").value = cfg.stall_timeout ?? 20;
+  $("#setHistDays").value = cfg.history_days ?? 365;
   setDlg.showModal();
 };
 $("#setClose").onclick = () => setDlg.close();
@@ -620,12 +705,14 @@ $("#setSave").onclick = async () => {
     retries: num("#setRetries", 0, 20, cfg.retries ?? 5),
     timeout: num("#setTimeout", 5, 300, cfg.timeout ?? 30),
     stall_timeout: num("#setStall", 5, 120, cfg.stall_timeout ?? 20),
+    history_days: num("#setHistDays", 0, 3650, cfg.history_days ?? 365),
   } });
   if (r && r.config) cfg = r.config;
   notice(r && r.warning === "download_dir" ? tr("warn_dir") : tr("saved"));
   localStorage.setItem("ferdimLang", lang === "auto" ? "" : lang);
   setDlg.close();
   await loadLang(lang);
+  loadHistory(); loadHistStats();
   poll();
 };
 
@@ -635,5 +722,7 @@ $("#setSave").onclick = async () => {
   const r = await api("/api/config").catch(() => ({}));
   if (r && r.config) cfg = r.config;
   await poll();
+  await loadHistory();
+  await loadHistStats();
   setInterval(poll, 500);
 })();

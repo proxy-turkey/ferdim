@@ -173,3 +173,25 @@ dialog select,dialog textarea{width:100%;margin-top:4px}
 .ziprow .n{font-family:ui-monospace,monospace;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
 .ziprow .s{color:var(--dim);white-space:nowrap}
+
+/* --------------------------------------------------------------- gecmis */
+.history{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}
+.histhead{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.histhead h2{font-size:14px;letter-spacing:.3px}
+.histhead .mini{background:transparent;border:0;color:var(--dim);font:inherit;
+  font-size:12px;cursor:pointer;padding:6px 10px;border-radius:8px}
+.histhead .mini:hover{background:var(--panel2);color:var(--text)}
+.histtools{display:grid;grid-template-columns:minmax(220px,1fr) 150px;gap:8px;
+  margin:8px 0}
+.histstats{font-size:12px;margin-bottom:6px}
+.histlist{list-style:none;display:flex;flex-direction:column;gap:6px}
+.histrow{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:7px 10px;font-size:13px}
+.histrow .hname{display:flex;align-items:center;justify-content:space-between;
+  gap:8px}
+.histrow .hname .fname{font-weight:600;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+.histrow .url{font-size:11px;color:var(--dim);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.histrow:hover{outline:1px solid var(--line)}
+@media (max-width: 840px){ .histtools{grid-template-columns:1fr} }

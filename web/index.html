@@ -88,6 +88,26 @@
     <p data-i18n="empty_title">Kuyruk boş.</p>
     <p class="dim" data-i18n="empty_hint"></p>
   </div>
+  <section class="history" aria-labelledby="histH">
+    <div class="histhead">
+      <h2 id="histH" data-i18n="hist_title">Geçmiş</h2>
+      <button type="button" class="mini" id="histClear" data-i18n="hist_clear">Geçmişi temizle</button>
+    </div>
+    <div class="histtools">
+      <label class="sr-only" for="histSearch" data-i18n="hist_search">Geçmişte ara</label>
+      <input id="histSearch" type="search" data-i18n-ph="hist_search_ph" placeholder="Dosya, adres ya da sunucu ara" autocomplete="off" spellcheck="false">
+      <label class="sr-only" for="histState" data-i18n="hist_state">Durum</label>
+      <select id="histState">
+        <option value="" data-i18n="hist_all">Tümü</option>
+        <option value="done" data-i18n="st_done">Tamam</option>
+        <option value="error" data-i18n="st_error">Hata</option>
+        <option value="canceled" data-i18n="st_canceled">İptal</option>
+      </select>
+    </div>
+    <p id="histStats" class="dim histstats"></p>
+    <ul id="histList" class="histlist"></ul>
+    <p id="histEmpty" class="dim" hidden data-i18n="hist_empty">Geçmiş boş.</p>
+  </section>
 </main>
 
 <footer>
@@ -149,6 +169,7 @@
         <option value="rename" data-i18n="watch_rename">.done olarak yeniden adlandır</option>
       </select></label>
     <label class="chk"><input type="checkbox" id="setSidecar"> <span data-i18n="lbl_sidecar">Sağlamaları otomatik doğrula (.sha256 / .md5 yan dosyaları)</span></label>
+    <label><span data-i18n="hist_days">Geçmiş saklama (gün; 0 = sınırsız)</span> <input id="setHistDays" type="number" min="0" max="3650"></label>
     <details class="adv">
       <summary data-i18n="lbl_advanced">Gelişmiş</summary>
       <div class="grid3">

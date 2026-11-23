@@ -316,6 +316,29 @@ with sync_playwright() as p:
     page.click("#setSave")
     page.wait_for_timeout(800)
 
+    # --------------------------------------------------------- geçmiş
+    page.wait_for_selector("#histList .histrow", timeout=10000)
+    htxt = page.inner_text("#histList")
+    check("gecmis: biten isler listelenir", "arsiv.zip" in htxt and "yok-iso.iso" in htxt)
+    check("gecmis: istatistik ozeti", page.evaluate(
+        "() => /[0-9]/.test(document.querySelector('#histStats').textContent)"))
+    check("gecmis: yeniden indirme dugmesi odaklanabilir", page.evaluate("""() => {
+        const b = document.querySelector('#histList .act');
+        if (!b) return false;
+        b.focus();
+        return document.activeElement === b
+          && (b.getAttribute('aria-label') || '').length > 0; }"""))
+    page.fill("#histSearch", "arsiv")
+    page.wait_for_timeout(700)
+    check("gecmis: arama suzgeci", "arsiv.zip" in page.inner_text("#histList")
+          and "yok-iso.iso" not in page.inner_text("#histList"))
+    page.fill("#histSearch", "zzz-yok")
+    page.wait_for_timeout(700)
+    check("gecmis: sonuc yok mesaji", page.is_visible("#histEmpty")
+          and "Eşleşen kayıt yok" in page.inner_text("#histEmpty"))
+    page.fill("#histSearch", "")
+    page.wait_for_timeout(700)
+
     # -------------------------------------------------- azaltılmış hareket
     ctx2 = browser.new_context(viewport={"width": 1280, "height": 800},
                                reduced_motion="reduce", locale="tr-TR")

@@ -5,6 +5,7 @@ import threading
 import time
 
 from .. import util
+from ..history import STATES as HISTORY_STATES, open_history
 from ..paths import AppEnv
 from .job import DownloadJob, JobSpec, JobState
 
@@ -24,6 +25,10 @@ class QueueManager:
         self._running = False
         self._ticker: threading.Thread | None = None
         self.last_nm_ping = 0.0
+        self.history = open_history(env)
+        self._hist_state: dict[str, str] = {}   # is -> yazilmis son durum
+        # saklama suresi (gun): 0 = sonsuza kadar; hata kuyrugu durdurmaz
+        self.history.prune(cfg.get("history_days", 365))
         self._load()
         self._running = True
         self._size_probed: set[str] = set()
@@ -51,12 +56,24 @@ class QueueManager:
             except Exception:
                 pass
 
+    def _job_changed(self, job):
+        """Is degisti: dinleyicilere iletir; BITEN isi gecmise yazar.
+        Gecmis hatasi (disk dolu, bozuk DB) kuyrugu asla durdurmaz."""
+        self._notify(job)
+        state = job.state
+        if state in HISTORY_STATES and self._hist_state.get(job.id) != state:
+            self._hist_state[job.id] = state
+            try:
+                self.history.record(job)
+            except Exception:
+                pass
+
     # ----------------------------------------------------------------- jobs
     def add(self, spec: JobSpec, job_id: str | None = None,
             paused: bool = False) -> DownloadJob:
         """paused=True: is kuyruga 'durdurulmus' girer, tick baslatmaz."""
         job = DownloadJob(self.env, self.cfg, spec, job_id=job_id,
-                          on_change=lambda j: self._notify(j))
+                          on_change=self._job_changed)
         if paused:
             job.state = JobState.PAUSED
         with self._lock:
@@ -115,6 +132,7 @@ class QueueManager:
                 pass
         with self._lock:
             self.jobs.remove(job)
+            self._hist_state.pop(job.id, None)
             self._save()
         self._notify()
         return True
@@ -124,6 +142,7 @@ class QueueManager:
             for j in list(self.jobs):
                 if j.state in (JobState.DONE, JobState.ERROR, JobState.CANCELED):
                     self.jobs.remove(j)
+                    self._hist_state.pop(j.id, None)
             self._save()
 
     # ------------------------------------------------------------- schedule

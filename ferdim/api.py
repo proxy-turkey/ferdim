@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .engine.job import JobSpec
 from . import util
+from .history import STATES as HISTORY_STATES
 from .i18n import detect_lang, dict_for
 from . import metalink as _ml
 from .watch import MAX_FILE, parse_url_list
@@ -14,7 +15,8 @@ MAX_MIRRORS = 24              # metalink belgeleri sikca 10-20 ayna listeler
 MAX_METALINK_FILES = 64
 _MAX_INT = {"segments": (1, 32, 8), "max_concurrent": (1, 32, 8),
             "retries": (0, 20, 5), "timeout": (5, 300, 30),
-            "stall_timeout": (5, 120, 20), "web_port": (1024, 65535, 8378)}
+            "stall_timeout": (5, 120, 20), "web_port": (1024, 65535, 8378),
+            "history_days": (0, 3650, 365)}
 
 
 def _default_segments(cfg: dict) -> int:
@@ -281,6 +283,38 @@ def handle(ctx, cmd: str, params: dict) -> dict:
     if cmd == "clear-finished":
         qm.clear_finished()
         return {"ok": True}
+    if cmd == "history":
+        state = str(params.get("state") or "")
+        found = qm.history.search(
+            str(params.get("q") or params.get("text") or ""),
+            state=state if state in HISTORY_STATES else "",
+            limit=params.get("limit", 50), offset=params.get("offset", 0))
+        if found is None:
+            return {"ok": False, "error": "gecmis okunamadi"}
+        return {"ok": True, **found}
+    if cmd == "history-stats":
+        stats = qm.history.stats()
+        if stats is None:
+            return {"ok": False, "error": "gecmis okunamadi"}
+        return {"ok": True, **stats}
+    if cmd == "history-redownload":
+        rec = qm.history.get(params.get("id", ""))
+        if not rec:
+            return {"ok": False, "error": "gecmis kaydi yok"}
+        again = dict(rec.get("opts") or {})
+        again["url"] = rec.get("url", "")      # sifre zaten opts icinde
+        result = handle(ctx, "add", again)
+        if result.get("ok"):
+            result["history"] = rec.get("id", "")
+        return result
+    if cmd == "history-clear":
+        older = params.get("older_than")
+        try:
+            days = int(older) if older not in (None, "") else 0
+        except (TypeError, ValueError):
+            days = 0
+        removed = qm.history.clear(older_than_days=days if days > 0 else None)
+        return {"ok": True, "removed": removed}
     if cmd == "limit":
         val = params.get("value", 0)
         if isinstance(val, str):

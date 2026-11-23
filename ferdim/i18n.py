@@ -285,6 +285,70 @@ S = {
         "tr": "indirme başarısız oldu (bilinmeyen neden)",
         "es": "la descarga falló (motivo desconocido)",
         "ru": "загрузка не удалась (неизвестная причина)"},
+    # --------------------------------------------------------------- gecmis
+    "hist_title": {
+        "en": "History", "tr": "Geçmiş", "es": "Historial", "ru": "История"},
+    "hist_search": {
+        "en": "Search history", "tr": "Geçmişte ara",
+        "es": "Buscar en el historial", "ru": "Поиск в истории"},
+    "hist_search_ph": {
+        "en": "Search file, URL or host", "tr": "Dosya, adres ya da sunucu ara",
+        "es": "Busca archivo, URL o servidor", "ru": "Искать файл, URL или сервер"},
+    "hist_state": {
+        "en": "State", "tr": "Durum", "es": "Estado", "ru": "Состояние"},
+    "hist_all": {
+        "en": "All", "tr": "Tümü", "es": "Todos", "ru": "Все"},
+    "hist_clear": {
+        "en": "Clear history", "tr": "Geçmişi temizle",
+        "es": "Borrar historial", "ru": "Очистить историю"},
+    "hist_confirm_clear": {
+        "en": "Delete the whole download history?",
+        "tr": "Tüm indirme geçmişi silinsin mi?",
+        "es": "¿Borrar todo el historial de descargas?",
+        "ru": "Удалить всю историю загрузок?"},
+    "hist_empty": {
+        "en": "No history yet.", "tr": "Geçmiş boş.",
+        "es": "Aún no hay historial.", "ru": "История пока пуста."},
+    "hist_none": {
+        "en": "No matching records.", "tr": "Eşleşen kayıt yok.",
+        "es": "No hay registros coincidentes.", "ru": "Совпадений нет."},
+    "hist_stats": {
+        "en": "{n} records · {bytes} total", "tr": "{n} kayıt · toplam {bytes}",
+        "es": "{n} registros · {bytes} en total",
+        "ru": "{n} записей · всего {bytes}"},
+    "hist_host_line": {
+        "en": "{host}: {n} · avg {links} links · {speed}",
+        "tr": "{host}: {n} · ort. {links} bağlantı · {speed}",
+        "es": "{host}: {n} · media {links} enlaces · {speed}",
+        "ru": "{host}: {n} · сред. {links} соединений · {speed}"},
+    "hist_meta": {
+        "en": "{state} · {size} · {date} · {host}",
+        "tr": "{state} · {size} · {date} · {host}",
+        "es": "{state} · {size} · {date} · {host}",
+        "ru": "{state} · {size} · {date} · {host}"},
+    "hist_links": {
+        "en": "avg {avg} / peak {peak} links",
+        "tr": "ort. {avg} / tepe {peak} bağlantı",
+        "es": "media {avg} / pico {peak} enlaces",
+        "ru": "сред. {avg} / пик {peak} соединений"},
+    "hist_redownload": {
+        "en": "Download again", "tr": "Yeniden indir",
+        "es": "Descargar de nuevo", "ru": "Скачать снова"},
+    "hist_redownloaded": {
+        "en": "{name} queued again.", "tr": "{name} yeniden kuyruğa alındı.",
+        "es": "{name} volvió a la cola.", "ru": "{name} снова в очереди."},
+    "hist_cleared": {
+        "en": "{n} records deleted.", "tr": "{n} kayıt silindi.",
+        "es": "{n} registros eliminados.", "ru": "{n} записей удалено."},
+    "hist_days": {
+        "en": "Keep history (days; 0 = forever)",
+        "tr": "Geçmiş saklama (gün; 0 = sınırsız)",
+        "es": "Conservar historial (días; 0 = siempre)",
+        "ru": "Хранить историю (дней; 0 = всегда)"},
+    "hist_failed": {
+        "en": "Cannot read the history.", "tr": "Geçmiş okunamadı.",
+        "es": "No se pudo leer el historial.",
+        "ru": "Не удалось прочитать историю."},
 }
 
 

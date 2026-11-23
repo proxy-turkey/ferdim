@@ -37,6 +37,8 @@ DEFAULTS = {
     "watch_dirs": [],              # izlenen klasorler (baglanti listesi / metalink)
     "watch_done": "delete",        # kuyruga alinan dosya: delete | rename | keep
     "watch_interval": 3,           # tarama araligi (sn)
+    # --- kuyruk gecmisi (1.5) ---
+    "history_days": 365,           # 0 = gecmisi sonsuza kadar sakla
 }
 
 

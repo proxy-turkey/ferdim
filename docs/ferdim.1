@@ -86,7 +86,18 @@ Show or change settings: segments, concurrency, scheduler window and
 per-category windows (\fIschedule.categories\fR), language, watched
 folders (\fIwatch_dirs\fR, \fIwatch_done\fR = delete | rename | keep),
 automatic sidecar verification (\fIchecksum_sidecar\fR), retries and
-timeouts (\fItimeout\fR, \fIstall_timeout\fR).
+timeouts (\fItimeout\fR, \fIstall_timeout\fR) and download history
+retention (\fIhistory_days\fR, default 365 days, \fB0\fR keeps forever).
+.TP
+.BI history " [QUERY]"
+Show the persistent job history (SQLite database in the state directory),
+newest first. \fB\-\-state\fR filters by \fBdone\fR, \fBerror\fR or
+\fBcanceled\fR; \fB\-\-limit\fR caps the result. \fB\-\-stats\fR prints the
+total bytes served, the number of records and per-host averages (links and
+speed). \fB\-\-redownload\fR \fIID\fR queues the saved URL and options
+again. \fB\-\-clear\fR removes everything, or with \fB\-\-older\-than\fR
+\fIDAYS\fR only records older than that. A password embedded in a URL is
+kept out of the stored address; it is retained only for re-download.
 .TP
 .BI daemon
 Run the RPC/HTTP daemon in the foreground (normally started via the
@@ -97,7 +108,8 @@ Open the web UI in the default browser.
 .SH FILES
 .TP
 .I ~/.local/state/ferdim/
-Socket, token, PID, queue state and job metadata.
+Socket, token, PID, queue state, job metadata and the download history
+database (\fIhistory.db\fR, mode 0600).
 .TP
 .I ~/.config/ferdim/config.json
 User configuration (see \fBferdim config\fR; invalid values are reset to

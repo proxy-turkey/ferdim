@@ -109,6 +109,10 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
                 "/api/config": "config-set", "/api/turbo": "turbo",
                 "/api/zip-preview": "zip-preview",
                 "/api/clear-finished": "clear-finished",
+                "/api/history": "history",
+                "/api/history-stats": "history-stats",
+                "/api/history-redownload": "history-redownload",
+                "/api/history-clear": "history-clear",
             }
             cmd = table.get(u.path)
             if not cmd:

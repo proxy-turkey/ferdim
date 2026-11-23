@@ -48,6 +48,7 @@ front-ends: CLI, web UI, and GTK 4.
 | **Automation** | Watched folders queue `.metalink` / `.meta4` documents and URL-list text files automatically; schedule windows can be set per category; `ferdim add @list.txt` queues a whole list. |
 | **Smart queue** | A background prober learns the size of queued files and runs smallest-first, so a 2 MB PDF never waits behind a 4 GB ISO. |
 | **Live telemetry** | The web UI plots aggregate throughput and the open-connection count over the last two minutes, plus a per-job speed sparkline — plain canvas, no chart library, client-side ring buffers. |
+| **Queue history** | Finished jobs (done, error, canceled) are stored in a SQLite database in the state directory (`history.db`, mode 0600, WAL). Search by file, URL or host, filter by state, re-download with the saved URL and options, and read totals plus per-host averages (links, speed). Retention is `history_days` (default 365, `0` keeps forever); a URL's password is stored only for re-download, never in the searchable record. |
 
 Also included: queue with concurrency limits and a night-window scheduler,
 watched folders, global + per-job speed limits, clipboard watching (event-driven on Wayland),
@@ -155,10 +156,16 @@ ferdim add @liste.txt                           # queue every URL in a file
 ferdim add ftp://example.org/pub/distro.iso --wait       # FTP or ftps:// (anonymous or user:pass in URL)
 ferdim config --set '{"language":"ru"}'
 ferdim config --set '{"watch_dirs":["~/İndirilenler/ferdim-kuyruk"]}'   # auto-queue dropped lists
+ferdim history                                 # finished jobs, newest first
+ferdim history debian --state done              # search file/URL/host + state
+ferdim history --stats                         # bytes served, per-host averages
+ferdim history --redownload <id>                # queue the same URL/options again
+ferdim history --clear --older-than 30          # retention (history_days config)
 ```
 
 - **Web UI** — `http://127.0.0.1:8378`: live queue, categories, speed/ETA,
-  per-job controls, throughput and connection graphs, settings, scheduler
+  per-job controls, throughput and connection graphs, download history with
+  search, re-download and statistics, settings, scheduler
   (global and per-category), watched folders, language picker. Fully
   keyboard- and screen-reader-friendly.
 - **GTK 4 app** — `ferdim-gui` or from your app menu.

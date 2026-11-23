@@ -4,6 +4,32 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [Unreleased]
+
+### Added
+- Queue history in SQLite: every job that reaches a terminal state
+  (`done`, `error`, `canceled`) is recorded in `history.db` in the state
+  directory (mode 0600, WAL, versioned schema with forward migrations).
+  The record holds the redacted URL, filename, host, size/bytes,
+  duration, average and peak link counts, state, error code, checksum
+  result and finish time; re-download parameters (headers, cookies,
+  mirrors, checksums, per-job limit, credentials) are kept for the
+  *re-download* action and never appear in listings. A database failure
+  is logged and swallowed, so history can never block or fail the queue.
+- API commands shared by the socket and HTTP servers: `history` (text
+  search over file/URL/host, state filter, limit/offset),
+  `history-redownload` (re-add with the saved URL and options),
+  `history-stats` (total bytes, record count, per-host average links and
+  speed) and `history-clear` (all records, or `older_than` days).
+- CLI: `ferdim history [QUERY]` with `--state`, `--limit`, `--stats`,
+  `--redownload ID`, `--clear [--older-than DAYS]`.
+- Web UI: a download-history panel with search, state filter, statistics
+  summary, re-download buttons and clear, keyboard navigable and built
+  with `textContent` only.
+- `history_days` config (default 365, `0` keeps forever), clamped by the
+  config sanitiser and pruned at daemon start; exposed in the web
+  settings dialog.
+
 ## [1.5.0] — 2026-11-24
 
 First 1.5 release; it also ships the 1.4.2 fixes below (1.4.2 was never
