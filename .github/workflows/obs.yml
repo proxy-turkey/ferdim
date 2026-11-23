@@ -1,0 +1,59 @@
+name: OBS
+
+# Etiket push'unda openSUSE Build Service paketini (home:proxy-turkey/ferdim)
+# yeni etiket arsivi ve spec ile gunceller; OBS derlemeyi kendisi baslatir.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v1.5.1)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  obs:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      PRJ: home:proxy-turkey
+      PKG: ferdim
+    steps:
+      - name: Tools
+        run: dnf -y install osc curl git
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Version check
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          test "$ver" = "$(awk '/^Version:/{print $2}' packaging/ferdim.spec)"
+          test "$ver" = "$(python3 -c 'import ferdim;print(ferdim.__version__)')"
+      - name: Commit to OBS
+        env:
+          OBS_USER: ${{ secrets.OBS_USER }}
+          OBS_PASSWORD: ${{ secrets.OBS_PASSWORD }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.config/osc
+          umask 077
+          {
+            printf '[general]\napiurl = https://api.opensuse.org\n\n'
+            printf '[https://api.opensuse.org]\nuser = %s\npass = %s\n' "$OBS_USER" "$OBS_PASSWORD"
+            printf 'credentials_mgr_class = osc.credentials.PlaintextConfigFileCredentialsManager\n'
+          } > ~/.config/osc/oscrc
+          work=$(mktemp -d)
+          cd "$work"
+          osc co "$PRJ" "$PKG"
+          cd "$PRJ/$PKG"
+          rm -f v*.tar.gz
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$TAG.tar.gz" \
+            "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/$TAG.tar.gz"
+          cp "$GITHUB_WORKSPACE/packaging/ferdim.spec" .
+          osc addremove
+          osc ci -m "ferdim ${TAG#v}"
