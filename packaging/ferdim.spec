@@ -16,7 +16,11 @@ BuildRequires:  systemd-rpm-macros
 BuildRequires:  desktop-file-utils
 Requires:       python3 >= 3.9
 Requires:       hicolor-icon-theme
+%if 0%{?suse_version}
+# openSUSE: /usr/share/mozilla dizini bu pakete ait (mozilla-filesystem yok)
+%else
 Requires:       mozilla-filesystem
+%endif
 Recommends:     python3-gobject
 Recommends:     firefox
 Supplements:    (firefox and python3-gobject)
@@ -94,6 +98,9 @@ python3 -m unittest discover -s tests -v
 %{_datadir}/%{srcname}/
 %{_datadir}/applications/%{srcname}.desktop
 %{_datadir}/icons/hicolor/scalable/apps/%{srcname}.svg
+%if 0%{?suse_version}
+%dir %{_datadir}/mozilla
+%endif
 %dir %{_datadir}/mozilla/native-messaging-hosts
 %{_datadir}/mozilla/native-messaging-hosts/%{srcname}.json
 %{_userunitdir}/%{srcname}.service
