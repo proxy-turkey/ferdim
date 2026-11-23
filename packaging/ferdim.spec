@@ -13,7 +13,10 @@ BuildArch:      noarch
 BuildRequires:  python3-devel
 BuildRequires:  zip
 BuildRequires:  systemd-rpm-macros
+BuildRequires:  desktop-file-utils
 Requires:       python3 >= 3.9
+Requires:       hicolor-icon-theme
+Requires:       mozilla-filesystem
 Recommends:     python3-gobject
 Recommends:     firefox
 Supplements:    (firefox and python3-gobject)
@@ -50,6 +53,7 @@ install -D -m 0755 bin/ferdim-gui %{buildroot}%{_bindir}/ferdim-gui
 mkdir -p %{buildroot}%{_datadir}/applications
 sed 's|@BIN@|%{_bindir}/ferdim-gui|' scripts/ferdim.desktop > \
   %{buildroot}%{_datadir}/applications/%{srcname}.desktop
+desktop-file-validate %{buildroot}%{_datadir}/applications/%{srcname}.desktop
 install -D -m 0644 scripts/icons/ferdim.svg \
   %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/%{srcname}.svg
 install -D -m 0644 docs/%{srcname}.1 %{buildroot}%{_mandir}/man1/%{srcname}.1
@@ -90,14 +94,26 @@ python3 -m unittest discover -s tests -v
 %{_datadir}/%{srcname}/
 %{_datadir}/applications/%{srcname}.desktop
 %{_datadir}/icons/hicolor/scalable/apps/%{srcname}.svg
+%dir %{_datadir}/mozilla/native-messaging-hosts
 %{_datadir}/mozilla/native-messaging-hosts/%{srcname}.json
 %{_userunitdir}/%{srcname}.service
 %{_mandir}/man1/%{srcname}.1*
 %{_mandir}/man1/%{srcname}-nm.1*
 %{_mandir}/man1/%{srcname}-gui.1*
 
-# systemd ships file triggers that reload user units installed under
-# the user unit dir, so explicit scriptlets are unnecessary.
+# systemd USER unit: presets are applied by the user-unit scriptlets
+# (Packaging Guidelines, Scriptlets: User Units); file triggers do not
+# cover user units and the macros need the unit name as argument.
+# The trailing comment keeps the macro's final newline inside the
+# scriptlet: rpm 6 trims it otherwise, which trips fedora-review's
+# verbatim macro-expansion check (CheckSystemdUserunitdirScriplets).
+%post
+%systemd_user_post %{srcname}.service
+# end of user-unit post scriptlet
+
+%preun
+%systemd_user_preun %{srcname}.service
+# end of user-unit preun scriptlet
 
 %changelog
 * Mon Nov 23 2026 Enes Aksu <eaksu@pm.me> - 1.4.1-1
@@ -106,6 +122,8 @@ python3 -m unittest discover -s tests -v
 - SHA-1/SHA-512 and sidecar checksum auto-discovery, verified before "done"
 - per-category schedule windows, watched folders, add-file / add @list.txt
 - web UI and GTK accessibility pass, consistent 1024-based size units
+- packaging: desktop-file-validate, systemd user-unit scriptlets, owned
+  native-messaging-hosts directory (review findings)
 * Wed Oct 21 2026 Enes Aksu <eaksu@pm.me> - 1.4.0-1
 - DASH (MPD) downloads, multi-mirror blending, metalink/.meta4 expansion,
 - per-job SHA-256/MD5 verification, ZIP preview, size-probing smart queue,

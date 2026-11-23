@@ -106,10 +106,26 @@ releases.
 |---|---|
 | License | MIT, SPDX-valid, license file installed via `%license` |
 | BuildArch | noarch; payload at `/usr/share/ferdim` |
-| `%check` | full 26-test suite runs during build (mock-verified) |
+| `%check` | full test suite runs during build (79 tests, mock-verified) |
 | rpmlint | 0 errors, 0 warnings (spec, SRPM, RPM) |
-| scriptlets | none (systemd user-unit file triggers handle reload) |
+| scriptlets | user unit only: `%post %systemd_user_post ferdim.service`, `%preun %systemd_user_preun ferdim.service` |
+| desktop file | validated with `desktop-file-validate` at build time |
 | man pages | `ferdim(1)`, `ferdim-nm(1)`, `ferdim-gui(1)` |
 | systemd | user unit `ferdim.service` via `%{_userunitdir}` |
-| Firefox integration | native-messaging manifest in `/usr/share/mozilla/native-messaging-hosts` |
+| Firefox integration | native-messaging manifest in `/usr/share/mozilla/native-messaging-hosts` (directory owned, `Requires: mozilla-filesystem`) |
+
+Reviewer note: `fedora-review` matches scriptlets against the *verbatim*
+macro expansion, whose last line ends in a space and a newline. rpm 6 trims
+that from stored scriptlets, so `CheckSystemdUserunitdirScriplets` reports a
+false FAIL for every user-unit package built with rpm 6 (reproducible with
+stock packages such as `authselect-libs`). The spec keeps a trailing comment
+inside both scriptlets so the macro's final newline survives and the check
+passes; the comment is inert.
+
+After the tag exists, `fedora-review` reports no failed checks:
+
+```
+FAIL: []   (35 pass, 28 pending = the reviewer's manual items)
+```
+
 | Extension bundle | shipped unsigned at `/usr/share/ferdim/ferdim-extension.zip` (AMO self-signing documented) |

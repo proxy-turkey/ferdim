@@ -59,6 +59,12 @@ semantic versioning.
   of raw library exceptions.
 
 ### Fixed
+- Packaging findings that `fedora-review` had been reporting since 1.4.0
+  unnoticed: the shipped `.desktop` file is now validated at build time
+  (`desktop-file-validate`), the systemd **user** unit gets its
+  `systemd_user_post` / `systemd_user_preun` scriptlets, and the package
+  owns `/usr/share/mozilla/native-messaging-hosts`
+  (`Requires: mozilla-filesystem`, `Requires: hicolor-icon-theme`).
 - A mirror that returned 404, or a different file size, failed the whole
   job; it is now dropped and the remaining sources finish the download.
 - A job was reported `done` before its checksum was verified, so

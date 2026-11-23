@@ -221,6 +221,29 @@ background task; it will fail on the password prompt.
   anything. A half-applied run once left a function with a docstring but
   no body (`_bad_checksum` returned `None`), and a hand-typed 8-space
   marker silently matched inside a 12-space line.
+- `fedora-review` does **not** print `PASS:`/`FAIL:` lines. The verdict
+  is in `review-ferdim/review.json` → `results[MUST|SHOULD|EXTRA]` →
+  lists of `{name, result, note}`. 1.4.0 shipped claiming "review-clean"
+  while `CheckDesktopFileInstall`, `CheckSystemdUserunitdirScriplets` and
+  directory ownership were failing and nobody looked. Always run:
+  `sudo python3 -c "import json;d=json.load(open('review-ferdim/review.json'));print([c['name'] for g in d['results'].values() for l in g.values() for c in l if c['result']=='fail'])"`
+  — the expected answer after a tagged release is `[]`. `pending`
+  results are the human reviewer's manual checks, not failures.
+- `systemd-rpm-macros` ≥ 258 requires the unit name as an argument
+  (`%systemd_user_post ferdim.service`); with none, rpm aborts with
+  "%systemd_user_post macro requires some arguments".
+- `fedora-review` matches scriptlets against the verbatim macro expansion
+  (last line `fi` + space + newline). **rpm 6 trims that trailing
+  whitespace**, so `CheckSystemdUserunitdirScriplets` false-FAILs for any
+  user-unit package (stock packages included). Keep the inert trailing
+  comment inside `%post` / `%preun` — it preserves the newline and the
+  check passes. Other packaging MUSTs this project once missed:
+  `desktop-file-validate` on the shipped `.desktop`
+  (`BuildRequires: desktop-file-utils`) and owning every directory the
+  package creates (`%dir %{_datadir}/mozilla/native-messaging-hosts`).
+- The review directory is root-owned (`sudo rm -rf`), and running
+  `cd` into it resets the shell's working directory — `cd` back to the
+  repo explicitly.
 - Timing-sensitive assertions are a smell: if a test can pass or fail
   depending on poll timing, the state machine is wrong (that is how
   "done before verify" was found). Fix the ordering, do not add sleeps.
@@ -228,8 +251,9 @@ background task; it will fail on the password prompt.
 ## Fedora submission status
 
 `docs/fedora-submission.md` documents the process and contains the
-paste-ready review request. As of 1.4.0 the package is review-clean
-(`fedora-review`: no failed checks). The blocker is procedural: the
+paste-ready review request. As of 1.4.1 the only `fedora-review`
+failure is `CheckSourceDownloads` before the tag exists (it passes once
+the tag is pushed and the review is re-run). The blocker is procedural: the
 maintainer needs a sponsor — read that doc before touching packaging.
 
 ## Roadmap

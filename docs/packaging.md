@@ -59,7 +59,13 @@ The full process (summarized from the
 Typical polish items the reviewer will ask for (already done):
 
 - noarch package, `%license`, verbatim upstream tarball (`Source0` tag URL),
-- systemd user unit via `%{_userunitdir}` + `%systemd_user_post`,
+- systemd user unit via `%{_userunitdir}` with the user-unit scriptlets
+  (`%post %systemd_user_post ferdim.service`,
+  `%preun %systemd_user_preun ferdim.service`),
+- `desktop-file-validate` on the shipped `.desktop` file
+  (`BuildRequires: desktop-file-utils`),
+- owned `/usr/share/mozilla/native-messaging-hosts` directory
+  (`Requires: mozilla-filesystem`), `Requires: hicolor-icon-theme`,
 - `Requires: python3`, soft deps for the GTK front-end and Firefox,
 - no bundled vendored code, MIT license file included.
 
