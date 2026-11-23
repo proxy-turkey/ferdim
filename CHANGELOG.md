@@ -4,7 +4,10 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
-## [Unreleased]
+## [1.5.0] — 2026-11-24
+
+First 1.5 release; it also ships the 1.4.2 fixes below (1.4.2 was never
+tagged on its own).
 
 ### Added
 - Web UI speed graph: aggregate throughput and a live connection-count

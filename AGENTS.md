@@ -5,7 +5,7 @@ Fedora-first, with a Firefox WebExtension. The engine, CLI and daemon
 are **Python stdlib only** — no pip dependencies, ever. The web UI is
 dependency-free vanilla JS. The extension is Manifest V2.
 
-State at authorship: **1.4.2 released**; test suite green (87 tests),
+State at authorship: **1.5.0 released**; test suite green (135 tests),
 `web-ext lint` 0 errors / 0 warnings, UI smoke checks green
 (`bash tests/ui/run.sh all`), `rpmlint` 0/0, `fedora-review` no failed
 checks, mock builds cleanly on Fedora 43.
@@ -44,6 +44,7 @@ checks, mock builds cleanly on Fedora 43.
 |---|---|
 | `ferdim/engine/job.py` | The core: segmented multi-connection engine, throughput governor, adaptive server limits, parked worker pool, work stealing, dynamic range sizing, end-game donation, crash-safe resume, source health (mirrors, fail-over, stall), checksum + sidecar verify, DASH dispatch |
 | `ferdim/engine/segments.py` | Shared HLS/DASH pipeline: parallel segment fetch to temp files, ordered assembly, per-segment resume |
+| `ferdim/engine/ftp.py` | FTP/FTPS via `ftplib`: single stream, REST resume, MDTM change detection, transient-error retries, 2xx final reply required (truncation guard), codes on `FtpError` |
 | `ferdim/engine/hls.py` | m3u8 parsing (variants/master), thin wrapper over `segments.assemble` |
 | `ferdim/engine/dash.py` | MPD parsing: best-representation selection, SegmentTemplate (`$Number$`/`$Time$`/SegmentTimeline) and SegmentList |
 | `ferdim/engine/queue.py` | QueueManager: concurrency, night scheduler + per-category windows, smart queue (background size prober, smallest-first), persistence (mirrors, checksums and per-job limits survive restarts) |

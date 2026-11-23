@@ -1,7 +1,7 @@
 %global srcname ferdim
 
 Name:           %{srcname}
-Version:        1.4.2
+Version:        1.5.0
 Release:        1%{?dist}
 Summary:        Dynamic self-tuning download manager with Firefox integration
 
@@ -116,6 +116,13 @@ python3 -m unittest discover -s tests -v
 # end of user-unit preun scriptlet
 
 %changelog
+* Tue Nov 24 2026 Enes Aksu <eaksu@pm.me> - 1.5.0-1
+- FTP/FTPS downloads via the standard library (resume, retries, MDTM check)
+- stable API error codes; web UI and CLI translate engine errors
+- mirrors are probed in the background before workers rely on them
+- web UI speed graph and connection timeline
+- GTK: modal add window and a settings window; Gtk.Dialog removed
+- state files are created private (0600); passwords redacted in the API
 * Mon Nov 23 2026 Enes Aksu <eaksu@pm.me> - 1.4.2-1
 - fix: job commands over the local socket lost their job id (pause, resume,
 - restart, cancel, remove never worked from the CLI or the GTK app)
