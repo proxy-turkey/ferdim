@@ -194,11 +194,11 @@ class QueueManager:
                     ready.sort(key=lambda j: (j.total if j.total > 0
                                               else float("inf"), j.created))
                     for job in ready[:slots]:
-                        job.start()
+                        job.start(queued_only=True)
                         started = True
             else:
                 for job in queued[:slots]:
-                    job.start()
+                    job.start(queued_only=True)
                     started = True
         for j in self.jobs:
             j.update_speed()

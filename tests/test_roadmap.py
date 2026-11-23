@@ -346,16 +346,22 @@ class MirrorHealthTests(unittest.TestCase):
     def test_16_pause_command_returns_when_paused(self):
         """pause() havuz kapanana kadar bekler: komut dondugunde durum
         'paused' dir ve araliklar kaydedilmistir (CLI/GTK aninda gorur)."""
-        job = self._job(f"{self.base}/slow.bin", segments=4)
+        # hiz limiti indirmeyi yavaslatir: pause gercekten ORTADA gelir
+        # (limitsiz 4 MB yerel indirme duraklatmadan once bitebilirdi)
+        job = self._job(f"{self.base}/slow.bin", segments=4, limit=512_000)
         job.start()
         self.assertTrue(wait_state(job, (JobState.DOWNLOADING,)))
-        time.sleep(0.6)
+        t0 = time.monotonic()
+        while job.done < 256 * 1024 and time.monotonic() - t0 < 20:
+            time.sleep(0.01)
+        self.assertGreaterEqual(job.done, 256 * 1024, "indirme ilerlemedi")
         job.pause()
         self.assertEqual(job.state, JobState.PAUSED, job.state)
         meta = util.read_json(job.meta_path)
         covered = sum(e - s + 1 for s, e in meta["ranges"])
         self.assertEqual(covered + job.done, len(DATA), "araliklar + indirilen = toplam")
         self.assertEqual(job._inflight, {})
+        job._bucket.set_rate(0)      # devam hizli bitsin (limit testi degil)
         job.resume()
         self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR)))
         self.assertEqual(job.state, JobState.DONE, job.error)

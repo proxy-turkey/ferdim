@@ -75,7 +75,8 @@ class RpcNativeTests(unittest.TestCase):
         Soket sunucusu 'id' alanini istek kimligi sanip parametreden atiyordu:
         CLI ve GTK'daki is dugmeleri 1.3.0'dan beri sessizce etkisizdi."""
         with self._client() as c:
-            r = c.request("add", url=f"{self.base}/slow.bin", segments=2)
+            r = c.request("add", url=f"{self.base}/slow.bin", segments=2,
+                          limit="256K")
             self.assertTrue(r.get("ok"), r)
             jid = r["id"]
             try:

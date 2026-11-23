@@ -259,6 +259,12 @@ class DownloadJob:
         self._lock = threading.RLock()
         self._cond = threading.Condition(self._lock)
         self._stop = threading.Event()
+        # start() penceresi: _prepare + monitor yayini bitene kadar temiz.
+        # pause()/cancel() bunu bekler; yoksa monitor henuz yayinlanmamisken
+        # (ya da onceki kosunun olu monitor'u ile) 'downloading' durumda
+        # donerlerdi.
+        self._start_done = threading.Event()
+        self._start_done.set()
         # isci havuzu sunucunun izin verdigi kadarina adaptive
         # kuculur; limit asimlari isi HATA ile bitirmez.
         self._allowed = max(1, min(int(spec.segments or 8), 32))
@@ -413,10 +419,16 @@ class DownloadJob:
         self.on_change(self)
 
     # ----------------------------------------------------------------- start
-    def start(self):
+    def start(self, *, queued_only: bool = False):
+        """Baslatir. queued_only: yalnizca hala KUYRUK'ta olan isi baslatir
+        (zamanlayici boyle cagirir); bu arada kullanici duraklattiysa is
+        baslamaz - eskiden zamanlayici duraklamayi sessizce ezerdi."""
         with self._lock:
             if self.state in (JobState.DOWNLOADING, JobState.CONNECTING):
                 return
+            if queued_only and self.state != JobState.QUEUED:
+                return
+            self._start_done.clear()
             self._stop.clear()
             self.error = ""
             self.error_code = ""
@@ -424,15 +436,45 @@ class DownloadJob:
             self._reset_sources()
         self._changed()
         try:
-            self._prepare()
-        except Exception as e:
-            self._fail(_describe_error(e), _code_for(e))
-            return
-        self.state = JobState.DOWNLOADING
+            try:
+                self._prepare()
+            except Exception as e:
+                # duraklatma hazirligi yarida kesti: bu bir hata degil
+                if self._stop.is_set():
+                    self._fold_stopped()
+                    return
+                self._fail(_describe_error(e), _code_for(e))
+                return
+            # _prepare() bu arada pause()/cancel() gormus olabilir. Karari
+            # AYNI kilit altinda ver: DOWNLOADING yazip isci baslatmak
+            # durdurma/iptal kararini ezerdi.
+            with self._lock:
+                stopped = self._stop.is_set() or self.state == JobState.CANCELED
+                if not stopped:
+                    self.state = JobState.DOWNLOADING
+            if stopped:
+                self._fold_stopped()
+                return
+            self._changed()
+            if self.kind == "http":
+                self._start_mirror_probe()
+            self._spawn()
+        finally:
+            self._start_done.set()
+
+    def _fold_stopped(self):
+        """start() pause/cancel gordu: is 'paused' kalir, nokta yazilir;
+        hazirligin yarida kesilmesi HATA degildir. (_checkpoint yarim
+        hazirligi yazmaz: _fd acilmadan durum diske dokulmez.)"""
+        pausing = False
+        with self._lock:
+            if self.state != JobState.CANCELED:
+                self.state = JobState.PAUSED
+                pausing = True
+            self._cond.notify_all()
+        if pausing:
+            self._checkpoint(force=True)
         self._changed()
-        if self.kind == "http":
-            self._start_mirror_probe()
-        self._spawn()
 
     def _prepare(self):
         opt = self.spec.options(self.cfg)
@@ -604,8 +646,12 @@ class DownloadJob:
                                  name=f"ferdim-{self.id}-{i}")
             t.start()
             self._threads.append(t)
-        self._monitor = threading.Thread(target=self._monitor_loop, daemon=True)
-        self._monitor.start()
+        # monitor EN SON yayinlanir: panelde gorunen durum ile join edilecek
+        # halka ayni kusaga ait olsun (pause/cancel _start_done'dan sonra
+        # okur, o yuzden atama sirasi onemli).
+        mon = threading.Thread(target=self._monitor_loop, daemon=True)
+        mon.start()
+        self._monitor = mon
 
     def _take_range(self) -> tuple[int, int] | None:
         with self._lock:
@@ -1714,16 +1760,46 @@ class DownloadJob:
         self._changed()
 
     # -------------------------------------------------------------- control
+    def _await_run(self, deadline: float) -> None:
+        """start() bitene ve monitor zinciri kapanana kadar bekler. Zincir
+        onemli: _do_restart yeni bir monitor yayinlayabilir, o zaman eski
+        halkayi degil sonuncuyu join ederiz."""
+        left = deadline - time.monotonic()
+        if left > 0 and not self._start_done.is_set():
+            self._start_done.wait(left)
+        cur = threading.current_thread()
+        while True:
+            m = self._monitor
+            if m is None or m is cur:
+                return
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            m.join(left)
+            if self._monitor is m:
+                return
+
     def pause(self):
         """Durdurur ve (en cok ~8 sn) havuzun kapanmasini bekler: komut
         dondugunde kalan araliklar kuyruktadir, denetim noktasi
-        yazilmistir ve durum 'paused' dir."""
+        yazilmistir ve durum 'paused' dir.
+
+        Baslatma penceresi de kapsanir: start() hazirlik/probe asamasindayken
+        gelen duraklatma, isi 'downloading' durumda birakmaz (eskiden monitor
+        henuz yayinlanmadigi icin olu/None monitor join edilip donuluyordu).
+        """
         self._stop.set()
         with self._cond:
             self._cond.notify_all()       # park etmis iscalar uyansin
-        m = self._monitor
-        if m is not None and m is not threading.current_thread():
-            m.join(timeout=8.0)
+        with self._lock:
+            queued = self.state == JobState.QUEUED
+            if queued:
+                # zamanlayicinin baslatmasini bekle: start(queued_only=True)
+                self.state = JobState.PAUSED
+        if queued:
+            self._changed()
+            return
+        self._await_run(time.monotonic() + 8.0)
         if self.kind == "ftp" and self.state == JobState.DOWNLOADING:
             # FTP tek akis: 8 sn icinde donmemis olabilir (yavas baglanti);
             # akis dur sinyalini gorur ve yazmaz, nokta burada tamamlanir.
@@ -1741,8 +1817,9 @@ class DownloadJob:
         self._stop.set()
         with self._cond:
             self._cond.notify_all()
-        if self._monitor:
-            self._monitor.join(timeout=5)
+        # fd ancak start() penceresi ve monitor kapandiktan sonra kapatilir:
+        # yoksa baslatma ortasindaki isciler kapali fd'ye yazardi.
+        self._await_run(time.monotonic() + 5.0)
         self._join_threads(2.0)
         try:
             if self._fd is not None:
@@ -1750,7 +1827,8 @@ class DownloadJob:
                 self._fd = None
         except Exception:
             pass
-        self.state = JobState.CANCELED
+        with self._lock:
+            self.state = JobState.CANCELED
         self.meta_path.unlink(missing_ok=True)
         if delete_files:
             self.part_path.unlink(missing_ok=True)
