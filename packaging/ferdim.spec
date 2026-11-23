@@ -14,6 +14,10 @@ BuildRequires:  python3-devel
 BuildRequires:  zip
 BuildRequires:  systemd-rpm-macros
 BuildRequires:  desktop-file-utils
+%if 0%{?suse_version}
+# OBS: ikon dizinlerinin sahibi derleme kokunde olmali
+BuildRequires:  hicolor-icon-theme
+%endif
 Requires:       python3 >= 3.9
 Requires:       hicolor-icon-theme
 %if 0%{?suse_version}
