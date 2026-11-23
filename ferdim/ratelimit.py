@@ -24,10 +24,19 @@ class TokenBucket:
             self._tokens = min(self._tokens, max(self._rate, 1 << 20))
             self._cond.notify_all()
 
-    def take(self, n: int) -> None:
+    def take(self, n: int, stop: "threading.Event | None" = None) -> bool:
+        """n baytlik yer ayirir. Hiz limiti altinda yer yoksa bekler.
+        stop verilirse bekleme sirasinda durdurma sinyalini gormezden
+        gelmez: sinyal gelince bayt harcamadan False doner (cagiran,
+        elindeki parcayi yazmadan araligi kuyruga iade eder). Boylece hiz
+        limitli bir is durdurulmak istendiginde isciler kovada
+        dakikalarca beklemez."""
         if self._rate <= 0 or n <= 0:
-            return
+            return True
+        step = 0.1 if stop is not None else 0.25
         while True:
+            if stop is not None and stop.is_set():
+                return False
             with self._cond:
                 now = time.monotonic()
                 burst = max(self._rate, 1 << 17)  # en az 128KB burst
@@ -35,6 +44,6 @@ class TokenBucket:
                 self._ts = now
                 if self._tokens >= n:
                     self._tokens -= n
-                    return
+                    return True
                 wait = (n - self._tokens) / self._rate
-            time.sleep(min(wait, 0.25))
+            time.sleep(min(wait, step))

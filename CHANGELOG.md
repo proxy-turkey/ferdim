@@ -4,6 +4,40 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [1.4.2] — 2026-11-23
+
+Bug-fix release for 1.4.1, found by an end-to-end run of the CLI against the
+real daemon.
+
+### Fixed
+- `ferdim pause`, `resume`, `restart`, `cancel` and `remove <id>` never
+  worked: the local-socket server mistook the job `id` for a request
+  correlation id and dropped it from the parameters, so every job command ran
+  with an empty id. The GTK per-job buttons were silently affected too (the
+  web UI uses HTTP and was not). Request correlation now uses a separate
+  `req_id` field; all job commands are covered by an end-to-end socket test.
+- `pause` returned before the job had actually paused. It now returns once the
+  worker pool has folded, the remaining ranges are queued and the checkpoint
+  is written.
+- Ranges being downloaded by a worker were missing from the checkpoint. Pausing
+  (or crashing) while a connection was in the middle of a slow read could
+  resume with a gap and end in "eksik veri". In-flight ranges are now part of
+  every checkpoint and are re-downloaded from their last completed offset.
+- A worker still blocked in a read when its job was paused and resumed could
+  keep running next to the new workers. Workers now belong to a generation and
+  exit quietly when it changes.
+- A worker that died from an unexpected exception no longer takes its range
+  with it.
+- Pausing or cancelling a speed-limited job could take minutes: 32 workers
+  waiting on the shared token bucket only noticed the stop signal when their
+  turn came, and each worker was joined with its own timeout. The bucket wait
+  is now aborted by the stop signal and workers are joined under one shared
+  deadline — `ferdim pause <id>` returns in well under a second.
+- Changing the default downloads folder retroactively rewrote the reported
+  path of every existing job (a finished download appeared under the new
+  folder, and re-queued after a daemon restart). Each job now keeps the
+  folder it was added to, and the folder is persisted with the queue.
+
 ## [1.4.1] — 2026-11-23
 
 ### Added

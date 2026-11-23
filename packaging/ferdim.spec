@@ -1,7 +1,7 @@
 %global srcname ferdim
 
 Name:           %{srcname}
-Version:        1.4.1
+Version:        1.4.2
 Release:        1%{?dist}
 Summary:        Dynamic self-tuning download manager with Firefox integration
 
@@ -116,6 +116,11 @@ python3 -m unittest discover -s tests -v
 # end of user-unit preun scriptlet
 
 %changelog
+* Mon Nov 23 2026 Enes Aksu <eaksu@pm.me> - 1.4.2-1
+- fix: job commands over the local socket lost their job id (pause, resume,
+- restart, cancel, remove never worked from the CLI or the GTK app)
+- fix: pause returns once the job is paused; in-flight ranges are checkpointed
+- fix: workers of a paused generation exit quietly after a resume
 * Mon Nov 23 2026 Enes Aksu <eaksu@pm.me> - 1.4.1-1
 - source health model for mirrors: throughput-weighted balancing, fail-over,
 - stall detection, Content-Range validation, jittered exponential backoff

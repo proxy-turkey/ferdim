@@ -21,7 +21,11 @@ class _Handler(socketserver.StreamRequestHandler):
                     self.wfile.write(b'{"ok":false,"error":"gecersiz JSON"}\n')
                     continue
                 cmd = msg.pop("cmd", "")
-                req_id = msg.pop("id", None)
+                # istek kimligi 'req_id' alanindadir: 'id' bir IS kimligidir
+                # (pause/resume/remove ...). Eskiden 'id' istek kimligi
+                # sanilip parametreden atiliyordu; is komutlari bos kimlikle
+                # gidiyordu ve hicbir zaman islemiyordu.
+                req_id = msg.pop("req_id", None)
                 if cmd == "watch":
                     watcher = self.wfile
                     server.register_watcher(self.wfile)

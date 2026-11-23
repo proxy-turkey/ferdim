@@ -164,13 +164,16 @@ S = {
     "ext_state":      {"en": "Add-on", "tr": "Eklenti", "es": "Extensión", "ru": "Расширение"},
     "add_failed":     {"en": "Could not add:", "tr": "Eklenemedi:", "es": "No se pudo añadir:", "ru": "Не удалось добавить:"},
     "warn_dir":       {"en": "Downloads folder could not be created; the default folder is used.", "tr": "İndirme dizini oluşturulamadı; varsayılan dizin kullanılıyor.", "es": "No se pudo crear la carpeta de descargas; se usa la carpeta predeterminada.", "ru": "Не удалось создать папку загрузок; используется папка по умолчанию."},
-    "warn_dir":       {"en": "Downloads folder could not be created; the default folder is used.", "tr": "İndirme dizini oluşturulamadı; varsayılan dizin kullanılıyor.", "es": "No se pudo crear la carpeta de descargas; se usa la carpeta predeterminada.", "ru": "Не удалось создать папку загрузок; используется папка по умолчанию."},
     "limit_custom":   {"en": "custom", "tr": "özel", "es": "personalizado", "ru": "свой"},
     "cli_bad_checksum": {
         "en": "invalid checksum (use algo:digest or a hex digest)",
         "tr": "geçersiz sağlama (algo:özet ya da onaltılık özet kullanın)",
         "es": "suma no válida (usa algo:suma o una suma hexadecimal)",
         "ru": "неверная контрольная сумма (алг:сумма или шестнадцатеричная сумма)"},
+    # ------------------------------------------------- 1.5: hata kodlari (A)
+    # ------------------------------------------------- 1.5: hiz grafigi (B)
+    # ------------------------------------------------- 1.5: gecmis (C)
+    # ------------------------------------------------- 1.5: gtk (D)
 }
 
 

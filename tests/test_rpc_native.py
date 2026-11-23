@@ -66,6 +66,50 @@ class RpcNativeTests(unittest.TestCase):
     def _client(self):
         return FerdimClient(self.sock)
 
+    def _job_state(self, c, jid):
+        return next((j["state"] for j in c.request("stats")["jobs"]
+                     if j["id"] == jid), None)
+
+    def test_00_job_commands_carry_their_id(self):
+        """Is kimligiyle cagrilan komutlar (pause/resume/restart/cancel/remove).
+        Soket sunucusu 'id' alanini istek kimligi sanip parametreden atiyordu:
+        CLI ve GTK'daki is dugmeleri 1.3.0'dan beri sessizce etkisizdi."""
+        with self._client() as c:
+            r = c.request("add", url=f"{self.base}/slow.bin", segments=2)
+            self.assertTrue(r.get("ok"), r)
+            jid = r["id"]
+            try:
+                for _ in range(100):
+                    if self._job_state(c, jid) == "downloading":
+                        break
+                    time.sleep(0.1)
+                self.assertEqual(self._job_state(c, jid), "downloading")
+                self.assertTrue(c.request("pause", id=jid)["ok"])
+                self.assertEqual(self._job_state(c, jid), "paused")
+                self.assertTrue(c.request("resume", id=jid)["ok"])
+                for _ in range(50):
+                    if self._job_state(c, jid) == "downloading":
+                        break
+                    time.sleep(0.1)
+                self.assertEqual(self._job_state(c, jid), "downloading")
+                self.assertTrue(c.request("cancel", id=jid)["ok"])
+                self.assertEqual(self._job_state(c, jid), "canceled")
+                self.assertTrue(c.request("restart", id=jid)["ok"])
+                self.assertIn(self._job_state(c, jid), ("queued", "connecting",
+                                                        "downloading"))
+                # istek kimligi yalniz 'req_id' alanindan gelir ve yankilanir;
+                # is kimligi req_id olarak geri donmez
+                r = c.request("stats", req_id="istek-42")
+                self.assertEqual(r.get("req_id"), "istek-42")
+                r = c.request("remove", id=jid)
+                self.assertTrue(r["ok"], r)
+                self.assertNotIn("req_id", r)
+            finally:
+                c.request("remove", id=jid)
+            self.assertIsNone(self._job_state(c, jid))
+            # bilinmeyen is: net hata, sessiz basari degil
+            self.assertFalse(c.request("pause", id="boyle-bir-is-yok")["ok"])
+
     def test_01_ping_version(self):
         with self._client() as c:
             self.assertTrue(c.request("ping")["ok"])

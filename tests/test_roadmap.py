@@ -251,6 +251,157 @@ class MirrorHealthTests(unittest.TestCase):
         self.assertIn((0, 999_999), job._pending, "kalan aralik kuyrukta olmali")
         job.cancel(delete_files=True)
 
+    # --- duraklama / devam: elde kalan aralik kaybolmaz ---
+    class _BlockedResp:
+        """read() kapi acilana kadar bekleyen sahte yanit (yavas okuma).
+        Content-Range isin bildirdigi boyutla tutarli olmali: motor her
+        yanitin baslangic/boyutunu dogrular."""
+
+        status = 206
+
+        def __init__(self, gate, job, first):
+            self._gate = gate
+            self.headers = {"Content-Range": f"bytes {first}-{job.total - 1}/{job.total}"}
+
+        def read(self, _n):
+            self._gate.wait(10)
+            return b"x" * 16
+
+        def close(self):
+            pass
+
+    def _lingering_worker(self, job, first=0):
+        """Sahte (kapali) yanitla bir isci baslatir. Yanit, test bitene
+        kadar yerinde kalir; isci gercekten okumada bekliene kadar bekler."""
+        gate = threading.Event()
+        real = httpcli.open_range
+        httpcli.open_range = lambda *a, **k: self._BlockedResp(gate, job, first)
+        self.addCleanup(lambda: (gate.set(), setattr(httpcli, "open_range", real)))
+
+        def run():
+            job._process_range((first, job.total - 1),
+                               job.spec.options(job.cfg), 0, job._gen)
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t0 = time.monotonic()
+        while not job._inflight and time.monotonic() - t0 < 5:
+            time.sleep(0.01)
+        time.sleep(0.3)                  # _open + ilk read'a gecmesi icin
+        self.assertTrue(t.is_alive(), "isci okumada beklemeli")
+        self.assertEqual(job._inflight, {0: (first, job.total - 1)})
+        return t, gate
+
+    def test_13_inflight_range_is_checkpointed(self):
+        """Denetim noktasi kuyruktaki VE iscinin elindeki araliklari yazar:
+        yavas bir baglantida duraklama (ya da cokme) sonrasi o aralik
+        kaybolup 'eksik veri' uretmez."""
+        cfg = dict(self.cfg)
+        job = dead_job(f"{self.base}/file.bin", cfg, segments=2)
+        job._pending = [(500_000, 700_000)]
+        job._inflight[0] = (0, 299_999)
+        job._checkpoint(force=True)
+        ranges = util.read_json(job.meta_path)["ranges"]
+        self.assertEqual(sorted(map(tuple, ranges)), [(0, 299_999), (500_000, 700_000)])
+        job.cancel(delete_files=True)
+
+    def test_14_pause_with_lingering_worker_then_resume(self):
+        """Okumada takili isci varken duraklama: komut dondugunde aralik
+        kayittadir ve durum 'paused'; devam edilince yeni kusak araligi
+        indirir, eski isci (okumasi bitince) sessizce cekilir - araligi
+        ikinci kez kuyruga eklemez, veri yazmaz."""
+        cfg = dict(self.cfg)
+        job = dead_job(f"{self.base}/file.bin", cfg, segments=2)
+        t, gate = self._lingering_worker(job)
+        job._threads = []              # birlesme beklemesin: isci hala okumada
+        job.pause()
+        job._fold_threads()
+        self.assertEqual(job.state, JobState.PAUSED)
+        meta = util.read_json(job.meta_path)
+        self.assertEqual([tuple(r) for r in meta["ranges"]], [(0, 999_999)])
+        # devam: _prepare gibi kuyruk kayittan yuklenir, kusak degisir
+        job._pending = [tuple(r) for r in meta["ranges"]]
+        job._stop.clear()
+        job._gen += 1
+        gate.set()
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(job._pending, [(0, 999_999)])   # kopya yok
+        self.assertEqual(job._inflight, {})
+        self.assertEqual(job.done, 0)                          # veri yazmadi
+        job.cancel(delete_files=True)
+
+    def test_15_pause_lingering_worker_requeues_when_still_stopped(self):
+        """Duraklama surerken okumasi biten isci kalan araligi iade eder."""
+        cfg = dict(self.cfg)
+        job = dead_job(f"{self.base}/file.bin", cfg, segments=2)
+        t, gate = self._lingering_worker(job)
+        job._stop.set()
+        gate.set()
+        t.join(5)
+        self.assertEqual(job._pending, [(0, 999_999)])
+        self.assertEqual(job._inflight, {})
+        self.assertEqual(job.done, 0)
+        job.cancel(delete_files=True)
+
+    def test_16_pause_command_returns_when_paused(self):
+        """pause() havuz kapanana kadar bekler: komut dondugunde durum
+        'paused' dir ve araliklar kaydedilmistir (CLI/GTK aninda gorur)."""
+        job = self._job(f"{self.base}/slow.bin", segments=4)
+        job.start()
+        self.assertTrue(wait_state(job, (JobState.DOWNLOADING,)))
+        time.sleep(0.6)
+        job.pause()
+        self.assertEqual(job.state, JobState.PAUSED, job.state)
+        meta = util.read_json(job.meta_path)
+        covered = sum(e - s + 1 for s, e in meta["ranges"])
+        self.assertEqual(covered + job.done, len(DATA), "araliklar + indirilen = toplam")
+        self.assertEqual(job._inflight, {})
+        job.resume()
+        self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR)))
+        self.assertEqual(job.state, JobState.DONE, job.error)
+        self.assertEqual(sha(job.final_path), DATA_SHA)
+
+    def test_17_pause_and_cancel_are_prompt_under_speed_limit(self):
+        """Hiz limitli iste 32 isci tek kovada sirayla bekler; durdurma
+        yine de hizli olmali (eski davranis: pause 8 sn sonra bile
+        'downloading', cancel dakikalar suruyordu)."""
+        job = self._job(f"{self.base}/file.bin", segments=16, limit=60_000)
+        job.start()
+        self.assertTrue(wait_state(job, (JobState.DOWNLOADING,)))
+        time.sleep(1.2)                      # isciler kovaya takilsin
+        t0 = time.monotonic()
+        job.pause()
+        dt = time.monotonic() - t0
+        self.assertEqual(job.state, JobState.PAUSED, job.state)
+        self.assertLess(dt, 2.5, f"pause {dt:.1f} sn surdu")
+        self.assertEqual(job._inflight, {})
+        job.resume()
+        self.assertTrue(wait_state(job, (JobState.DOWNLOADING,)))
+        time.sleep(1.0)
+        t0 = time.monotonic()
+        job.cancel()
+        dt = time.monotonic() - t0
+        self.assertEqual(job.state, JobState.CANCELED, job.state)
+        self.assertLess(dt, 3.5, f"cancel {dt:.1f} sn surdu")
+        time.sleep(0.5)
+        self.assertFalse([t for t in job._threads if t.is_alive()])
+
+    def test_18_token_bucket_wait_is_abortable(self):
+        from ferdim.ratelimit import TokenBucket
+        b = TokenBucket(1000)                 # 1 KB/sn
+        stop = threading.Event()
+        out = []
+        t = threading.Thread(target=lambda: out.append(b.take(10_000_000, stop)))
+        t.start()
+        time.sleep(0.3)
+        stop.set()
+        t.join(3)
+        self.assertEqual(out, [False])        # bekleyis kesildi, bayt harcanmadi
+        self.assertFalse(t.is_alive())
+        self.assertTrue(b.take(1))
+        self.assertTrue(TokenBucket(0).take(10 ** 9, stop))   # sinirsiz: hep True
+        self.assertTrue(b.take(500))          # stop olsa da yer varsa alinir
+
     def test_11b_error_text_is_human_readable(self):
         """Ham kitaplik metni ('HTTP Error 404: File not found') yerine
         durumun ne oldugunu soyleyen kisa metin."""
@@ -539,6 +690,42 @@ class QueueRoadmapTests(unittest.TestCase):
             self.assertTrue(snap["sched_wait"])
             self.assertEqual(snap["window"], f"{closed_w['start']}-{closed_w['stop']}")
             self.assertFalse(free.snapshot()["sched_wait"])
+        finally:
+            qm.shutdown()
+
+    def test_02b_job_keeps_its_folder_when_default_changes(self):
+        """Varsayilan indirme klasoru degisince eskiden eklenmis islerin
+        yolu da kayiyordu (bitmis is baska klasorde gosteriliyor,
+        yeniden yuklenince yeniden kuyruga giriyordu). Hedef klasor is
+        eklenirken sabitlenir ve kuyruk dosyasina yazilir."""
+        env = AppEnv.__new__(AppEnv)            # gercek koklu AppEnv el ile
+        env._fixed_dir = False
+        env._download_dir = None
+        env._dir_cfg = None
+        env.state_dir = Path(tempfile.mkdtemp(prefix="ferdim-dir-"))
+        env.jobs_dir = env.state_dir / "jobs"
+        env.jobs_dir.mkdir(parents=True)
+        env.config_path = env.state_dir / "config.json"
+        a, b = env.state_dir / "a", env.state_dir / "b"
+        cfg = {"download_dir": str(a), "turbo_mode": False}
+        env.reload_download_dir(cfg)             # daemon'in yaptigi gibi
+        qm = QueueManager(env, cfg)
+        try:
+            old = qm.add(JobSpec(url="http://127.0.0.1:1/eski.bin"), paused=True)
+            self.assertEqual(old.target_dir, a)
+            cfg["download_dir"] = str(b)
+            env.reload_download_dir(cfg)       # ayar canli degisti
+            self.assertEqual(old.target_dir, a)          # eski is yerinde
+            new = qm.add(JobSpec(url="http://127.0.0.1:1/yeni.bin"), paused=True)
+            self.assertEqual(new.target_dir, b)          # yeni is yeni klasore
+            self.assertEqual(old.snapshot()["dir"], str(a))
+            qm._save()
+            qm2 = QueueManager(env, cfg)                  # daemon yeniden basladi
+            try:
+                self.assertEqual(qm2.get(old.id).target_dir, a)
+                self.assertEqual(qm2.get(new.id).target_dir, b)
+            finally:
+                qm2.shutdown()
         finally:
             qm.shutdown()
 

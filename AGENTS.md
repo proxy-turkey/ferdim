@@ -5,7 +5,7 @@ Fedora-first, with a Firefox WebExtension. The engine, CLI and daemon
 are **Python stdlib only** — no pip dependencies, ever. The web UI is
 dependency-free vanilla JS. The extension is Manifest V2.
 
-State at authorship: **1.4.1 released**; test suite green (79 tests),
+State at authorship: **1.4.2 released**; test suite green (87 tests),
 `web-ext lint` 0 errors / 0 warnings, UI smoke checks green
 (`bash tests/ui/run.sh all`), `rpmlint` 0/0, `fedora-review` no failed
 checks, mock builds cleanly on Fedora 43.
@@ -60,6 +60,7 @@ checks, mock builds cleanly on Fedora 43.
 | `extension/` | Firefox MV2 WebExtension + `_locales` |
 | `packaging/ferdim.spec` | Fedora spec — `%check` runs the full suite at build time |
 | `tests/` | stdlib unittest; `tests/helpers.py` has counting HTTP servers, DASH/manifest fixtures, `FakeTime` for governor determinism. `tests/test_roadmap.py` covers source health, checksums, watch folders, API behaviour and static UI rules |
+| `tests/cli_smoke.sh` | End-to-end CLI smoke test against the *running* daemon with the installed binary (isolated download folder, restores settings, removes only its own jobs) |
 | `tests/ui/run.sh` | Optional UI gates (not part of `unittest`): live web UI in headless Chromium (Playwright) + GTK smoke under Xvfb, against an isolated daemon |
 | `scripts/build_srpm.sh`, `scripts/install.sh` | SRPM builder (tarball matches the GitHub tag archive layout), user-level installer |
 | `docs/` | Man pages, `fedora-submission.md` (paste-ready review request), screenshots |
@@ -109,6 +110,31 @@ Read `job.py` before touching the engine. The invariants that matter:
 - Retries back off with `backoff_delay` (2ⁿ s capped at 15, ×0.5–1.5
   jitter). A range is requeued only when its worker gives up, so the
   same range is never processed twice.
+- **In-flight ranges are checkpointed.** Every worker registers the range
+  it holds in `self._inflight[wid]` (advanced per chunk, narrowed on
+  donation) and `_checkpoint` writes `_pending` + `_inflight`. A pause or
+  a crash mid-read therefore re-downloads that range from its last
+  completed offset instead of resuming with a gap ("eksik veri").
+  `requeue()` pops the entry in the same locked section, so an entry is
+  never both queued and in flight.
+- Workers belong to a **generation** (`self._gen`, bumped in `_spawn`).
+  A worker that was still inside a read when its job was paused and
+  resumed sees `gen != self._gen` and returns without requeueing or
+  writing — its range is already in the new pending list.
+- `pause()` is synchronous: sets `_stop`, wakes parked workers, joins the
+  monitor (≤ 8 s) and returns when the state is `paused` and the
+  checkpoint exists. Never rely on a pause that only sets `_stop`.
+- Every blocking wait in a worker must honour `_stop`:
+  `TokenBucket.take(n, stop)` returns `False` when stopped (the caller
+  requeues its range), reads time out through `stall_timeout`, and
+  `_join_threads()` joins all workers under ONE shared deadline (per-thread
+  timeouts multiply by worker count). Without this a speed-limited job
+  took minutes to pause or cancel.
+- `target_dir` is pinned at first use and persisted (`"dir"` in
+  `queue.json` is always written): a job keeps its folder when the default
+  downloads folder changes. Anything a snapshot exposes must be stable —
+  the old property followed the *current* default and retroactively
+  rewrote `dir`/`fullpath` of finished jobs.
 - **Verification runs before DONE.** `_finalize_file` verifies while the
   state is still `downloading` (`extra["verifying"] = True`) and only
   then sets `done`; anything that sees `done` may trust the file. A
@@ -140,6 +166,7 @@ Read `job.py` before touching the engine. The invariants that matter:
 python3 -m unittest discover -s tests        # full suite (must be green)
 npx -y web-ext lint --source-dir extension   # 0 errors and 0 warnings required
 bash tests/ui/run.sh all                     # optional UI gates: web (Playwright) + GTK (Xvfb)
+bash tests/cli_smoke.sh                      # installed binary vs the RUNNING daemon (restores settings)
 bash scripts/build_srpm.sh                   # SRPM; tarball mirrors tag archive
 rpmlint ~/rpmbuild/SRPMS/ferdim-*.src.rpm packaging/ferdim.spec
 sudo mock -r fedora-43-x86_64 --clean --rebuild ~/rpmbuild/SRPMS/ferdim-X.Y.Z-1.fc43.src.rpm
@@ -164,7 +191,8 @@ background task; it will fail on the password prompt.
    `docs/ferdim.1` / `ferdim-nm.1` / `ferdim-gui.1` (`.TH` string),
    `extension/manifest.json`, `CHANGELOG.md`.
 2. Gates: tests green, web-ext lint 0/0, `bash tests/ui/run.sh all`
-   green, rpmlint 0/0, mock build OK (its `%check` re-runs the suite),
+   green, `bash tests/cli_smoke.sh` green against the installed build,
+   rpmlint 0/0, mock build OK (its `%check` re-runs the suite),
    `fedora-review` clean.
 2b. Docs travel with the code: README feature rows + usage block,
    `ROADMAP.md` ticks, `CHANGELOG.md` entry, man pages (`man --warnings
@@ -244,6 +272,24 @@ background task; it will fail on the password prompt.
 - The review directory is root-owned (`sudo rm -rf`), and running
   `cd` into it resets the shell's working directory — `cd` back to the
   repo explicitly.
+- **Two smoke layers exist and both matter:** `bash tests/ui/run.sh all`
+  (isolated daemon; web UI in Chromium, GTK under Xvfb) and
+  `bash tests/cli_smoke.sh` (the *running* daemon and the *installed*
+  binary; restores every setting it touches). The second one found the
+  socket `id` bug, the slow pause under a speed limit and the moving
+  `target_dir` in a single run.
+- **Socket protocol:** the request correlation field is `req_id`, never
+  `id` — `id` is the job id. Until 1.4.2 the server popped `id` as the
+  correlation id, so `ferdim pause/resume/cancel/restart/remove` (and
+  the GTK buttons) silently did nothing since 1.3.0. The web UI uses
+  HTTP and hid the bug; only an end-to-end run of the real CLI verbs
+  against the real daemon exposed it. Before a release, drive every
+  user-visible verb through the installed binary — unit tests of
+  `api.handle()` do not go through the socket.
+- When a smoke test cleans up, remove **only the jobs it created** (by
+  id); the user's real queue lives in the same daemon.
+- CLI output follows the shell's locale (`LANG=en_US.UTF-8` here ⇒
+  English strings); never assert on Turkish CLI text.
 - Timing-sensitive assertions are a smell: if a test can pass or fail
   depending on poll timing, the state machine is wrong (that is how
   "done before verify" was found). Fix the ordering, do not add sleeps.
@@ -251,9 +297,10 @@ background task; it will fail on the password prompt.
 ## Fedora submission status
 
 `docs/fedora-submission.md` documents the process and contains the
-paste-ready review request. As of 1.4.1 the only `fedora-review`
-failure is `CheckSourceDownloads` before the tag exists (it passes once
-the tag is pushed and the review is re-run). The blocker is procedural: the
+paste-ready review request. Since 1.4.1 `fedora-review` reports no
+failed checks on the tag-built SRPM (36 pass, 27 pending = the reviewer's
+manual items); before a tag exists only `CheckSourceDownloads` fails. The
+blocker is procedural: the
 maintainer needs a sponsor — read that doc before touching packaging.
 
 ## Roadmap

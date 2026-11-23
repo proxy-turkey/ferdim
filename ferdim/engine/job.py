@@ -215,6 +215,10 @@ class DownloadJob:
         self._allowed = max(1, min(int(spec.segments or 8), 32))
         self._active = 0          # su an aralik isleyen isci sayisi
         self._alive: set[int] = set()
+        # eldeki (iscilerin isledigi) araliklar: denetim noktasi bunlari da
+        # yazar, boylece duraklama/cokme sonrasi hicbir aralik kaybolmaz
+        self._inflight: dict[int, tuple[int, int]] = {}
+        self._gen = 0              # isci kusagi: her (yeniden) baslatmada artar
         self._spawned_n = 0       # park edilenler dahil toplam isci
         self._limit_events = 0
         # --- akilli guclendirici: hedef = hat VEYA sunucu tavani ---
@@ -251,6 +255,7 @@ class DownloadJob:
         self._sidecar: dict = {}   # otomatik bulunan saglama degerleri
         self._sc_lock = threading.Lock()   # yan dosya <-> bitis el skmasmasi
         self._finalized = threading.Event()
+        self._dir: Path | None = None    # hedef klasor: ilk erisimde sabitlenir
         self._retries = 5
         self._stall = 20           # sn: bu kadar sure bayt gelmezse akis durdu
         self._restarts = 0
@@ -271,7 +276,17 @@ class DownloadJob:
 
     @property
     def target_dir(self) -> Path:
-        return Path(self.spec.directory) if self.spec.directory else self.env.download_dir
+        """Hedef klasor. Acikca verilmisse o; degilse isin ilk
+        kullanimindaki varsayilan indirme klasoru SABITLENIR: varsayilan
+        sonradan degisse de bitmis isin dosyasi yerinde kalir (yolu,
+        silme, arsiv onizleme hep dogru yeri gosterir)."""
+        if self.spec.directory:
+            return Path(self.spec.directory)
+        if self._dir is None:
+            d = self.env.download_dir
+            with self._lock:
+                self._dir = self._dir or d
+        return self._dir
 
     @property
     def final_path(self) -> Path:
@@ -464,13 +479,16 @@ class DownloadJob:
     # ---------------------------------------------------------------- workers
     def _spawn(self):
         n = max(1, min(int(self.spec.segments), 32))
+        with self._lock:
+            self._spawned_n = n
+            self._gen += 1              # yeni kusak: eskiler cekilir
+            gen = self._gen
+        self._threads = [t for t in self._threads if t.is_alive()]
         for i in range(n):
-            t = threading.Thread(target=self._worker, args=(i,), daemon=True,
+            t = threading.Thread(target=self._worker, args=(i, gen), daemon=True,
                                  name=f"ferdim-{self.id}-{i}")
             t.start()
             self._threads.append(t)
-        with self._lock:
-            self._spawned_n = n
         self._monitor = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor.start()
 
@@ -818,18 +836,29 @@ class DownloadJob:
                 return cut - 1
         return e
 
-    def _worker(self, wid: int):
+    def _worker(self, wid: int, gen: int | None = None):
         if self.kind == "hls":
             return  # HLS kendi havuzunu yonetir
+        if gen is None:
+            gen = self._gen
         opt = self.spec.options(self.cfg)
-        while not self._stop.is_set():
+        # kusak degismisse (durdurma -> devam arasinda okumada kalan eski
+        # isci) isci cekilir: araligi denetim noktasinda yazili, iade edilmez
+        while not self._stop.is_set() and gen == self._gen:
             rng = self._acquire(wid)
             if rng is None:
                 return
             cooldown = 0.0
             exit_worker = False
             try:
-                cooldown, exit_worker = self._process_range(rng, opt)
+                cooldown, exit_worker = self._process_range(rng, opt, wid, gen)
+            except Exception:
+                # beklenmedik hata: elindeki aralik kaybolmasin
+                with self._lock:
+                    left = self._inflight.pop(wid, None)
+                    if left and gen == self._gen:
+                        self._pending.append(left)
+                raise
             finally:
                 self._release()
             if cooldown:
@@ -867,7 +896,8 @@ class DownloadJob:
                 raise SourceInvalid("farkli dosya (boyut/aralik)")
         return resp
 
-    def _process_range(self, rng, opt) -> tuple[float, bool]:
+    def _process_range(self, rng, opt, wid: int = -1,
+                       gen: int | None = None) -> tuple[float, bool]:
         """Bir aralik isler. (cooldown, cikis) dondurur.
 
         cooldown: sunucu limiti nedeniyle bekleme (slot birakildi).
@@ -880,23 +910,28 @@ class DownloadJob:
         """
         s, e = rng
         cursor = s
+        if gen is None:
+            gen = self._gen
         attempt = 0            # alternatifsiz basarisizlik (geri cekilme basamagi)
         limit_hits = 0
         last_donate = time.monotonic()
+        with self._lock:
+            self._inflight[wid] = (cursor, e)      # elde: denetim noktasinda
 
         def requeue():
             with self._lock:
                 self._pending.append((cursor, e))
+                self._inflight.pop(wid, None)      # artik kuyrukta, elde degil
 
         def backoff():
             nonlocal attempt
             attempt += 1
             time.sleep(backoff_delay(attempt, rng=self._rand))
 
-        while cursor <= e and not self._stop.is_set():
+        while cursor <= e and not self._stop.is_set() and gen == self._gen:
             src = self._next_source()
             if src is None:
-                if not self._stop.is_set():
+                if not self._stop.is_set() and gen == self._gen:
                     requeue()
                     self._fail(self._dead_reason())
                 return (0.0, True)
@@ -998,14 +1033,22 @@ class DownloadJob:
                     chunk = resp.read(min(self._chunk, remaining))
                     if not chunk:
                         break
-                    if self._stop.is_set():
-                        requeue()
+                    if self._stop.is_set() or gen != self._gen:
+                        if gen == self._gen:       # eski kusak iade etmez
+                            requeue()              # (aralik kayitta zaten var)
                         return (0.0, True)
-                    self._bucket.take(len(chunk))
+                    if not self._bucket.take(len(chunk), self._stop) \
+                            or gen != self._gen:
+                        # hiz kovasi beklerken durdurma geldi: okunan parca
+                        # yazilmadi, aralik (cursor'dan) kuyruga doner
+                        if gen == self._gen:
+                            requeue()
+                        return (0.0, True)
                     with self._lock:
                         os.pwrite(self._fd, chunk, cursor)
                         cursor += len(chunk)
                         self.done += len(chunk)
+                        self._inflight[wid] = (cursor, e)
                     nbytes += len(chunk)
                     win_b += len(chunk)
                     if not progressed and nbytes >= (1 << 20):
@@ -1020,6 +1063,9 @@ class DownloadJob:
                     if now - last_donate >= 1.0:
                         last_donate = now
                         e = self._maybe_donate(cursor, e)
+                        with self._lock:           # bagislanan kuyrugta, elde degil
+                            if wid in self._inflight:
+                                self._inflight[wid] = (cursor, e)
                 if self.total < 0:
                     # bilinmeyen boyut: EOF dosyanin gercek sonudur
                     with self._lock:
@@ -1084,6 +1130,8 @@ class DownloadJob:
                 with self._cond:
                     src.active -= 1
                     self._cond.notify_all()
+                with self._lock:
+                    self._inflight.pop(wid, None)  # bitti ya da iade edildi
         # stop geldi veya dongu bitti
         return (0.0, False)
 
@@ -1197,9 +1245,18 @@ class DownloadJob:
             return
         self._finalize_file()
 
+    def _join_threads(self, timeout: float) -> None:
+        """Tum iscileri ORTAK bir sure icinde bekler: her isciye ayri sure
+        degil (32 takili isci 32 x 3 sn degil, en cok 'timeout' sn)."""
+        deadline = time.monotonic() + timeout
+        for t in list(self._threads):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            t.join(left)
+
     def _fold_threads(self):
-        for t in self._threads:
-            t.join(timeout=3)
+        self._join_threads(3.0)
         self._checkpoint(force=True)
         if self.state in (JobState.DOWNLOADING, JobState.CONNECTING):
             self.state = JobState.PAUSED
@@ -1333,12 +1390,22 @@ class DownloadJob:
             self.error = msg
             self.speed = 0
         self._stop.set()  # diger iscalar kalan araliklari katlasin
+        with self._cond:
+            self._cond.notify_all()
         self._checkpoint(force=True)
         self._changed()
 
     # -------------------------------------------------------------- control
     def pause(self):
+        """Durdurur ve (en cok ~8 sn) havuzun kapanmasini bekler: komut
+        dondugunde kalan araliklar kuyruktadir, denetim noktasi
+        yazilmistir ve durum 'paused' dir."""
         self._stop.set()
+        with self._cond:
+            self._cond.notify_all()       # park etmis iscalar uyansin
+        m = self._monitor
+        if m is not None and m is not threading.current_thread():
+            m.join(timeout=8.0)
         self._changed()
 
     def resume(self):
@@ -1347,10 +1414,11 @@ class DownloadJob:
 
     def cancel(self, delete_files: bool = False):
         self._stop.set()
+        with self._cond:
+            self._cond.notify_all()
         if self._monitor:
             self._monitor.join(timeout=5)
-        for t in self._threads:
-            t.join(timeout=2)
+        self._join_threads(2.0)
         try:
             if self._fd is not None:
                 os.close(self._fd)
@@ -1383,7 +1451,10 @@ class DownloadJob:
                 "total": self.total,
                 "etag": self._etag,
                 "last_modified": self._last_modified,
-                "ranges": [list(r) for r in self._pending],
+                # eldeki araliklar da yazilir: duraklama/cokme aninda bir
+                # iscinin elinde kalan bolum yeniden indirilir, kaybolmaz
+                "ranges": [list(r) for r in self._pending] +
+                          [list(r) for r in self._inflight.values()],
                 "done": self.done,
                 "kind": self.kind,
                 "allowed": self._allowed,

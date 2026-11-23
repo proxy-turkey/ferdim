@@ -251,7 +251,9 @@ class QueueManager:
         for j in self.jobs:
             data.append({
                 "id": j.id, "url": j.url, "filename": j.final_filename,
-                "dir": j.spec.directory, "segments": j.spec.segments,
+                # hedef klasor her zaman yazilir: varsayilan indirme
+                # klasoru degisse de is yeniden yuklenince yerini korur
+                "dir": str(j.target_dir), "segments": j.spec.segments,
                 "headers": j.spec.headers, "cookies": j.spec.cookies,
                 "user": j.spec.user, "password": j.spec.password,
                 "proxy": j.spec.proxy, "insecure": j.spec.insecure,
