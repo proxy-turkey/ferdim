@@ -1,7 +1,7 @@
 %global srcname ferdim
 
 Name:           %{srcname}
-Version:        1.5.0
+Version:        1.5.1
 Release:        1%{?dist}
 Summary:        Dynamic self-tuning download manager with Firefox integration
 
@@ -127,6 +127,12 @@ python3 -m unittest discover -s tests -v
 # end of user-unit preun scriptlet
 
 %changelog
+* Tue Nov 24 2026 Enes Aksu <eaksu@pm.me> - 1.5.1-1
+- SOCKS5/SOCKS5h proxy support in the standard library (HTTP, HTTPS, FTP)
+- download history in SQLite: search, re-download, per-host statistics
+- fix: pause is synchronous across the job start window; HLS/DASH pause
+- fix: --insecure was ignored for HTTPS; descriptor leak on pause/resume
+- packaging: openSUSE conditionals; COPR, OBS and AMO publish on tag
 * Tue Nov 24 2026 Enes Aksu <eaksu@pm.me> - 1.5.0-1
 - FTP/FTPS downloads via the standard library (resume, retries, MDTM check)
 - stable API error codes; web UI and CLI translate engine errors

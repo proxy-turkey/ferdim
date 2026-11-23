@@ -4,7 +4,7 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
-## [Unreleased]
+## [1.5.1] — 2026-11-24
 
 ### Added
 - The Firefox extension is published on addons.mozilla.org (listed,
@@ -47,6 +47,20 @@ semantic versioning.
   authentication or permission failure fails the job at once with the
   stable `auth` / `forbidden` error code instead of burning retries, and
   proxy passwords never appear in snapshots, logs or error messages.
+- openSUSE packages on OBS (`home:proxy-turkey/ferdim`, Tumbleweed and
+  Leap 16.0); COPR, OBS and AMO are all published from the release tag.
+
+### Fixed
+- `pause` could return while a job was still downloading when it arrived
+  between the job start and its monitor thread (seen as an intermittent
+  test failure on Fedora 44 / Rawhide builders). A pause on a queued job was
+  lost, a pause while connecting turned the job into an error, and a cancel
+  during start could be overwritten. Start, pause and cancel now hand over
+  under one lock and pause waits for the start in progress.
+- Pausing an HLS or DASH download left it stuck in "downloading" and resume
+  did nothing; the DASH segment checkpoint could be overwritten.
+- `--insecure` / `verify_tls = false` was ignored for HTTPS downloads.
+- A file descriptor leaked on every pause/resume cycle.
 
 ## [1.5.0] — 2026-11-24
 
