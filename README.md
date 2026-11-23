@@ -75,15 +75,15 @@ the full test suite running inside `%check`, and `rpmlint` is clean. See
 [docs/fedora-submission.md](docs/fedora-submission.md) for the path into the
 official repositories, and [docs/packaging.md](docs/packaging.md) for COPR.
 
-Once the package lands in COPR / Fedora repositories:
+Fedora 43 and newer (x86_64, aarch64) — from COPR, rebuilt automatically on
+every release tag:
 
 ```bash
-# COPR (when published):
-dnf copr enable <maintainer>/ferdim
-dnf install ferdim
+sudo dnf copr enable proxy-turkey/ferdim
+sudo dnf install ferdim
 ```
 
-Until then, install from a release tarball or from source (below).
+Other distributions: install from a release tarball or from source (below).
 
 ### From source (any modern Linux, user-level)
 

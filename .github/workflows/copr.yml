@@ -1,0 +1,48 @@
+name: COPR
+
+# Etiket push'unda (vX.Y.Z) COPR'da proxy-turkey/ferdim icin derleme baslatir.
+# SRPM, Fedora incelemesindeki gibi GitHub etiket arsivinden uretilir.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v1.5.1)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  copr:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Tools
+        run: dnf -y install rpm-build copr-cli curl git
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Build SRPM from the tag archive
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          spec_ver=$(awk '/^Version:/{print $2}' packaging/ferdim.spec)
+          test "$ver" = "$spec_ver" || { echo "tag $TAG != spec $spec_ver"; exit 1; }
+          mkdir -p ~/rpmbuild/SOURCES ~/rpmbuild/SPECS
+          curl -fsSL -o ~/rpmbuild/SOURCES/"$TAG".tar.gz \
+            "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/$TAG.tar.gz"
+          cp packaging/ferdim.spec ~/rpmbuild/SPECS/
+          rpmbuild -bs ~/rpmbuild/SPECS/ferdim.spec
+      - name: Submit to COPR
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.config
+          printf '%s\n' "$COPR_CONFIG" > ~/.config/copr
+          chmod 600 ~/.config/copr
+          copr-cli build proxy-turkey/ferdim ~/rpmbuild/SRPMS/ferdim-*.src.rpm

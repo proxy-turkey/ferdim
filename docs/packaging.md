@@ -5,6 +5,11 @@ covers the three publication tiers and what each requires.
 
 ## 1) COPR — the fast track (`dnf copr enable … && dnf install ferdim`)
 
+> Live: <https://copr.fedorainfracloud.org/coprs/proxy-turkey/ferdim/>.
+> `.github/workflows/copr.yml` rebuilds it on every `v*` tag push (SRPM
+> from the GitHub tag archive; `COPR_CONFIG` repository secret holds the
+> copr-cli config). The manual steps below are kept for forks.
+
 COPR is Fedora's personal build service and the quickest way to make
 `dnf install ferdim` work for everyone.
 

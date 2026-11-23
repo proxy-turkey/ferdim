@@ -29,7 +29,7 @@ Shipped in **1.4.1** (2026-11-23):
 
 ## 1.5 — distribution & reach
 
-- [ ] COPR repository with automatic builds on tag push; document
+- [x] COPR repository with automatic builds on tag push; document
       `dnf copr enable` as the one-liner install.
 - [ ] Official Fedora package submission completed (sponsor found;
       `docs/fedora-submission.md` has the template).
