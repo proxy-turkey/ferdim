@@ -13,25 +13,82 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
+from . import socks
+
 RCVBUF = 1 << 21  # 2 MB (cekirdek rmem_max ile kisitlanir, sorun degil)
+
+
+def _tune(sock: socket.socket) -> None:
+    """Baglanti soketine turbo tamponunu uygular (stdlib ile ayni)."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF)
+    except OSError:
+        pass
 
 
 class FastHTTPConnection(http.client.HTTPConnection):
     def connect(self):
         super().connect()
-        try:
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF)
-        except OSError:
-            pass
+        _tune(self.sock)
 
 
 class FastHTTPSConnection(http.client.HTTPSConnection):
     def connect(self):
         super().connect()
-        try:
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF)
-        except OSError:
-            pass
+        _tune(self.sock)
+
+
+def _socks_http_conn(proxy: str):
+    """SOCKS5 tuneli uzerinden duz HTTP baglantisi."""
+
+    class Conn(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = socks.open_tunnel(proxy, self.host, self.port,
+                                          self.timeout)
+            _tune(self.sock)
+
+    return Conn
+
+
+def _socks_https_conn(proxy: str):
+    """Tunel uzerinden TLS: SNI ve sertifika dogrulamasi hedef adiyla."""
+
+    class Conn(http.client.HTTPSConnection):
+        def connect(self):
+            raw = socks.open_tunnel(proxy, self.host, self.port,
+                                    self.timeout)
+            try:
+                self.sock = self._context.wrap_socket(
+                    raw, server_hostname=self.host)
+            except BaseException:
+                raw.close()
+                raise
+            _tune(self.sock)
+
+    return Conn
+
+
+class SocksHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, proxy: str):
+        super().__init__()
+        self._proxy = proxy
+
+    def http_open(self, req):
+        return self.do_open(_socks_http_conn(self._proxy), req)
+
+
+class SocksHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, proxy: str, context=None):
+        super().__init__(context=context)
+        self._proxy = proxy
+
+    def https_open(self, req):
+        return self.do_open(_socks_https_conn(self._proxy), req,
+                            context=self._context)
 
 
 class FastHTTPHandler(urllib.request.HTTPHandler):
@@ -89,22 +146,31 @@ class ProbeResult:
     content_disposition: str = ""
 
 
-def _make_opener(opt: DlOptions):
-    handlers: list[urllib.request.BaseHandler] = []
-    if opt.proxy:
-        handlers.append(urllib.request.ProxyHandler(
-            {"http": opt.proxy, "https": opt.proxy}))
-    else:
-        # cevre degiskenlerindeki proxy'yi koru (urllib varsayilani)
-        handlers.append(urllib.request.ProxyHandler())
-    if opt.insecure:
-        ctx = ssl.create_default_context()
+def _tls_context(insecure: bool) -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    if insecure:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        handlers.append(FastHTTPSHandler(context=ctx))
+    return ctx
+
+
+def _make_opener(opt: DlOptions):
+    handlers: list[urllib.request.BaseHandler] = []
+    if opt.proxy and socks.is_socks(opt.proxy):
+        # SOCKS5: gecit HTTP degil, tunel acar; ProxyHandler kullanilmaz.
+        handlers.append(SocksHTTPHandler(opt.proxy))
+        handlers.append(SocksHTTPSHandler(
+            opt.proxy, _tls_context(opt.insecure)))
     else:
-        handlers.append(FastHTTPSHandler())
-    handlers.append(FastHTTPHandler())
+        if opt.proxy:
+            handlers.append(urllib.request.ProxyHandler(
+                {"http": opt.proxy, "https": opt.proxy}))
+        else:
+            # cevre degiskenlerindeki proxy'yi koru (urllib varsayilani)
+            handlers.append(urllib.request.ProxyHandler())
+        handlers.append(FastHTTPSHandler(
+            context=_tls_context(True) if opt.insecure else None))
+        handlers.append(FastHTTPHandler())
     return urllib.request.build_opener(*handlers)
 
 

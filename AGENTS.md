@@ -5,7 +5,7 @@ Fedora-first, with a Firefox WebExtension. The engine, CLI and daemon
 are **Python stdlib only** — no pip dependencies, ever. The web UI is
 dependency-free vanilla JS. The extension is Manifest V2.
 
-State at authorship: **1.5.0 released**; test suite green (135 tests),
+State at authorship: **1.5.0 released**; test suite green (145 tests),
 `web-ext lint` 0 errors / 0 warnings, UI smoke checks green
 (`bash tests/ui/run.sh all`), `rpmlint` 0/0, `fedora-review` no failed
 checks, mock builds cleanly on Fedora 43.
@@ -48,6 +48,7 @@ checks, mock builds cleanly on Fedora 43.
 | `ferdim/engine/hls.py` | m3u8 parsing (variants/master), thin wrapper over `segments.assemble` |
 | `ferdim/engine/dash.py` | MPD parsing: best-representation selection, SegmentTemplate (`$Number$`/`$Time$`/SegmentTimeline) and SegmentList |
 | `ferdim/engine/queue.py` | QueueManager: concurrency, night scheduler + per-category windows, smart queue (background size prober, smallest-first), persistence (mirrors, checksums and per-job limits survive restarts) |
+| `ferdim/engine/socks.py` | SOCKS5 tunnel client (RFC 1928 / RFC 1929), pure stdlib: `socks5://` resolves locally, `socks5h://` at the proxy |
 | `ferdim/engine/httpcli.py` | Probe/download primitives (per-read timeout ⇒ stall detection), `fetch_small` for sidecars, headers, auth, proxy, cookies |
 | `ferdim/metalink.py` | `.metalink` / `.meta4` (RFC 5854) parsing |
 | `ferdim/api.py` | Command handlers shared by socket and HTTP: token-auth API, metalink expansion (remote + local `add-file`), config sanitising (`_sanitize_config`), turbo/limit consistency, ZIP preview |
@@ -160,6 +161,12 @@ Read `job.py` before touching the engine. The invariants that matter:
 - HLS and DASH never go through the range engine; they call
   `segments.assemble` (parallel fetch, ordered assembly, per-segment
   checkpointing).
+- A `socks5://` / `socks5h://` proxy is a **tunnel**, not an HTTP proxy:
+  `httpcli._make_opener` swaps the urllib proxy handler for SOCKS
+  handlers, TLS is wrapped over the tunnel with the target's SNI, and
+  FTP opens control + passive data connections through `_SocksFTP`
+  (active mode is impossible over CONNECT). Proxy `auth` / `forbidden`
+  codes are terminal — never burn retries on them.
 
 ## Commands
 

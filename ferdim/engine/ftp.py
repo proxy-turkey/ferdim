@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
 
 from .. import util
+from . import socks
 
 BLOCK = 1 << 16          # 64 KB veri blogu
 POLL = 2.0               # veri okuma yoklamasi: durdurma en gec bu kadar bekler
@@ -131,6 +132,8 @@ def _perm_error(ex: ftplib.error_perm) -> FtpError:
 def _wrap(ex: BaseException, connecting: bool = False) -> FtpError:
     if isinstance(ex, FtpError):
         return ex
+    if isinstance(ex, socks.SocksError):
+        return FtpError(str(ex), ex.code, transient=ex.code == "network")
     if isinstance(ex, socket.gaierror):
         return FtpError("sunucu adi cozulemedi", "network", transient=True)
     if isinstance(ex, ConnectionRefusedError):
@@ -182,16 +185,93 @@ def _wrap(ex: BaseException, connecting: bool = False) -> FtpError:
     return FtpError(str(ex) or type(ex).__name__)
 
 
+class _SocksFTP:
+    """ftplib baglantilarini SOCKS5 tunelinden gecirir.
+
+    Kontrol ve pasif veri baglantisi ayni tunelden acilir (PASV'in verdigi
+    ozel adres gecitten gorunmeyebilir; veri baglantisi kontrol sunucusu
+    adresine kurulur). Aktif mod SOCKS uzerinden kurulamaz: gecit geri
+    baglanti kabul etmez, bu yuzden pasif mod zorunludur.
+    """
+
+    _socks_proxy = ""            # alt siniflar ornekte doldurur
+
+    def connect(self, host: str = "", port: int = 0, timeout=-999,
+                source_address=None):
+        # ftplib.FTP.connect ile ayni sozlesme; tek fark soketin tunelden
+        # gelmesi (stdlib kodu kopyalanir, cunku create_connection'e
+        # mudahale edilemiyor).
+        if host != "":
+            self.host = host
+        if port > 0:
+            self.port = port
+        if timeout != -999:
+            self.timeout = timeout
+        if source_address is not None:
+            self.source_address = source_address
+        if self.timeout is not None and not self.timeout:
+            raise ValueError("Non-blocking socket (timeout=0) is not supported")
+        self.sock = socks.open_tunnel(self._socks_proxy, self.host, self.port,
+                                      self.timeout)
+        self.af = self.sock.family
+        self.file = self.sock.makefile("r", encoding=self.encoding)
+        self.welcome = self.getresp()
+        return self.welcome
+
+    def ntransfercmd(self, cmd: str, rest=None):
+        """Pasif veri baglantisini tunelden acar (gerekirse TLS ile sarar)."""
+        if not self.passiveserver:
+            raise socks.SocksError("FTP SOCKS yalniz pasif modda calisir",
+                                   "incompatible")
+        _host, port = self.makepasv()
+        conn = socks.open_tunnel(self._socks_proxy, self.host, port,
+                                 self.timeout)
+        try:
+            if rest is not None:
+                self.sendcmd("REST %s" % rest)
+            resp = self.sendcmd(cmd)
+            # bazi sunucular LIST/STOR icin once 200 doner (protokol disi)
+            if resp[0] == "2":
+                resp = self.getresp()
+            if resp[0] != "1":
+                raise ftplib.error_reply(resp)
+        except BaseException:
+            conn.close()
+            raise
+        size = ftplib.parse150(resp) if resp[:3] == "150" else None
+        if getattr(self, "_prot_p", False):
+            conn = self.context.wrap_socket(conn, server_hostname=self.host)
+        return conn, size
+
+
+class _SocksFTPPlain(_SocksFTP, ftplib.FTP):
+    def __init__(self, proxy: str, *args, **kw):
+        super().__init__(*args, **kw)
+        self._socks_proxy = proxy
+
+
+class _SocksFTPTLS(_SocksFTP, ftplib.FTP_TLS):
+    def __init__(self, proxy: str, *args, **kw):
+        super().__init__(*args, **kw)
+        self._socks_proxy = proxy
+
+
 def _connect(t: _Target, *, timeout: float, insecure: bool,
-             stall: float) -> ftplib.FTP:
+             stall: float, proxy: str = "") -> ftplib.FTP:
+    # FTP yalniz SOCKS5 tunelini kullanir; HTTP gecidi FTP'ye uygulanmaz.
+    use_socks = bool(proxy) and socks.is_socks(proxy)
     if t.secure:
         ctx = ssl.create_default_context()
         if insecure:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-        ftp: ftplib.FTP = ftplib.FTP_TLS(context=ctx, timeout=timeout)
+        if use_socks:
+            ftp: ftplib.FTP = _SocksFTPTLS(proxy, context=ctx, timeout=timeout)
+        else:
+            ftp = ftplib.FTP_TLS(context=ctx, timeout=timeout)
     else:
-        ftp = ftplib.FTP(timeout=timeout)
+        ftp = _SocksFTPPlain(proxy, timeout=timeout) if use_socks \
+            else ftplib.FTP(timeout=timeout)
     try:
         ftp.connect(t.host, t.port)
         ftp.login(t.user, t.password)
@@ -224,14 +304,15 @@ def _close(ftp: ftplib.FTP, graceful: bool) -> None:
 
 
 def probe_meta(url: str, *, timeout: int = 30, insecure: bool = False,
-               stall: float | None = None, user: str = "",
-               password: str = "") -> tuple[int, str]:
+               stall: float | None = None, user: str = "", password: str = "",
+               proxy: str = "") -> tuple[int, str]:
     """(boyut, MDTM) dondurur. SIZE yoksa boyut -1, MDTM yoksa zaman bos.
     Yol yoksa FtpError."""
     t = parse_url(url, user, password)
     stall = float(stall or max(int(timeout), 5))
     try:
-        ftp = _connect(t, timeout=timeout, insecure=insecure, stall=stall)
+        ftp = _connect(t, timeout=timeout, insecure=insecure, stall=stall,
+                       proxy=proxy)
     except BaseException as ex:
         raise _wrap(ex) from None
     try:
@@ -257,16 +338,17 @@ def probe_meta(url: str, *, timeout: int = 30, insecure: bool = False,
 
 
 def probe_size(url: str, *, timeout: int = 30, insecure: bool = False,
-               stall: float | None = None, user: str = "",
-               password: str = "") -> int:
+               stall: float | None = None, user: str = "", password: str = "",
+               proxy: str = "") -> int:
     """Dosya boyutu; sunucu SIZE desteklemiyorsa -1. Yol yoksa FtpError."""
     return probe_meta(url, timeout=timeout, insecure=insecure, stall=stall,
-                      user=user, password=password)[0]
+                      user=user, password=password, proxy=proxy)[0]
 
 
 def download(url: str, fd: int, offset: int, *, stop, bucket, progress,
              stalled, insecure: bool = False, timeout: int = 30,
-             halted=None, user: str = "", password: str = "") -> int:
+             halted=None, user: str = "", password: str = "",
+             proxy: str = "") -> int:
     """offset'ten EOF'a indirir, yazilan bayt sayisini dondurur.
 
     stop   : threading.Event; bekleme ve okuma aralarinda gorulur.
@@ -284,7 +366,8 @@ def download(url: str, fd: int, offset: int, *, stop, bucket, progress,
     if aborted():
         return 0
     try:
-        ftp = _connect(t, timeout=timeout, insecure=insecure, stall=stall)
+        ftp = _connect(t, timeout=timeout, insecure=insecure, stall=stall,
+                       proxy=proxy)
     except BaseException as ex:
         raise _wrap(ex) from None
     written = 0
