@@ -13,7 +13,10 @@ yalnizca RTT bandi ve baglanti basi hiz bildirir.
 
 Dosya durum dizininde 0600 modunda, atomik yazilir (tmp + os.replace);
 en fazla MAX_HOSTS kayit tutulur (en eski last_seen duser) ve
-MAX_AGE_DAYS gun gormeyen kayitlar atilir.
+MAX_AGE_DAYS gun gormeyen kayitlar atilir. Dosya bir sema surumu tasir
+(FORMAT_VERSION) ve sirali goclardan gecer; bilinmeyen alanlar korunur.
+Dosya baska bir surec tarafindan degistirildiyse (mtime + boyut) yazim
+oncesinde yeniden okunup birlestirilir; kayitlar birbirini ezmez.
 """
 from __future__ import annotations
 
@@ -31,6 +34,50 @@ MAX_AGE_DAYS = 90         # gun: bu kadar gormeyen ana makine unutulur
 RTT_LOW = 0.05            # sn: altinda "low"
 RTT_MID = 0.20            # sn: altinda "mid", ustu "high"
 FORMAT_VERSION = 1
+
+
+def _hosts_migration_1(data: dict) -> None:
+    """v1: 'version' alani + 'hosts' sozlugu; surum alani olmayan dosya v0."""
+
+
+# ileri goc: her adim bir onceki surumun uzerine ekler (history.py gibi)
+HOSTS_MIGRATIONS = {1: _hosts_migration_1}
+
+
+def _migrate_hosts(data: dict, version: int) -> int:
+    """Sirali goclari uygular; dosya bizden yeniyse dokunmaz.
+
+    Bilinmeyen alanlar (ust duzey ve kayit icinde) korunur; bizden yeni
+    surum tasiyan dosya en iyi cabayla okunur, goc ettirilmez.
+    """
+    while version < FORMAT_VERSION:
+        HOSTS_MIGRATIONS[version + 1](data)
+        version += 1
+    return version
+
+
+def _parse_file(raw) -> tuple[dict[str, dict], dict, int]:
+    """hosts.json govdesini (kayitlar, bilinmeyen ust alanlar, surum) ayirir.
+
+    Bozuk ya da eksik dosya bos depo sayilir; tek bozuk kayit digerlerini
+    dusurmez (ayni kuyruk kurtarma sozlesmesi).
+    """
+    if not isinstance(raw, dict):
+        return {}, {}, 0
+    hosts = raw.get("hosts")
+    data: dict[str, dict] = {}
+    if isinstance(hosts, dict):
+        for host, val in hosts.items():
+            rec = _entry(val)
+            if isinstance(host, str) and host and rec is not None:
+                data[host.lower()] = rec
+    extra = {k: v for k, v in raw.items() if k not in ("version", "hosts")}
+    try:
+        version = max(0, int(raw.get("version") or 0))
+    except (TypeError, ValueError):
+        version = 0
+    return data, extra, _migrate_hosts(data, version)
+
 
 # semaya gore varsayilan portlar: URL'de yazilsa da anahtar sadelesir
 _DEFAULT_PORTS = {"http": (80,), "https": (443,), "ftp": (21,),
@@ -82,11 +129,15 @@ def rtt_band(secs: float) -> str:
 
 
 def _entry(raw) -> dict | None:
-    """Diskten okunan tek kaydi dogrular; bozuksa None."""
+    """Diskten okunan tek kaydi dogrular; bozuksa None.
+
+    Bilinmeyen alanlar (bizden yeni surum) kayitta oldugu gibi saklanir ve
+    yeniden yazimda korunur.
+    """
     if not isinstance(raw, dict):
         return None
     try:
-        return {
+        rec = {
             "links": max(0, int(raw.get("links") or 0)),
             "seg_workers": max(0, int(raw.get("seg_workers") or 0)),
             "throttled": bool(raw.get("throttled")),
@@ -97,6 +148,10 @@ def _entry(raw) -> dict | None:
         }
     except (TypeError, ValueError):
         return None
+    for key, val in raw.items():
+        if key not in rec:          # bilinmeyen alan: oldugu gibi korunur
+            rec[key] = val
+    return rec
 
 
 class HostProfiles:
@@ -116,8 +171,39 @@ class HostProfiles:
         self._now = now_fn
         self._lock = threading.Lock()
         self._data: dict[str, dict] | None = None
+        # dosya imzasi: baska bir surec yazdiysa tazeleme icin (mtime + boyut)
+        self._sig = None
+        self._extra: dict = {}          # dosyadaki bilinmeyen ust alanlar
+        self._version = FORMAT_VERSION  # dosyanin (korunan) sema surumu
 
     # ------------------------------------------------------------- ic yardim
+    def _file_sig(self):
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def _refresh_locked(self) -> None:
+        """Baska bir surec dosyayi degistirdiyse yeniden okur ve birlestirir.
+
+        Disk temeldir: baska surecin ekledigi ana makineler gelir, sildigi
+        kayitlar geri getirilmez. Bellekte daha yeni bir olcum varsa (henuz
+        yazilmamis) o korunur; boylece es zamanli yazimlar birbirini ezmez.
+        """
+        sig = self._file_sig()
+        if sig == self._sig or self._data is None:
+            return
+        data, extra, version = _parse_file(util.read_json(self.path))
+        for host, rec in self._data.items():
+            cur = data.get(host)
+            if cur is not None and rec["last_seen"] > cur["last_seen"]:
+                data[host] = rec
+        self._data = data
+        self._extra = extra
+        self._version = max(self._version, version)
+        self._sig = sig
+
     def _prune_locked(self, now: float) -> None:
         """Suresi dolanlari at, sonra en eski last_seen'leri buda."""
         assert self._data is not None
@@ -132,28 +218,31 @@ class HostProfiles:
                 del self._data[host]
 
     def _load_locked(self, now: float) -> dict[str, dict]:
-        """Dosyayi bir kez okur; bozuk dosya bos depo sayilir.
+        """Dosyayi bir kez okur; sonra baska surec yazdiysa tazeler.
 
-        Prune her okumada calisir: suresi dolan ana makine, araya bir
-        record() girmeden de get()/hosts() sonucunda GORUNMEZ.
+        Bozuk dosya bos depo sayilir. Prune her okumada calisir: suresi
+        dolan ana makine, araya bir record() girmeden de get()/hosts()
+        sonucunda GORUNMEZ.
         """
         if self._data is None:
-            raw = util.read_json(self.path)
-            hosts = raw.get("hosts") if isinstance(raw, dict) else None
-            data: dict[str, dict] = {}
-            if isinstance(hosts, dict):
-                for host, val in hosts.items():
-                    rec = _entry(val)
-                    if isinstance(host, str) and host and rec is not None:
-                        data[host.lower()] = rec
+            data, extra, version = _parse_file(util.read_json(self.path))
             self._data = data
+            self._extra = extra
+            self._version = version
+            self._sig = self._file_sig()
+        else:
+            self._refresh_locked()
         self._prune_locked(now)
         return self._data
 
     def _save_locked(self) -> None:
         assert self._data is not None
-        util.atomic_write_json(self.path,
-                               {"version": FORMAT_VERSION, "hosts": self._data})
+        # bilinmeyen ust alanlar ve daha yeni surum numarasi korunur
+        payload = dict(self._extra)
+        payload["version"] = max(FORMAT_VERSION, self._version)
+        payload["hosts"] = self._data
+        util.atomic_write_json(self.path, payload)
+        self._sig = self._file_sig()
 
     # ------------------------------------------------------------------ okuma
     def get(self, text: str) -> dict | None:
