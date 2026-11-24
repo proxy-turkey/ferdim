@@ -118,6 +118,16 @@ Write \fIFILE.ferdim-merkle\fR: content-defined (FastCDC, 256 KiB / 1 MiB /
 chunk hashes. A publisher can host the manifest next to the file like a
 \&.sha256 sidecar; a downloader picks up \fI<url>.ferdim-merkle\fR
 automatically.
+.IP
+A metalink document can point at the manifest instead of relying on the
+sidecar: put a \fB<metaurl
+mediatype="application/x-ferdim-merkle">URL</metaurl>\fR inside the
+\fB<file>\fR element and, optionally, the expected root in \fB<hash
+type="ferdim-merkle-root">HEX</hash>\fR. Both ride along as unknown
+elements, so other tools ignore them. The manifest of a document the user
+supplied is treated like \fB\-\-merkle\fR (explicit, a mismatch is an
+error); a declared root that differs from the fetched manifest aborts the
+add.
 .TP
 .BI merkle " verify FILE [MANIFEST]"
 Re-hash the chunks listed in the manifest (default \fIFILE.ferdim-merkle\fR)

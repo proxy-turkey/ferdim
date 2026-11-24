@@ -115,6 +115,15 @@ Durum web arayüzünün alt bilgisinde görünür.
 Merkle kökü. Yayıncı bildirimi dosyanın yanında \&.sha256 yan dosyası gibi
 barındırabilir; indirici \fI<url>.ferdim-merkle\fR adresini kendiliğinden
 bulur.
+.IP
+Bir metalink belgesi yan dosyaya güvenmek yerine bildirimi kendisi
+gösterebilir: \fB<file>\fR öğesinin içine \fB<metaurl
+mediatype="application/x-ferdim-merkle">URL</metaurl>\fR ve isteğe bağlı
+olarak beklenen kökü \fB<hash type="ferdim-merkle-root">HEX</hash>\fR
+koyun. İkisi de bilinmeyen öğe olarak taşınır, diğer araçlar yok sayar.
+Kullanıcının verdiği belgedeki bildirim \fB\-\-merkle\fR gibi kesin sayılır
+(uyuşmazlık hatadır); belgede beyan edilen kök indirilen bildirimin
+köküyle tutmazsa ekleme hiç yapılmaz.
 .TP
 .BI merkle " verify DOSYA [BİLDİRİM]"
 Bildirimde listelenen parçaları yeniden özetler (varsayılan

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mmap
 import os
 import sys
 import threading
@@ -141,6 +142,122 @@ class ChunkerTests(unittest.TestCase):
         self.assertEqual(bad, [(target[0], target[1])])
         p.write_bytes(self.buf + b"x")
         self.assertEqual(cdc.verify_file(p, man), (False, []))
+
+
+def reference_chunk_ranges(buf, min_size=cdc.MIN_CHUNK,
+                           avg_size=cdc.AVG_CHUNK, max_size=cdc.MAX_CHUNK):
+    """1.7 oncesi parcalayici (birebir kopya): sinir kararliligi referansi.
+
+    Hizlandirilmis surum bununla ayni sonucu vermek zorunda; bu yuzden
+    burada, uretim kodunda degil, testte tutulur."""
+    gear = cdc.GEAR
+    mask_s, mask_l = cdc._masks(avg_size)
+    n = len(buf)
+    if min_size < 1:
+        min_size = 1
+    if max_size < min_size:
+        max_size = min_size
+    i = 0
+    while i < n:
+        left = n - i
+        if left <= min_size:
+            yield i, n
+            return
+        limit = n if left <= max_size else i + max_size
+        mid = min(i + avg_size, limit)
+        j = i + min_size
+        h = 0
+        cut = 0
+        while j < mid:
+            h = ((h << 1) + gear[buf[j]]) & cdc.M64
+            j += 1
+            if not h & mask_s:
+                cut = j
+                break
+        if not cut:
+            while j < limit:
+                h = ((h << 1) + gear[buf[j]]) & cdc.M64
+                j += 1
+                if not h & mask_l:
+                    cut = j
+                    break
+            if not cut:
+                cut = limit
+        yield i, cut
+        i = cut
+
+
+class ChunkerStabilityTests(unittest.TestCase):
+    """Hizlandirilmis parcalayici 1.6 algoritmasiyla BAYT BAYT ayni
+    sinirlari uretmeli: yayinlanmis `.ferdim-merkle` bildirimleri gecerli
+    kalsin. Referans yukarida birebir kopya olarak durur."""
+
+    def test_40_matches_reference_on_random_data(self):
+        sizes = (0, 1, 7, 8, 9, 4096, 200_000, 700_000, 3 << 20)
+        extra = [dict(min_size=1, avg_size=1 << 15, max_size=1 << 20),
+                 dict(min_size=1, avg_size=512, max_size=1 << 20),
+                 dict(min_size=1 << 17, avg_size=1 << 18, max_size=1 << 19),
+                 dict(min_size=300, avg_size=1 << 20, max_size=300)]
+        for size in sizes:
+            data = hashlib.shake_256(b"cdc-ref-%d" % size).digest(size)
+            pars = [{}, SMALL]
+            if 200_000 <= size < 3 << 20:      # kucuk girdilerde gereksiz
+                pars += extra
+            for par in pars:
+                with self.subTest(size=size, par=par):
+                    self.assertEqual(
+                        list(reference_chunk_ranges(data, **par)),
+                        list(cdc.chunk_ranges(data, **par)))
+
+    def test_41_matches_reference_on_edge_patterns(self):
+        """Tekrar eden/dusuk entropili veri: on eleme adaylari siklasir."""
+        pats = {
+            "sifir": b"\x00" * 300_000,
+            "tek": b"Z" * 300_000,
+            "periyodik": b"0123456789abcdef" * 18_750,
+            "sinirli": bytes(range(4)) * 75_000,
+        }
+        # aday yogunlugu yuksek veri: her bayt, dusuk 8 biti sifirlayacak
+        # sekilde secilir (koti niyetli girdi taklidi)
+        res = {}
+        for b in range(256):
+            res.setdefault(cdc.GEAR[b] % 256, b)
+        h, out = 0, bytearray()
+        for _ in range(300_000):
+            b = res.get((-2 * h) % 256, 0)
+            out.append(b)
+            h = ((h << 1) + cdc.GEAR[b]) & cdc.M64
+        pats["yogun-aday"] = bytes(out)
+        for name, data in pats.items():
+            for par in ({}, SMALL):
+                with self.subTest(desen=name, par=par):
+                    self.assertEqual(
+                        list(reference_chunk_ranges(data, **par)),
+                        list(cdc.chunk_ranges(data, **par)))
+
+    def test_43_dense_candidates_fall_back_to_the_plain_loop(self):
+        """Aday siniri asilinca toptan tarama klasik donguye doner (hazir
+        pencere ozetiyle) ve sinirlar degismez."""
+        par = dict(min_size=4096, avg_size=1 << 17, max_size=1 << 18)
+        data = hashlib.shake_256(b"cdc-yogun").digest(1 << 20)
+        want = list(reference_chunk_ranges(data, **par))
+        self.assertGreater(len(want), 2)
+        with mock.patch.object(cdc, "_MAX_CAND", 1):
+            self.assertEqual(list(cdc.chunk_ranges(data, **par)), want)
+
+    def test_42_buffer_types_agree(self):
+        data = hashlib.shake_128(b"cdc-buf").digest(900_000)
+        want = list(cdc.chunk_ranges(data, **SMALL))
+        self.assertEqual(list(cdc.chunk_ranges(memoryview(data), **SMALL)),
+                         want)
+        root = tmp_root(self, "ferdim-cdc-mmap-")
+        p = root / "x.bin"
+        p.write_bytes(data)
+        with open(p, "rb") as f, mmap.mmap(f.fileno(), 0,
+                                           access=mmap.ACCESS_READ) as mm:
+            self.assertEqual(list(cdc.chunk_ranges(mm, **SMALL)), want)
+        self.assertEqual([h for _, _, h in cdc.chunk_hashes(p, **SMALL)],
+                         [sha(data[s:e]) for s, e in want])
 
 
 class CdcServer(BaseHTTPRequestHandler):

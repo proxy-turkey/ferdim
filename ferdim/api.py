@@ -164,20 +164,65 @@ def _bad_checksum(params: dict) -> bool:
     return False
 
 
+def _metalink_root_guard(items: list, base: dict, cfg: dict) -> str:
+    """metalink icindeki Merkle kokunun indirilen bildirimle ayni oldugunu
+    dogrular (bos dize: sorun yok).
+
+    Kullanicinin verdigi belge acik bir kaynaktir: bildirim `--merkle` gibi
+    KESIN sayilir, uyusmazsa is hata olur. Belgedeki kok ayrica bildirimin
+    kendi kokuyla ayni olmalidir; tutmazsa dosya kuyruga hic alinmaz
+    (yanlis eslesme "dogrulandi" demek olurdu). Bildirim bu anda
+    okunamiyorsa is yine kuyruga girer: motor ayni sorunu merkle_manifest
+    koduyla bildirir."""
+    need = [it for it in items[:MAX_METALINK_FILES]
+            if it.get("merkle") and it.get("merkle_root")]
+    if not need:
+        return ""
+    from . import cdc
+    from .engine import httpcli as _hc
+    try:
+        opt = _spec_from(base, cfg).options(cfg)
+    except (TypeError, ValueError, KeyError):
+        return ""                    # secenekler kurulamadi: motor karar verir
+    for it in need:
+        try:
+            text = _hc.fetch_small(
+                it["merkle"], opt,
+                timeout=min(max(int(opt.timeout), 2), 8),
+                limit=cdc.MAX_MANIFEST)
+            man = cdc.Manifest.parse(text)
+        except OSError as e:            # ag hatasi / HTTP 4xx-5xx
+            close = getattr(e, "close", None)
+            if close is not None:
+                close()                # urllib HTTPError'i soketi birakmaz
+            continue                   # motor ayni sorunu bildirir
+        except ValueError:
+            continue                   # cozulemeyen bildirim: motor bildirir
+        if man.root != it["merkle_root"]:
+            return (f"{it['filename']}: merkle koku bildirimle uyusmuyor")
+    return ""
+
+
 def _add_metalink_items(ctx, items: list, base: dict) -> dict:
     """Ayristirilmis metalink dosyalarini kuyruga ekler. 'base' icindeki
     dizin, kimlik, hiz limiti gibi ayarlar her dosyaya tasinir."""
     keep = {k: v for k, v in (base or {}).items()
             if k not in ("url", "filename", "mirrors", "sha256", "md5",
                          "sha1", "sha512", "checksums", "checksum", "merkle")}
+    err = _metalink_root_guard(items, keep, ctx["cfg"])
+    if err:
+        return {"ok": False, "error": f"metalink: {err}"}
     ids, first = [], None
     for it in items[:MAX_METALINK_FILES]:
-        r = handle(ctx, "add", {
-            **keep, "url": it["urls"][0],
-            "mirrors": it["urls"][1:MAX_MIRRORS],
-            "filename": it["filename"],
-            "checksums": it.get("hashes") or {"sha256": it.get("sha256", ""),
-                                              "md5": it.get("md5", "")}})
+        checks = it.get("hashes") or {"sha256": it.get("sha256", ""),
+                                      "md5": it.get("md5", "")}
+        add = {**keep, "url": it["urls"][0],
+               "mirrors": it["urls"][1:MAX_MIRRORS],
+               "filename": it["filename"], "checksums": checks}
+        if it.get("merkle"):
+            # belgeye ait bildirim: dosya icin acikca verilmis sayilir
+            add["merkle"] = it["merkle"]
+        r = handle(ctx, "add", add)
         if r.get("ok"):
             ids.append(r["id"])
             first = first or r
