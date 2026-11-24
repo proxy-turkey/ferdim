@@ -97,6 +97,15 @@ denemeler ve zaman aşımları (\fItimeout\fR, \fIstall_timeout\fR) ve indirme
 geçmişinin saklanma süresi (\fIhistory_days\fR, varsayılan 365 gün,
 \fB0\fR sonsuza kadar saklar).
 .TP
+.BI hosts " [\-\-forget SUNUCU | \-\-clear]"
+Öğrenilmiş sunucu bağlantı profillerini gösterir: hız denetleyicisinin
+yerleştiği bağlantı sayısı, yanıt süresi bandı, ölçülen bağlantı başı hız
+ve örnek sayısı. Yeni işler soğuk başlangıç yerine öğrenilen bağlantı
+sayısından (sunucu 429/503 döndüyse öğrenilen güvenli tavandan) başlar;
+denetleyici her iki yönde denemeye devam eder, varsayılan yine en yüksek
+güçtür. \fB\-\-forget\fR tek bir sunucuyu, \fB\-\-clear\fR tümünü siler.
+Öğrenmeyi kapatmak için \fIlearn_hosts\fR değerini \fBfalse\fR yapın.
+.TP
 .BI history " [SORGU]"
 Kalıcı iş geçmişini (durum dizinindeki SQLite veritabanı) en yeniden
 eskiye doğru gösterir. \fB\-\-state\fR \fBdone\fR, \fBerror\fR veya
@@ -118,7 +127,9 @@ Web arayüzünü varsayılan tarayıcıda açar.
 .TP
 .I ~/.local/state/ferdim/
 Soket, jeton, PID, kuyruk durumu, iş üst verisi ve indirme geçmişi
-veritabanı (\fIhistory.db\fR, kip 0600).
+veritabanı (\fIhistory.db\fR, kip 0600); öğrenilmiş sunucu profilleri
+\fIhosts.json\fR dosyasındadır (aynı kip, en çok 500 sunucu, 90 günden eski
+kayıtlar silinir).
 .TP
 .I ~/.config/ferdim/config.json
 Kullanıcı yapılandırması (bkz. \fBferdim config\fR; geçersiz değerler
