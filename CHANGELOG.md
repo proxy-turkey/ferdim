@@ -4,7 +4,7 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
-## [Unreleased]
+## [1.6.0] — 2026-11-24
 
 ### Added
 - Learned per-host connection profiles (`ferdim/profiles.py`,

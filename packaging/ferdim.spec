@@ -1,7 +1,7 @@
 %global srcname ferdim
 
 Name:           %{srcname}
-Version:        1.5.1
+Version:        1.6.0
 Release:        1%{?dist}
 Summary:        Dynamic self-tuning download manager with Firefox integration
 
@@ -155,6 +155,12 @@ python3 -m unittest discover -s tests -v
 # end of user-unit preun scriptlet
 
 %changelog
+* Tue Nov 24 2026 Enes Aksu <eaksu@pm.me> - 1.6.0-1
+- learned per-host connection profiles; coexistence mode (opt-in)
+- archive browsing: nested ZIP / tar, selective extraction, repair
+- desktop notifications; ferdim-dbus session-bus bridge; GNOME Shell extension
+- content-defined chunking with Merkle verification and range-level repair
+- optional HTTP/3 transport (python3-aioquic); Turkish man pages
 * Tue Nov 24 2026 Enes Aksu <eaksu@pm.me> - 1.5.1-1
 - SOCKS5/SOCKS5h proxy support in the standard library (HTTP, HTTPS, FTP)
 - download history in SQLite: search, re-download, per-host statistics

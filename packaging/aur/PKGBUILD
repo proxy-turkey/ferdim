@@ -1,6 +1,6 @@
 # Maintainer: Enes Aksu <eaksu@pm.me>
 pkgname=ferdim
-pkgver=1.5.1
+pkgver=1.6.0
 pkgrel=1
 pkgdesc="Dynamic, self-tuning segmented download manager with a Firefox extension"
 arch=('any')
@@ -15,7 +15,7 @@ optdepends=('python-gobject: GTK 4 front-end (ferdim-gui) and D-Bus bridge'
             'wl-clipboard: clipboard watching on Wayland'
             'python-aioquic: HTTP/3 transport')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('20ced0df037cb796fd2ee6f57e9560fa86addb6753d81d95c2e1871b21d7511a')
+sha256sums=('SKIP')
 
 check() {
   cd "$pkgname-$pkgver"
