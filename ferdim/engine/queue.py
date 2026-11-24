@@ -5,7 +5,7 @@ import threading
 import time
 
 from .. import util
-from ..coexist import DEFAULT_THRESHOLD, LineMonitor
+from ..coexist import DEFAULT_LATENCY, DEFAULT_THRESHOLD, LineMonitor
 from ..history import STATES as HISTORY_STATES, open_history
 from ..paths import AppEnv
 from .job import DownloadJob, JobSpec, JobState
@@ -234,13 +234,26 @@ class QueueManager:
                                                   DEFAULT_THRESHOLD))))
         except (TypeError, ValueError):
             self.coexist.threshold = DEFAULT_THRESHOLD
+        try:
+            self.coexist.latency_factor = max(
+                1.2, min(20.0, float(self.cfg.get("coexist_latency",
+                                                  DEFAULT_LATENCY))))
+        except (TypeError, ValueError):
+            self.coexist.latency_factor = DEFAULT_LATENCY
         self._coexist_on = True
         if running is None:
             with self._lock:
                 running = [j for j in self.jobs if j.state in STATES_RUNNING]
         # kendi hizimizi duseriz: yalniz YABANCI (etkilesimli) trafik kalir
         own = sum(max(0.0, j.speed) for j in running)
-        self.coexist.sample(own)
+        # gecikme sinyali: kendi baglantilarimizin TTFB sismesi (en kotu is)
+        latency = 1.0
+        for j in running:
+            try:
+                latency = max(latency, j.latency_inflation())
+            except Exception:
+                pass
+        self.coexist.sample(own, latency=latency)
         self._apply_coexist_cap(self.coexist.active)
 
     def _apply_coexist_cap(self, active: bool) -> None:
@@ -272,6 +285,10 @@ class QueueManager:
             "pressure": round(float(m.pressure), 3),
             "active": bool(enabled and m.active),
             "threshold": float(m.threshold),
+            # gecikme sinyali: kendi TTFB sismemiz (1.0 = normal)
+            "latency": round(float(getattr(m, "latency", 1.0)), 3),
+            "latency_factor": float(getattr(m, "latency_factor",
+                                            DEFAULT_LATENCY)),
         }
 
     def set_speed_limit(self, bytes_per_sec: int):

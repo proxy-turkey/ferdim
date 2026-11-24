@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -163,6 +164,48 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(store.record("ornek.test", links=3))
         self.assertEqual(HostProfiles(env).get("ornek.test")["links"], 3)
 
+    def test_seg_workers_are_separate_from_links(self):
+        """Segment havuzu sayisi aralik islerinin baglanti sayisini ezmez."""
+        env, store = make_store(self)
+        store.record("ornek.test", seg_workers=6, rtt=0.02)
+        e = store.get("ornek.test")
+        self.assertEqual(e["seg_workers"], 6)
+        self.assertEqual(e["links"], 0)              # aralik olcumu yok
+        store.record("ornek.test", seg_workers=2)
+        e = store.get("ornek.test")
+        self.assertEqual(e["seg_workers"], 4)        # (6+2)/2 yumusak ortalama
+        self.assertEqual(e["links"], 0)
+        # sonraki aralik isi yalniz links alanini ogrenir
+        store.record("ornek.test", links=8)
+        e = HostProfiles(env).get("ornek.test")
+        self.assertEqual(e["links"], 8)
+        self.assertEqual(e["seg_workers"], 4)
+
+    def test_legacy_entry_without_seg_workers_loads(self):
+        """Eski hosts.json (seg_workers yok) aynen yuklenir: alan 0 sayilir."""
+        env, _store = make_store(self)
+        legacy = {"version": 1, "hosts": {"eski.test": {
+            "links": 5, "throttled": True, "rtt_band": "low",
+            "per_link_bps": 1_000_000, "samples": 3,
+            "last_seen": time.time()}}}
+        (env.state_dir / FILE_NAME).write_text(json.dumps(legacy), "utf-8")
+        store = HostProfiles(env)
+        e = store.get("eski.test")
+        self.assertEqual(e["links"], 5)
+        self.assertEqual(e["seg_workers"], 0)
+        self.assertTrue(e["throttled"])
+        # eski anahtar okunur, seg_workers olcumu eklenince dosyaya yazilir
+        store.record("eski.test", seg_workers=3)
+        e = HostProfiles(env).get("eski.test")
+        self.assertEqual((e["seg_workers"], e["links"]), (3, 5))
+
+    def test_bad_seg_workers_is_rejected(self):
+        """Bozuk olcum yok sayilir (links ile ayni sozlesme: False)."""
+        _env, store = make_store(self)
+        store.record("ornek.test", seg_workers=4)
+        self.assertFalse(store.record("ornek.test", seg_workers="bozuk"))
+        self.assertEqual(store.get("ornek.test")["seg_workers"], 4)
+
     def test_forget_and_clear(self):
         _env, store = make_store(self)
         store.record("a.test", links=2)
@@ -313,6 +356,40 @@ class JobReportTests(unittest.TestCase):
         self.assertFalse((env.state_dir / FILE_NAME).exists())
 
 
+class FtpReportTests(unittest.TestCase):
+    """FTP tek akis: yalniz RTT bandi + hiz ogrenilir, baglanti sayisi degil."""
+
+    def _ftp_job(self, case):
+        job, env = make_job(case, segments=1)
+        job.kind = "ftp"
+        job._host = "ftp.ornek.test"
+        return job, env
+
+    def test_records_rtt_and_throughput_only(self):
+        job, env = self._ftp_job(self)
+        job._report_ftp_profile(started=100.0, first_byte=100.08,
+                                moved=4 << 20, seconds=2.0)
+        e = open_profiles(env).get("ftp.ornek.test")
+        self.assertIsNotNone(e)
+        self.assertEqual(e["rtt_band"], "mid")        # 80 ms
+        self.assertEqual(e["per_link_bps"], 2 << 20)  # 4 MB / 2 sn
+        self.assertEqual(e["links"], 0, "FTP aralik tohumunu degistirmemeli")
+        self.assertEqual(e["seg_workers"], 0)
+
+    def test_small_transfer_is_not_learned(self):
+        job, env = self._ftp_job(self)
+        job._report_ftp_profile(started=100.0, first_byte=100.08,
+                                moved=4096, seconds=1.0)
+        self.assertIsNone(open_profiles(env).get("ftp.ornek.test"))
+
+    def test_learn_hosts_false_disables_ftp_report(self):
+        job, env = self._ftp_job(self)
+        job.cfg["learn_hosts"] = False
+        job._report_ftp_profile(started=100.0, first_byte=100.08,
+                                moved=4 << 20, seconds=2.0)
+        self.assertIsNone(open_profiles(env).get("ftp.ornek.test"))
+
+
 class ApiCliTests(unittest.TestCase):
     def setUp(self):
         self.env = AppEnv(root=tmp_root(self, "ferdim-prof-api-"))
@@ -350,6 +427,13 @@ class ApiCliTests(unittest.TestCase):
         cleared = api.handle(self.ctx, "hosts", {"clear": True})
         self.assertEqual(cleared["removed"], 1)
         self.assertEqual(api.handle(self.ctx, "hosts", {})["hosts"], [])
+
+    def test_api_hosts_reports_seg_workers(self):
+        store = open_profiles(self.env)
+        store.record("cdn.test", seg_workers=6, rtt=0.02)
+        rows = api.handle(self.ctx, "hosts", {})["hosts"]
+        self.assertEqual(rows[0]["seg_workers"], 6)
+        self.assertEqual(rows[0]["links"], 0)
 
     def test_cli_hosts_parser_and_output(self):
         args = cli.build_parser().parse_args(["hosts"])
