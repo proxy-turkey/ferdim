@@ -183,6 +183,8 @@ class Smoke(A.FerdimApp):
                 self.actions.append(("exception", "ekleme penceresi yok"))
                 return False
             w = wins[-1]
+            # yerel dosya: erisilemeyen bir URL kuyrukta takili kalip
+            # smart_queue siralamasini geciktiriyor (duman testi beklemesin)
             w.url.set_text(ADD_URL)
             if bad:
                 w.chk.set_text("zzz")
