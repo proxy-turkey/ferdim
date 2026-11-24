@@ -85,6 +85,16 @@ class PublishTest(unittest.TestCase):
                          hashlib.sha256(self.a.read_bytes()).hexdigest())
 
     # --------------------------------------------------------------- meta4
+    def test_meta4_files_are_direct_children_of_metalink(self):
+        """RFC 5854 (4.1.1): <file> ogeleri dogrudan <metalink> altindadir;
+        <files> kapsayicisi Metalink 3.0'a aittir, RFC 5854'te yoktur."""
+        self._run()
+        root = ET.parse(self.dir / "index.meta4").getroot()
+        self.assertEqual(_plain(root), "metalink")
+        self.assertEqual([_plain(e) for e in root],
+                         ["published", "file", "file"])
+        self.assertNotIn("files", {_plain(e) for e in root.iter()})
+
     def test_meta4_round_trips_through_metalink_parser(self):
         self._run(mirrors=["https://mirror.example.net/f",
                            "https://m2.example.net"])

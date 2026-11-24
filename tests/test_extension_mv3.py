@@ -197,6 +197,25 @@ const sendMessage = (env, msg) => new Promise((resolve, reject) => {
   await tick();
   out.afterTabRemoved = Object.keys(session.mediaByTab || {});
 
+  /* soguk baslangic: hidrasyon bitmeden sekme kapanir. Bos harita
+   * yazilirsa diger sekmelerin kayitli medyasi silinir. */
+  {
+    const hit = (name) => ({ url: "https://cdn.example/f/" + name + ".mp4",
+                             kind: "video", role: "direct",
+                             filename: name + ".mp4" });
+    const cold = { mediaByTab: { 7: [hit("gone")], 9: [hit("keep")] } };
+    const env = makeEnv({ session: cold, tabs: [{ id: 7 }, { id: 9 }] });
+    await env.fire("tabRemoved", 7);          // hidrasyon calismamis
+    await tick();
+    await tick();
+    out.coldStart = {
+      keys: Object.keys(cold.mediaByTab || {}),
+      sets: env.log.sessionSet.length,
+      media: (await sendMessage(env, { getMedia: true, tabId: 9 })).media
+        .map((m) => m.url),
+    };
+  }
+
   /* storage.session yok (MV2): durum yalnizca bellekte, ayni baglamda calisir */
   {
     const env = makeEnv({ tabs: [{ id: 7 }] });
@@ -345,6 +364,15 @@ class BackgroundSourceTests(unittest.TestCase):
         self.assertIn('MEDIA_KEY = "mediaByTab"', self.src)
         self.assertIn("sessionArea.set(", self.src)
 
+    def test_persist_waits_for_hydration(self):
+        """Soguk baslangicta yazma hidrasyona baglidir: bos harita
+        storage.session'daki onceki sekme kayitlarini silerdi."""
+        self.assertIn("!mediaHydrated", self.src)
+        self.assertLess(self.src.index("!mediaHydrated"),
+                        self.src.index("sessionArea.set("))
+        block = self.src.split("browser.tabs.onRemoved.addListener", 1)[1]
+        self.assertIn("await mediaReady()", block.split("});", 1)[0])
+
     def test_native_messaging_kept(self):
         self.assertIn('const NATIVE = "ferdim"', self.src)
         self.assertIn("runtime.sendNativeMessage", self.src)
@@ -391,6 +419,14 @@ class BackgroundBehaviorTests(unittest.TestCase):
 
     def test_tab_close_clears_session_state(self):
         self.assertEqual(self.out["afterTabRemoved"], [])
+
+    def test_cold_start_tab_close_keeps_other_tabs(self):
+        """Hidrasyon bitmeden gelen onRemoved bos haritayi yazip diger
+        sekmelerin medyasini silmemeli."""
+        cold = self.out["coldStart"]
+        self.assertEqual(cold["keys"], ["9"], cold)
+        self.assertEqual(cold["media"], ["https://cdn.example/f/keep.mp4"])
+        self.assertEqual(cold["sets"], 1)
 
     def test_mv2_without_session_still_serves_memory(self):
         media = self.out["memoryOnlyMedia"]
