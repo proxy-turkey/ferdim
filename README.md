@@ -83,6 +83,18 @@ sudo dnf copr enable proxy-turkey/ferdim
 sudo dnf install ferdim
 ```
 
+openSUSE Tumbleweed and Leap 16.0 (x86_64, aarch64) — from OBS:
+
+```bash
+sudo zypper addrepo https://download.opensuse.org/repositories/home:proxy-turkey/openSUSE_Tumbleweed/home:proxy-turkey.repo
+sudo zypper install ferdim
+```
+
+(Use `16.0` instead of `openSUSE_Tumbleweed` on Leap 16.0.)
+
+Arch Linux: `packaging/aur/PKGBUILD` builds with `makepkg -si`; the AUR
+package `ferdim` is updated from the same file on every release tag.
+
 Other distributions: install from a release tarball or from source (below).
 
 ### From source (any modern Linux, user-level)

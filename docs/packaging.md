@@ -87,6 +87,32 @@ git push origin v1.3.0
 resolves automatically (GitHub archives strip the leading `v`, which the
 spec handles by default since the directory is `ferdim-<version>`).
 
+## 4) openSUSE (OBS) and Arch Linux (AUR)
+
+**OBS** — <https://build.opensuse.org/package/show/home:proxy-turkey/ferdim>
+builds the same spec for Tumbleweed and Leap 16.0 (x86_64, aarch64); the
+`%if 0%{?suse_version}` blocks cover the differences (no
+`mozilla-filesystem`, `hicolor-icon-theme` and full `python3` — sqlite3 —
+at build time). Leap 15.x is not targeted: its Python 3.6 is too old.
+`.github/workflows/obs.yml` uploads the tag archive and spec on every `v*`
+tag (`OBS_USER` / `OBS_PASSWORD` secrets).
+
+**AUR** — `packaging/aur/PKGBUILD` is the source of truth. On every `v*`
+tag `.github/workflows/aur.yml` sets `pkgver`, refreshes `sha256sums` from
+the tag archive, builds in an Arch container (`check()` runs the full test
+suite), regenerates `.SRCINFO` and pushes to
+`ssh://aur@aur.archlinux.org/ferdim.git`. The push needs the
+`AUR_SSH_KEY` secret whose public half is registered on the AUR account
+(*My Account → SSH Public Key*); without the key the job still builds and
+only the push is skipped. Local check:
+
+```bash
+cd packaging/aur && makepkg -f && namcap PKGBUILD *.pkg.tar.zst
+```
+
+namcap reports `gi` / `glib2` as undeclared: they are the optional GTK
+front-end (`optdepends=python-gobject`), not a missing dependency.
+
 ## Extension signing
 
 The WebExtension must be signed for permanent installation in release
