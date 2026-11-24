@@ -162,6 +162,55 @@ class AltSvcTest(unittest.TestCase):
         self.assertTrue(h3.broken("https://ornek.test/b.bin"))
         self.assertFalse(h3.broken("https://baska.test/a.bin"))
 
+    def test_insecure_cache_is_separate(self):
+        url = "https://ornek.test/dosya.bin"
+        h3.remember_alt_svc(url, 'h3=":8443"; ma=60', insecure=True)
+        self.assertIsNone(h3.alt_svc_target(url),
+                          "guvenilmez isin kaydi guvenli ise sizmamali")
+        self.assertEqual(h3.alt_svc_target(url, insecure=True), ("", 8443))
+
+    def test_probe_remembers_only_the_final_origin(self):
+        origin = "https://ilk.test/dosya.bin"
+        final = "https://hedef.test/dosya.bin"
+        fake = _FakeResponse(total=10)
+        fake.url = final
+        fake.headers = _message(Alt_Svc='h3=":8443"; ma=60')
+        opt = httpcli.DlOptions(http3="off", timeout=3)
+        with mock.patch.object(httpcli, "_open_tcp", return_value=fake):
+            httpcli.probe(origin, opt)
+        self.assertIsNone(h3.alt_svc_target(origin),
+                          "yonlendirme hedefi kaynagin h3'unu belirleyemez")
+        self.assertEqual(h3.alt_svc_target(final), ("", 8443))
+
+    def test_probe_keeps_insecure_learning_separate(self):
+        url = "https://ornek.test/dosya.bin"
+        fake = _FakeResponse(total=10)
+        fake.url = url
+        fake.headers = _message(Alt_Svc='h3=":8443"; ma=60')
+        opt = httpcli.DlOptions(http3="off", insecure=True, timeout=3)
+        with mock.patch.object(httpcli, "_open_tcp", return_value=fake):
+            httpcli.probe(url, opt)
+        self.assertIsNone(h3.alt_svc_target(url))
+        self.assertEqual(h3.alt_svc_target(url, insecure=True), ("", 8443))
+
+    def test_cache_is_capped_and_keeps_recent(self):
+        for i in range(h3.MAX_CACHE):
+            self.assertTrue(h3.remember_alt_svc(
+                f"https://h{i}.test/x", 'h3=":443"; ma=600'))
+        self.assertEqual(len(h3._ALT_SVC), h3.MAX_CACHE)
+        self.assertEqual(h3.alt_svc_target("https://h0.test/x"), ("", 443))
+        h3.remember_alt_svc("https://yeni.test/x", 'h3=":443"; ma=600')
+        self.assertEqual(len(h3._ALT_SVC), h3.MAX_CACHE)
+        self.assertIsNotNone(h3.alt_svc_target("https://h0.test/x"),
+                             "az kullanilan kayit son kullanma ile korunmali")
+        self.assertIsNone(h3.alt_svc_target("https://h1.test/x"),
+                          "en eski kayit atilmali")
+
+    def test_broken_cache_is_capped(self):
+        for i in range(h3.MAX_CACHE + 20):
+            h3.mark_broken(f"https://h{i}.test/x")
+        self.assertLessEqual(len(h3._BROKEN), h3.MAX_CACHE)
+
 
 class ModeTest(unittest.TestCase):
     URL = "https://ornek.test/dosya.bin"
@@ -663,7 +712,8 @@ class EndToEndTest(unittest.TestCase):
         URL'in kendi portu (9) kapali: basari yalnizca duyurulan porta
         baglanildiginda mumkun."""
         url = "https://127.0.0.1:9/dosya.bin"
-        h3.remember_alt_svc(url, f'h3=":{self.server.port}"; ma=60')
+        h3.remember_alt_svc(url, f'h3=":{self.server.port}"; ma=60',
+                            insecure=True)
         opt = httpcli.DlOptions(http3="auto", insecure=True, timeout=10)
         p = httpcli.probe(url, opt)
         self.assertEqual(p.status, 206, p)
@@ -680,7 +730,8 @@ class EndToEndTest(unittest.TestCase):
         duyurulan 127.0.0.1:<port> hedefine baglanildiginda mumkun."""
         url = "https://localhost:9/dosya.bin"
         h3.remember_alt_svc(
-            url, f'h3="127.0.0.1:{self.server.port}"; ma=60')
+            url, f'h3="127.0.0.1:{self.server.port}"; ma=60',
+            insecure=True)
         opt = httpcli.DlOptions(http3="auto", insecure=True, timeout=10)
         p = httpcli.probe(url, opt)
         self.assertEqual(p.total, len(PAYLOAD))
@@ -913,7 +964,8 @@ class PoolTest(unittest.TestCase):
         with self.assertRaises(h3.H3Error):
             with httpcli.open_range(bad, self.opt(), 0, 9, timeout=10) as res:
                 res.read(10)
-        h3.remember_alt_svc(bad, f'h3=":{self.server.port}"; ma=60')
+        h3.remember_alt_svc(bad, f'h3=":{self.server.port}"; ma=60',
+                            insecure=True)
         fake = _FakeResponse(total=1234)
         with mock.patch.object(httpcli, "_open_tcp",
                                return_value=fake) as tcp:

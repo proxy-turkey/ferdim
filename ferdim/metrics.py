@@ -4,7 +4,8 @@ Sayaclar kuyruk tick'inde orneklenir: her is icin son gorulen bayt ve
 sayac degerleri tutulur, aradaki fark toplama eklenir. Boylece is
 kuyruktan silinse de toplam bayt/tekrar sayaci geri sarmaz (Prometheus
 sayaclari monotonik olmali). Kartesite sinirlidir: en cok MAX_HOSTS ana
-makine adiyla gorunur, geri kalan 'other' etiketi altinda toplanir.
+makine adiyla gorunur, geri kalan 'other' etiketi altinda toplanir;
+katlama ornekleme aninda yapilir, sozlukler zamanla buyumez.
 Ana makine anahtari profiles.host_key'dir: kimlik bilgisi ve yol yok.
 """
 from __future__ import annotations
@@ -94,6 +95,7 @@ class Collector:
                 self._done.pop(jid, None)
                 self._counters.pop(jid, None)
                 self._states.pop(jid, None)
+            self._bound()
             self._queue_jobs = states
             self._links = links
             self._speed = speed
@@ -119,6 +121,24 @@ class Collector:
     @staticmethod
     def _add(target: dict, host: str, n: int) -> None:
         target[host] = target.get(host, 0) + int(n)
+
+    def _bound(self) -> None:
+        """Kardesilik siniri ornekleme aninda uygulanir (kilit cagiranda).
+
+        Uc ana makine sozlugu birlikte MAX_HOSTS ile sinirlidir: en cok
+        baytli olanlar tutulur, kalanlar 'other' satirina katlanir. Boylece
+        sozlukler zamanla degil, kuyrugun o anki ana makine sayisiyla
+        buyur. Siralama bayt + ad ile belirlenimcidir."""
+        hosts = set(self._bytes) | set(self._retries) | set(self._throttles)
+        hosts.discard(OTHER)
+        if len(hosts) <= MAX_HOSTS:
+            return
+        ranked = sorted(hosts, key=lambda h: (-self._bytes.get(h, 0), h))
+        for host in ranked[MAX_HOSTS:]:
+            for target in (self._bytes, self._retries, self._throttles):
+                n = target.pop(host, 0)
+                if n:
+                    self._add(target, OTHER, n)
 
     def _sample_counters(self, jid: str, counters) -> None:
         """Is sayaclarindaki deltayi toplama ekler (kilit cagiranda)."""
@@ -149,28 +169,15 @@ class Collector:
             jobs_total = dict(self._jobs_total)
             queue_jobs = dict(self._queue_jobs)
             links, speed, coexist = self._links, self._speed, self._coexist
-        names = set(by_bytes) | set(retries) | set(throttles)
-        ranked = sorted(names, key=lambda h: (-by_bytes.get(h, 0),
-                                              -retries.get(h, 0), h))
-        kept = set(ranked[:MAX_HOSTS])
-        rest = ranked[MAX_HOSTS:]
-
-        def fold(values: dict):
-            # 'other' gercek bir ana makine adi da olabilir: toplama satiriyla
-            # cakismasin diye tek satirda birlestirilir (Prometheus'ta ayni
-            # etiket kumesi iki kez olamaz).
-            rows = [(h, int(values[h])) for h in ranked
-                    if h in kept and h in values and h != OTHER]
-            extra = sum(int(values.get(h, 0)) for h in rest)
-            if OTHER in kept:
-                extra += int(values.get(OTHER, 0))
-            if extra:
-                rows.append((OTHER, extra))
-            return rows
+        def rows(values: dict):
+            # Katlama ornekleme aninda yapildi (Collector._bound); burada
+            # yalniz belirlenimci sira: once bayt, sonra ad.
+            return sorted(((h, int(n)) for h, n in values.items()),
+                          key=lambda r: (-r[1], r[0]))
 
         out = ["# HELP ferdim_bytes_total Bytes downloaded, by host.",
                "# TYPE ferdim_bytes_total counter"]
-        for host, n in fold(by_bytes):
+        for host, n in rows(by_bytes):
             out.append(f'ferdim_bytes_total{{host="{_label(host)}"}} {_num(n)}')
         out += ["# HELP ferdim_jobs_total Jobs that reached a terminal state.",
                 "# TYPE ferdim_jobs_total counter"]
@@ -183,13 +190,13 @@ class Collector:
                 f"ferdim_active_links {_num(links)}",
                 "# HELP ferdim_retries_total Failed attempts retried, by host.",
                 "# TYPE ferdim_retries_total counter"]
-        for host, n in fold(retries):
+        for host, n in rows(retries):
             out.append(f'ferdim_retries_total{{host="{_label(host)}"}} '
                        f'{_num(n)}')
         out += ["# HELP ferdim_throttles_total HTTP 429/503 throttle "
                 "responses, by host.",
                 "# TYPE ferdim_throttles_total counter"]
-        for host, n in fold(throttles):
+        for host, n in rows(throttles):
             out.append(f'ferdim_throttles_total{{host="{_label(host)}"}} '
                        f'{_num(n)}')
         out += ["# HELP ferdim_speed_bytes Aggregate throughput in bytes "

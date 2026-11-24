@@ -296,10 +296,13 @@ def probe(url: str, opt: DlOptions) -> ProbeResult:
     res = _open_any(url, opt, headers, opt.timeout)
     try:
         out = _probe_from(res)
-        # Alt-Svc ogrenimi: "auto" modda sonraki istekler h3 deneyebilsin
-        for src in {url, out.final_url}:
-            if src:
-                h3.remember_alt_svc(src, res.headers.get("Alt-Svc"))
+        # Alt-Svc ogrenimi: yalniz yanitin SON adresi icin (yonlendirme
+        # hedefi baska bir kaynagin h3 ayarini belirleyemez) ve isin
+        # guvenilirlik sinifiyla ayni anahtara yazilir.
+        final = out.final_url or res.geturl() or url
+        if final:
+            h3.remember_alt_svc(final, res.headers.get("Alt-Svc"),
+                                bool(opt.insecure))
     finally:
         res.close()
     return out
@@ -349,7 +352,9 @@ def fetch_small(url: str, opt: DlOptions, timeout: float = 8.0,
             raise ValueError("html yanit")
         data = res.read(limit + 1)
         if res.headers.get("Alt-Svc"):
-            h3.remember_alt_svc(url, res.headers.get("Alt-Svc"))
+            final = res.geturl() or url
+            h3.remember_alt_svc(final, res.headers.get("Alt-Svc"),
+                                bool(opt.insecure))
     finally:
         res.close()
     if len(data) > limit:
