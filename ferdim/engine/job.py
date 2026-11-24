@@ -221,6 +221,9 @@ class JobSpec:
     proxy: str = ""
     insecure: bool = False
     http3: str = ""                  # "" -> cfg["http3"] (off|auto|force)
+    # Ozel pencere isi (eklenti 'ephemeral' ile isaretler): kuyruk ve
+    # gecmis diske cerez/baslik/parola yazmaz. Bellekteki is etkilenmez.
+    ephemeral: bool = False
     limit: int = 0  # is basina bayt/sn
     mirrors: list = field(default_factory=list)  # alternatif kaynak URL'leri
     sha256: str = ""   # bitiste dogrulanir

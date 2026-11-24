@@ -323,7 +323,8 @@ class NativeHostFilterTests(unittest.TestCase):
              "referer": "http://sayfa/", "cookies": "k=v", "ua": "UA",
              "segments": 4, "merkle": "/etc/passwd",
              "proxy": "socks5://127.0.0.1:9", "insecure": True,
-             "headers": ["X: y"], "checksum": "sha256:" + "0" * 64},
+             "headers": ["X: y"], "checksum": "sha256:" + "0" * 64,
+             "ephemeral": True},
             "bozuk-oge",                       # dict degil: atlanir
             {"url": "http://127.0.0.1:1/b.bin", "filename": "b.bin"},
         ]})
@@ -340,18 +341,22 @@ class NativeHostFilterTests(unittest.TestCase):
             self.assertLessEqual(set(it), allowed)
         for banned in ("merkle", "proxy", "insecure", "headers", "checksum"):
             self.assertNotIn(banned, items[0])
+        # ozel pencere isareti gecer; isaretsiz ogede alan yok (varsayilan False)
+        self.assertIs(items[0]["ephemeral"], True)
+        self.assertNotIn("ephemeral", items[1])
 
         # tek 'download' ayni kumeyi kullanir (parite)
         start = len(self.seen)
         self._send(p, {"cmd": "download", "url": "http://127.0.0.1:1/c.bin",
                        "filename": "c.bin", "merkle": "/etc/passwd",
                        "dir": "/tmp/baska", "proxy": "socks5://127.0.0.1:9",
-                       "insecure": True})
+                       "insecure": True, "ephemeral": True})
         self.assertTrue(self._recv(p)["ok"])
         add = next(m for m in self.seen[start:] if m.get("cmd") == "add")
         self.assertLessEqual(set(add) - {"cmd"}, allowed)
         self.assertNotIn("merkle", add)
         self.assertNotIn("dir", add)
+        self.assertIs(add["ephemeral"], True)
 
     def test_02_non_dict_frames_answer_with_error(self):
         p = self._host()

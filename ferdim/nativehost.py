@@ -27,12 +27,25 @@ DOWNLOAD_DEFAULTS = {
     "cookies": "",
     "ua": "",
     "segments": None,
+    # ozel pencere: cerez/baslik/parola diske yazilmaz (bkz. engine.queue)
+    "ephemeral": False,
 }
+
+# JSON'dan metin ya da 0/1 gelse de bool'a cevrilen alanlar
+_BOOL_KEYS = ("ephemeral",)
+
+
+def _pick(fields: dict) -> dict:
+    """Izinli alanlari bool alanlari zorlayarak dondurur."""
+    for k in _BOOL_KEYS:
+        if k in fields:
+            fields[k] = bool(fields[k])
+    return fields
 
 
 def download_params(msg: dict) -> dict:
     """Eklenti mesajindan yalnizca izinli indirme alanlarini al."""
-    return {k: msg.get(k, d) for k, d in DOWNLOAD_DEFAULTS.items()}
+    return _pick({k: msg.get(k, d) for k, d in DOWNLOAD_DEFAULTS.items()})
 
 
 def batch_items(msg: dict) -> list[dict]:
@@ -40,7 +53,7 @@ def batch_items(msg: dict) -> list[dict]:
     raw = msg.get("items")
     if not isinstance(raw, list):
         return []
-    return [{k: it[k] for k in DOWNLOAD_DEFAULTS if k in it}
+    return [_pick({k: it[k] for k in DOWNLOAD_DEFAULTS if k in it})
             for it in raw if isinstance(it, dict)]
 
 
