@@ -160,6 +160,32 @@ class LatencySignalTests(unittest.TestCase):
         sig.reset()
         self.assertEqual(sig.inflation(), 1.0)
 
+    def test_06_stale_host_is_pruned(self):
+        """Terk edilmis yavas kayit tavan sinyalini sonsuza dek tutmamali."""
+        ft = FakeTime()
+        sig = LatencySignal(now=ft.monotonic)
+        for _ in range(3):
+            sig.add("yavas.test", 0.02)
+        for _ in range(3):
+            sig.add("yavas.test", 0.40)
+        self.assertGreater(sig.inflation(), 1.0)
+        ft.t += sig.STALE + 1.0
+        self.assertEqual(sig.inflation(), 1.0, "bayat kayit dusurulmedi")
+        self.assertNotIn("yavas.test", sig._hosts)
+
+    def test_07_drop_removes_a_dead_host(self):
+        sig = LatencySignal()
+        for _ in range(4):
+            sig.add("yavas.test", 0.02)
+            sig.add("hizli.test", 0.02)
+        for _ in range(4):
+            sig.add("yavas.test", 0.40)
+        self.assertGreater(sig.inflation(), 1.0)
+        sig.drop("yavas.test")
+        self.assertEqual(sig.inflation(), 1.0)
+        sig.drop(None)                       # gecersiz anahtar sessiz
+        sig.drop("yok.test")
+
 
 class LatencyMonitorTests(unittest.TestCase):
     """Hat sakin olsa da (yabanci trafik yok) gecikme basinci tetikler."""
@@ -646,6 +672,24 @@ class JobLatencyTests(unittest.TestCase):
         self.assertGreaterEqual(stats["n"], 2, "probe + aralik istegi")
         self.assertGreater(stats["base"], 0.0)
         self.assertGreaterEqual(job.latency_inflation(), 1.0)
+
+    def test_dead_source_drops_its_latency_entry(self):
+        """Olumlu kaynak gecikme sinyalinden hemen dusurulur (kalici tavan
+        sinyali birakmaz)."""
+        env = AppEnv(root=tmp_root(self, "ferdim-lat-dead-"))
+        job = DownloadJob(env, env.load_config(), JobSpec(
+            url="http://yavas.test/f.bin", segments=2))
+        host = host_key("http://yavas.test/f.bin")
+        for _ in range(3):
+            job._lat.add(host, 0.02)
+        for _ in range(3):
+            job._lat.add(host, 0.40)
+        self.assertGreater(job.latency_inflation(), 1.0)
+        src = next(s for s in job._srcs if host_key(s.url) == host)
+        with job._lock:
+            job._mark_dead_locked(src)
+        self.assertEqual(job.latency_inflation(), 1.0,
+                         "olu kaynak gecikme sinyalinde kaldi")
 
 
 class SurfaceTests(unittest.TestCase):

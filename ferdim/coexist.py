@@ -78,23 +78,40 @@ class LatencySignal:
     Taban "EMA-min"dir: gozlenen en iyi TTFB, her ornekte binde 2 sisme
     payi ile (tek bir asiri hizli ornek tabani kilitleyip kalici yanlis
     alarm uretmesin). Oran 1.0 = normal; 2.0 = yanitlar iki kat yavas.
-    Isin tum kosusu boyunca birikir; ornek yoksa 1.0 (bilinmiyor = basinc
-    yok).
+    Ornek yoksa 1.0 (bilinmiyorsa basinc yok).
+
+    Ana makine kayitlari ZAMAN DAMGALIDIR: kaynagi olmayan (olumlu ayna,
+    terk edilmis baglanti) bir kayit `STALE` sn sonra dusurulur; yoksa tek
+    bir yavas ayna `inflation()` degerini sonsuza kadar yuksek tutup
+    baglanti sayisini kalici olarak yarilayabiliyordu. Kaynak olunce
+    `drop()` ile de hemen silinir.
     """
 
     ALPHA = 0.3            # guncel EMA agirligi (yeni ornegin payi)
     DECAY = 1.002          # tabanin ornek basina yumusak sismesi
     WARM = 3               # taban/guncel icin en az ornek
     LIMIT = 3600.0         # bundan uzun olcum (saat sicramasi) sayilmaz
+    STALE = 20.0           # sn: bu kadar ornek gelmeyen ana makine unutulur
 
-    def __init__(self):
+    def __init__(self, now=None):
         self._lock = threading.Lock()
+        self._now = now or time.monotonic
         self._hosts: dict[str, dict] = {}
 
     def reset(self) -> None:
         """Taban sifirlanir (kaynak degisti / is yeniden basladi)."""
         with self._lock:
             self._hosts.clear()
+
+    def drop(self, host: str) -> None:
+        """Ana makine kaydi hemen silinir (kaynagi oldu/terk edildi)."""
+        with self._lock:
+            self._hosts.pop(host or "", None)
+
+    def _prune_locked(self, now: float) -> None:
+        for key in [k for k, st in self._hosts.items()
+                    if now - float(st.get("t", 0.0)) > self.STALE]:
+            del self._hosts[key]
 
     def add(self, host: str, ttfb: float) -> None:
         """Bir yanit suresi ornegi ekler (gecersiz deger yok sayilir)."""
@@ -105,19 +122,25 @@ class LatencySignal:
         if not 0.0 < ttfb < self.LIMIT:
             return
         key = host or ""
+        now = self._now()
         with self._lock:
+            self._prune_locked(now)
             st = self._hosts.get(key)
             if st is None:
-                self._hosts[key] = {"n": 1, "base": ttfb, "ema": ttfb}
+                self._hosts[key] = {"n": 1, "base": ttfb, "ema": ttfb,
+                                    "t": now}
                 return
             st["n"] += 1
             st["ema"] += self.ALPHA * (ttfb - st["ema"])
             st["base"] = ttfb if ttfb < st["base"] \
                 else min(ttfb, st["base"] * self.DECAY)
+            st["t"] = now
 
     def inflation(self) -> float:
         """En kotu ana makinenin guncel/taban orani; bilinmiyorsa 1.0."""
+        now = self._now()
         with self._lock:
+            self._prune_locked(now)
             worst = 1.0
             for st in self._hosts.values():
                 if st["n"] < self.WARM or st["base"] <= 0:

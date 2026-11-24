@@ -7,6 +7,7 @@ kaynak istek sayisi tests.helpers sayaciyla dogrulanir.
 from __future__ import annotations
 
 import hashlib
+import os
 import socket
 import sys
 import threading
@@ -16,11 +17,14 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ferdim import cdc, peer
+from ferdim.engine import httpcli
+from ferdim.engine import job as jobmod
 from ferdim.engine.job import DownloadJob, JobSpec, JobState
 from ferdim.paths import AppEnv
 from tests.helpers import DATA, REQUEST_COUNTS, start_server, tmp_root
@@ -247,6 +251,237 @@ def start_bad_peer(ln):
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, srv.server_address[1]
+
+
+class SlowPeer(BaseHTTPRequestHandler):
+    """Gecerli parcalari gecikmeyle sunan sayacli esbaz (zamanlama testi)."""
+
+    protocol_version = "HTTP/1.1"
+    chunks: dict = {}
+    delay = 0.0
+    hits = 0
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        path = urlsplit(self.path).path
+        hx = path[len("/chunk/"):] if path.startswith("/chunk/") else ""
+        type(self).hits += 1
+        if type(self).delay:
+            time.sleep(type(self).delay)
+        data = type(self).chunks.get(hx)
+        if data is None:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+
+
+def start_slow_peer(data, man, delay=0.0):
+    SlowPeer.chunks = {hx: data[off:off + ln] for off, ln, hx in man.chunks}
+    SlowPeer.delay = delay
+    SlowPeer.hits = 0
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), SlowPeer)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_address[1]
+
+
+class PrefillGuardTests(unittest.TestCase):
+    """Esbaz onbellegi yalniz acik bildirimle, kosu kimligiyle ve kisa
+    butceyle calisir; pause/restart hazirligi bozmaz."""
+
+    def _env_job(self, root, cfg_mut=None):
+        env = AppEnv(root=root / "env")
+        cfg = env.load_config()
+        cfg["peer_cache"] = True
+        cfg["checksum_sidecar"] = False
+        if cfg_mut:
+            cfg_mut(cfg)
+        return env, cfg
+
+    def _open_part(self, job):
+        job.target_dir.mkdir(parents=True, exist_ok=True)
+        job._fd = os.open(job.part_path, os.O_RDWR | os.O_CREAT, 0o644)
+        os.ftruncate(job._fd, job.total)
+        self.addCleanup(lambda: job._close_fd())
+
+    def test_auto_manifest_never_uses_peers(self):
+        root = tmp_root(self, "ferdim-peer-auto-")
+        _, man, _ = prepare_source(root, SMALL_DATA)
+        env, cfg = self._env_job(root)
+        bad_srv, bad_port = start_bad_peer(man.chunks[0][1])
+        self.addCleanup(bad_srv.server_close)
+        self.addCleanup(bad_srv.shutdown)
+        node = peer.open_peer(env)
+        node.discovery.enabled = False
+        node.set_peers([("127.0.0.1", bad_port)])
+        job = DownloadJob(env, cfg, JobSpec(url="http://ornek.test/f.bin"))
+        job.kind = "http"
+        job.total = man.size
+        job._merkle = man
+        job._merkle_auto = True       # kendiliginden bulunan yan dosya
+        job._pending = [(0, man.size - 1)]
+        self._open_part(job)
+        job._peer_prefill(job.spec.options(cfg))
+        self.assertEqual(BadPeer.hits, 0, "auto bildirim esbazi kullanilmamali")
+        self.assertEqual(job._pending, [(0, man.size - 1)])
+        self.assertEqual(job.done, 0)
+        self.assertNotIn("peer_chunks", job.extra)
+
+    def test_explicit_prefill_rebases_speed_mark(self):
+        root = tmp_root(self, "ferdim-peer-mark-")
+        _, man, man_path = prepare_source(root, SMALL_DATA)
+        srv, port = start_slow_peer(SMALL_DATA, man)
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        env, cfg = self._env_job(root)
+        node = peer.open_peer(env)
+        node.discovery.enabled = False
+        node.set_peers([("127.0.0.1", port)])
+        job = DownloadJob(env, cfg, JobSpec(url="http://ornek.test/f.bin",
+                                           merkle=str(man_path)))
+        job.kind = "http"
+        job.total = man.size
+        job._merkle = man
+        job._merkle_auto = False
+        job._pending = [(0, man.size - 1)]
+        job._speed_done_mark = 0
+        self._open_part(job)
+        job._peer_prefill(job.spec.options(cfg))
+        self.assertEqual(job.done, man.size)
+        self.assertEqual(job._pending, [])
+        self.assertEqual(job._speed_done_mark, job.done,
+                         "esbaz baytlari hiz ornegine sicramamali")
+        self.assertEqual(job.extra.get("peer_chunks"), len(man.chunks))
+
+    def test_old_run_result_is_dropped(self):
+        """Eski hazirlik, yeni kosu baslarken `_pending`/`done` yazamaz."""
+        root = tmp_root(self, "ferdim-peer-run-")
+        _, man, man_path = prepare_source(root, SMALL_DATA)
+        env, cfg = self._env_job(root)
+        job = DownloadJob(env, cfg, JobSpec(url="http://ornek.test/f.bin",
+                                           merkle=str(man_path)))
+        job.kind = "http"
+        job.total = man.size
+        job._merkle = man
+        job._merkle_auto = False
+        job._pending = [(0, man.size - 1)]
+        self._open_part(job)
+
+        class FakeNode:
+            def fetch_chunks(self, man, pending, fd, stop=None, budget=None,
+                             write=None):
+                off, ln, _ = man.chunks[0]
+                wrote = write(off, b"x" * ln)     # hala eski kosu
+                self.job._run += 1                # bu arada yeni kosu basladi
+                return [(off, ln)] if wrote else []
+
+        fake = FakeNode()
+        fake.job = job
+        with mock.patch("ferdim.peer.open_peer", return_value=fake):
+            job._peer_prefill(job.spec.options(cfg))
+        self.assertEqual(job._pending, [(0, man.size - 1)],
+                         "eski kosunun araliklari uygulanmamali")
+        self.assertEqual(job.done, 0)
+        self.assertNotIn("peer_chunks", job.extra)
+
+    def test_prefill_budget_is_below_pause_wait(self):
+        self.assertLessEqual(jobmod.PEER_PREFILL_BUDGET, 4.0)
+        self.assertLess(jobmod.PEER_PREFILL_BUDGET, 8.0)
+
+
+class PrefillLifecycleTests(unittest.TestCase):
+    """Hazirlik icindeki pause/restart: is duraklamis kalir ve devam eder."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.origin, cls.base = start_server()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.origin.shutdown()
+
+    def _started_job(self, root, man_path, port):
+        env = AppEnv(root=root / "env")
+        cfg = env.load_config()
+        cfg["peer_cache"] = True
+        cfg["checksum_sidecar"] = False
+        cfg["max_concurrent"] = 4
+        node = peer.open_peer(env)
+        node.discovery.enabled = False
+        node.set_peers([("127.0.0.1", port)])
+        job = DownloadJob(env, cfg, JobSpec(
+            url=f"{self.base}/file.bin", segments=2, merkle=str(man_path)))
+        starter = threading.Thread(target=job.start, daemon=True)
+        starter.start()
+        self.assertTrue(self._wait(lambda: SlowPeer.hits > 0, 20),
+                        "esbaz taramasi baslamadi")
+        return job, starter
+
+    @staticmethod
+    def _wait(pred, timeout=20.0):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if pred():
+                return True
+            time.sleep(0.02)
+        return bool(pred())
+
+    def test_pause_during_prefill_folds_and_resume_completes(self):
+        root = tmp_root(self, "ferdim-peer-pause-")
+        _, man, man_path = prepare_source(root)
+        srv, port = start_slow_peer(DATA, man, delay=0.25)
+        try:
+            job, starter = self._started_job(root, man_path, port)
+            t0 = time.monotonic()
+            job.pause()
+            self.assertLess(time.monotonic() - t0, 8.0,
+                            "prefill pause penceresini asti")
+            self.assertEqual(job.state, JobState.PAUSED,
+                             f"pause dondu ama is {job.state}")
+            starter.join(10)
+            job.resume()
+            self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR),
+                                       60), f"{job.state} {job.error}")
+            self.assertEqual(job.state, JobState.DONE, job.error)
+            self.assertEqual(sha(job.final_path.read_bytes()), sha(DATA))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_restart_during_prefill_ends_with_correct_file(self):
+        root = tmp_root(self, "ferdim-peer-restart-")
+        _, man, man_path = prepare_source(root)
+        srv, port = start_slow_peer(DATA, man, delay=0.25)
+        try:
+            job, starter = self._started_job(root, man_path, port)
+            job.cancel(delete_files=False)
+            starter.join(10)
+            self.assertFalse(starter.is_alive(), "eski kosu bitmedi")
+            # kuyruk 'restart' yolu: yarim dosya silinir, is sifirlanir
+            job.part_path.unlink(missing_ok=True)
+            job.state = JobState.QUEUED
+            job.error = ""
+            job.total, job.done = -1, 0
+            job.start()
+            self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR),
+                                       60), f"{job.state} {job.error}")
+            self.assertEqual(job.state, JobState.DONE, job.error)
+            self.assertEqual(sha(job.final_path.read_bytes()), sha(DATA),
+                             "restart sonrasi dosya bozuk (eski kosu sizdi)")
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 class EndToEndTests(unittest.TestCase):
