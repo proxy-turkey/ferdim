@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import unittest
 import warnings
 from pathlib import Path
@@ -36,7 +37,7 @@ try:                                    # yalnizca testin kendisi import eder
 except Exception:                       # pragma: no cover - ortamda yok
     HAVE_AIOQUIC = False
 
-PAYLOAD = bytes(range(256)) * 16        # 4096 bayt
+PAYLOAD = bytes(range(256)) * 16384     # 4 MiB (yavas okur regresyonu)
 
 
 class _Clock:
@@ -93,45 +94,54 @@ class AltSvcTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_parse_port_and_max_age(self):
-        self.assertEqual(h3.parse_alt_svc('h3=":443"; ma=60'), (443, 60.0))
+        self.assertEqual(h3.parse_alt_svc('h3=":443"; ma=60'),
+                         ("", 443, 60.0))
         self.assertEqual(h3.parse_alt_svc('h3=":8443"'),
-                         (8443, h3.ALT_SVC_DEFAULT_MAX_AGE))
+                         ("", 8443, h3.ALT_SVC_DEFAULT_MAX_AGE))
 
     def test_parse_picks_longest_and_ignores_other_protocols(self):
         value = 'h2=":443"; ma=10, h3=":443"; ma=30, h3=":443"; ma=90'
-        self.assertEqual(h3.parse_alt_svc(value), (443, 90.0))
+        self.assertEqual(h3.parse_alt_svc(value), ("", 443, 90.0))
         self.assertIsNone(h3.parse_alt_svc('h2=":443"; ma=60'))
         self.assertIsNone(h3.parse_alt_svc(""))
         self.assertIsNone(h3.parse_alt_svc(None))
 
-    def test_parse_rejects_other_host_and_garbage(self):
-        self.assertIsNone(h3.parse_alt_svc('h3="baska.test:443"; ma=9',
-                                           "ornek.test"))
-        self.assertEqual(h3.parse_alt_svc('h3="ornek.test:443"; ma=9',
-                                          "ornek.test"), (443, 9.0))
+    def test_parse_alt_authority_and_garbage(self):
+        # duyurulan ana makine baglanti hedefidir (yetki/SNI kaynagin)
+        self.assertEqual(h3.parse_alt_svc('h3="baska.test:8443"; ma=9'),
+                         ("baska.test", 8443, 9.0))
+        self.assertEqual(h3.parse_alt_svc('h3="[::1]:9000"; ma=9'),
+                         ("::1", 9000, 9.0))
         self.assertIsNone(h3.parse_alt_svc('h3=":port"; ma=9'))
-        self.assertIsNone(h3.parse_alt_svc("h3"))     # '=' yok
+        self.assertIsNone(h3.parse_alt_svc("h3"))      # '=' yok
         self.assertIsNone(h3.parse_alt_svc('h3="443"'))  # iki nokta yok
 
     def test_cache_hit_and_expiry(self):
         url = "https://ornek.test/dosya.bin"
         self.assertTrue(h3.remember_alt_svc(url, 'h3=":8443"; ma=60'))
-        self.assertEqual(h3.alt_svc_port(url), 8443)
+        self.assertEqual(h3.alt_svc_target(url), ("", 8443))
         self.clock.t += 59
-        self.assertEqual(h3.alt_svc_port(url), 8443)
+        self.assertEqual(h3.alt_svc_target(url), ("", 8443))
         self.clock.t += 2
-        self.assertIsNone(h3.alt_svc_port(url), "suresi dolan kayit silinmeli")
+        self.assertIsNone(h3.alt_svc_target(url),
+                          "suresi dolan kayit silinmeli")
+
+    def test_cache_keeps_advertised_host(self):
+        url = "https://ornek.test/dosya.bin"
+        self.assertTrue(h3.remember_alt_svc(
+            url, 'h3="cdn.ornek.test:9000"; ma=60'))
+        self.assertEqual(h3.alt_svc_target(url), ("cdn.ornek.test", 9000))
 
     def test_ma_zero_clears(self):
         url = "https://ornek.test/dosya.bin"
         h3.remember_alt_svc(url, 'h3=":443"; ma=60')
         self.assertFalse(h3.remember_alt_svc(url, 'h3=":443"; ma=0'))
-        self.assertIsNone(h3.alt_svc_port(url))
+        self.assertIsNone(h3.alt_svc_target(url))
 
     def test_non_h3_header_not_cached(self):
         url = "https://ornek.test/dosya.bin"
         self.assertFalse(h3.remember_alt_svc(url, 'h2=":443"; ma=60'))
-        self.assertIsNone(h3.alt_svc_port(url))
+        self.assertIsNone(h3.alt_svc_target(url))
 
     def test_broken_backoff_expires(self):
         url = "https://ornek.test/dosya.bin"
@@ -320,6 +330,42 @@ class FallbackTest(unittest.TestCase):
         self.assertTrue(h3.broken(self.URL))
 
 
+class AvailabilityTest(unittest.TestCase):
+    def setUp(self):
+        self._old = h3._AVAILABLE
+        self.addCleanup(setattr, h3, "_AVAILABLE", self._old)
+
+    def test_missing_aioquic_is_cached(self):
+        """aioquic yoksa import her cagrida yeniden denenmemeli."""
+        h3._AVAILABLE = None
+        calls = []
+
+        def boom():
+            calls.append(1)
+            raise ImportError("aioquic yok")
+
+        with mock.patch.object(h3, "_load", boom):
+            self.assertFalse(h3.available())
+            self.assertFalse(h3.available())
+        self.assertEqual(len(calls), 1, "negatif sonuc onbelleklenmeli")
+
+
+class SessionTest(unittest.TestCase):
+    URL = "https://ornek.test/dosya.bin"
+
+    def test_connect_timeout_is_bounded(self):
+        """El sikismasi, stall suresinden bagimsiz ve kisa olmali."""
+        opt = httpcli.DlOptions(http3="auto")
+        self.assertEqual(h3._Session(self.URL, opt, {}, 30)._connect_timeout,
+                         h3.CONNECT_SECS)
+        self.assertEqual(h3._Session(self.URL, opt, {}, 2)._connect_timeout, 2)
+
+    def test_target_defaults_to_origin(self):
+        session = h3._Session(self.URL, httpcli.DlOptions(http3="auto"),
+                              {}, 5)
+        self.assertIsNone(session._target)
+
+
 class ConfigTest(unittest.TestCase):
     def test_default_off(self):
         self.assertEqual(paths.DEFAULTS["http3"], "off")
@@ -496,6 +542,62 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(b"".join(chunks), PAYLOAD[100:1124])
         self.assertFalse(h3.broken(self.url),
                          "basarili h3 kaynagi bozulmamali")
+
+    def test_auto_uses_advertised_port(self):
+        """Alt-Svc `h3=\":port\"` ile duyurulan port gercekten kullanilmali.
+
+        URL'in kendi portu (9) kapali: basari yalnizca duyurulan porta
+        baglanildiginda mumkun."""
+        url = "https://127.0.0.1:9/dosya.bin"
+        h3.remember_alt_svc(url, f'h3=":{self.server.port}"; ma=60')
+        opt = httpcli.DlOptions(http3="auto", insecure=True, timeout=10)
+        p = httpcli.probe(url, opt)
+        self.assertEqual(p.status, 206, p)
+        self.assertEqual(p.total, len(PAYLOAD))
+        with httpcli.open_range(url, opt, 0, 99, timeout=10) as res:
+            self.assertEqual(res.headers.get("Content-Range"),
+                             f"bytes 0-99/{len(PAYLOAD)}")
+            self.assertEqual(res.read(100), PAYLOAD[:100])
+
+    def test_auto_uses_advertised_host(self):
+        """Duyurulan ana makine de baglanti hedefi olmali.
+
+        URL'in ana makinesi (localhost:9) kapali: basari yalnizca
+        duyurulan 127.0.0.1:<port> hedefine baglanildiginda mumkun."""
+        url = "https://localhost:9/dosya.bin"
+        h3.remember_alt_svc(
+            url, f'h3="127.0.0.1:{self.server.port}"; ma=60')
+        opt = httpcli.DlOptions(http3="auto", insecure=True, timeout=10)
+        p = httpcli.probe(url, opt)
+        self.assertEqual(p.total, len(PAYLOAD))
+
+    def test_tail_survives_stream_end(self):
+        """Akis bittikten sonra okur gec kalirsa kuyruk kaybolmamali.
+
+        Kucuk aralik kuyruga sigar: sunucu tarafi hemen biter, olay
+        dongusu kapanir. Eski surum donguyu bu noktada kapatip kuyruktaki
+        kuyrugu H3Error olarak kaybediyordu (okur 0,3 sn bekliyor)."""
+        opt = httpcli.DlOptions(http3="force", insecure=True, timeout=10)
+        with httpcli.open_range(self.url, opt, 0, 2047, timeout=10) as res:
+            time.sleep(0.3)              # dongu kapanmadan okumaya baslama
+            self.assertEqual(res.read(4096), PAYLOAD[:2048])
+
+    def test_slow_reader_gets_whole_body(self):
+        """Akis bittikten sonra kuyrukta kalan parcalar kaybolmamali.
+
+        Yavas okur + 4 MiB tek aralik: dongu erken kapanirsa kuyruk
+        (DATA_QUEUE) tasmasi sahte stall/H3Error uretiyordu."""
+        opt = httpcli.DlOptions(http3="force", insecure=True, timeout=10)
+        end = len(PAYLOAD) - 1
+        got = bytearray()
+        with httpcli.open_range(self.url, opt, 0, end, timeout=10) as res:
+            while True:
+                chunk = res.read(65536)
+                if not chunk:
+                    break
+                got += chunk
+                time.sleep(0.002)          # kuyrugu doldur, sonra bosalt
+        self.assertEqual(bytes(got), PAYLOAD)
 
     def test_force_without_aioquic_errors(self):
         opt = httpcli.DlOptions(http3="force", insecure=True, timeout=10)
