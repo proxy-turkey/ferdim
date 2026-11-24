@@ -53,6 +53,25 @@ jobs:
           test "$ver" = "$(python3 -c 'import ferdim;print(ferdim.__version__)')"
           echo "VERSION=$ver" >> "$GITHUB_ENV"
 
+      - name: Pin the manifest to this tag's archive
+        run: |
+          # Flathub manifesti etiket arsivini sha256 ile sabitler; arsiv
+          # etiketten once yoktur, bu yuzden CI kendi etiketine yeniden baglar
+          set -euo pipefail
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
+          for i in 1 2 3 4 5; do curl -fsSL -o tag.tar.gz "$url" && break; sleep 10; done
+          sum="$(sha256sum tag.tar.gz | cut -d' ' -f1)"
+          python3 - "$MANIFEST" "$url" "$sum" <<'PY'
+          import re, sys
+          path, url, sha = sys.argv[1:]
+          t = open(path).read()
+          t, n1 = re.subn(r"(url: )https://github\.com/\S+/archive/refs/tags/\S+\.tar\.gz", r"\g<1>" + url, t, count=1)
+          t, n2 = re.subn(r"(sha256: )[0-9a-f]{64}", r"\g<1>" + sha, t, count=1)
+          assert n1 == n2 == 1, (n1, n2)
+          open(path, "w").write(t)
+          PY
+          grep -nE "url: |sha256: " "$MANIFEST"
+
       - name: Metadata and linter
         run: |
           set -euo pipefail
