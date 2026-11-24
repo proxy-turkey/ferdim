@@ -27,10 +27,6 @@ finish-args:
   # ferdim-dbus can export org.ferdim.Daemon1 for host consumers
   # (GNOME Shell extension) while the GUI runs in the sandbox.
   - --own-name=org.ferdim.Daemon
-  # TEMPORARY: ferdim/gui/app.py registers Gtk.Application under
-  # "app.ferdim.gui"; the sandbox bus only lets the app own its Flatpak app
-  # id. Drop this line once the GApplication id equals the app id.
-  - --own-name=app.ferdim.gui
 
 modules:
   - name: ferdim

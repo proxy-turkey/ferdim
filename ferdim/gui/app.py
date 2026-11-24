@@ -605,7 +605,7 @@ class SettingsWindow(Gtk.Window):
 
 class FerdimApp(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id="app.ferdim.gui")
+        super().__init__(application_id="io.github.proxy_turkey.FerDim")
         self.rows: dict[str, JobRow] = {}
         self.client: FerdimClient | None = None
         self.env = AppEnv()

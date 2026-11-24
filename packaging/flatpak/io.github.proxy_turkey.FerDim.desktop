@@ -9,7 +9,4 @@ Terminal=false
 Categories=Network;FileTransfer;GTK;
 Keywords=download;manager;segmented;firefox;http;ftp;
 StartupNotify=true
-# ferdim/gui/app.py currently registers Gtk.Application(application_id=
-# "app.ferdim.gui"); this keeps window grouping correct until that id is
-# aligned with the Flatpak app id.
-StartupWMClass=app.ferdim.gui
+StartupWMClass=io.github.proxy_turkey.FerDim

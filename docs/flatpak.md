@@ -54,7 +54,6 @@ finish-args:
   - --filesystem=xdg-download       # only the downloads folder
   - --talk-name=org.freedesktop.Notifications
   - --own-name=org.ferdim.Daemon    # ferdim-dbus bridge
-  - --own-name=app.ferdim.gui       # TEMPORARY, see code changes below
 ```
 
 There is no home-directory permission: the queue, settings, token and the
@@ -242,14 +241,12 @@ Notes:
 
 These are reported for `ferdim/` and were not edited here:
 
-1. **GApplication id.** `ferdim/gui/app.py` uses
-   `application_id="app.ferdim.gui"`. The Flatpak session bus only lets
-   the app own its Flatpak id, so the GUI exits with
-   `Failed to register: … ServiceUnknown` unless the manifest grants
-   `--own-name=app.ferdim.gui` (the temporary workaround above). Align
-   the id with `io.github.proxy_turkey.FerDim`, update
-   `StartupWMClass` in the desktop file, and drop the extra
-   `--own-name` from both manifests.
+1. **GApplication id — DONE.** `ferdim/gui/app.py` now registers
+   `Gtk.Application` as `io.github.proxy_turkey.FerDim`, same as the
+   Flatpak app id, so the sandbox session bus lets the app own its name:
+   the temporary extra `--own-name` workaround is gone from both
+   manifests and `StartupWMClass` in the desktop files matches the new
+   id. No further action; a rebuild of the bundle picks it up.
 2. **D-Bus activation.** `data/org.ferdim.Daemon.service` points at an
    absolute `/app/bin/ferdim-dbus` only after install; the session bus on
    the host cannot activate a service file from inside the sandbox.

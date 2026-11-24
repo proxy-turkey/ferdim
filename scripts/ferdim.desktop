@@ -9,3 +9,4 @@ Terminal=false
 Categories=Network;FileTransfer;GNOME;GTK;
 Keywords=download;manager;accelerator;indirme;ferdim;
 StartupNotify=true
+StartupWMClass=io.github.proxy_turkey.FerDim

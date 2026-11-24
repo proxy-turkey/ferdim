@@ -23,8 +23,6 @@ finish-args:
   - --filesystem=xdg-download
   - --talk-name=org.freedesktop.Notifications
   - --own-name=org.ferdim.Daemon
-  # TEMPORARY: see the Flathub manifest; drop with the GApplication id fix.
-  - --own-name=app.ferdim.gui
 
 modules:
   - name: ferdim
