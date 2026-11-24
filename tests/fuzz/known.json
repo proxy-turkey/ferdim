@@ -30,11 +30,6 @@
       "note": "SegmentTimeline S@t degeri re.sub'un yer tutucusu olarak kullaniliyor; t='\\1' gecersiz grup referansi uretiyor. re.sub yerine literal replace (ya da re.escape) gerekli.",
       "first_iter": 680,
       "sample_hex": "3c3f6c203f3e0a3c4d504420653d22223e3c506572696f642064753d225053223e0a3c41646170746174696f6e536574206d693d22767034223e3c526570726573656e746174696f6e2069683d22223e0a20203c5365676d656e7454656d706c617465206d653d227334732220696e3d226934223e20203c5365676d656e7454696d656c696e653e0a2020203c5320743d225c312220643d2230222f3e0a203c2f5365676d656e7454696d656c696e653e3c2f5365676d656e7454656d706c6174653e0a3c2f526570726573656e746174696f6e3e3c2f41646170746174696f6e5365743e3c2f506572696f643e3c2f4d50443e0a"
-    },
-    {
-      "id": "merkle:RecursionError",
-      "note": "Manifest.parse json.loads derinligini sinirlamiyor: derin ic ice JSON RecursionError siziyor (3.11-3.13; 3.14'te ~60000 seviye gerekir). json.loads'i (ValueError, RecursionError) ile sarmalayip ValueError uretmeli. Ornek: chunks degeri 4000x '[' + ']'.",
-      "first_iter": 40888
     }
   ]
 }

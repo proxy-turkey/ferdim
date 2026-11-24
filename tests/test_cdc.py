@@ -143,6 +143,23 @@ class ChunkerTests(unittest.TestCase):
         p.write_bytes(self.buf + b"x")
         self.assertEqual(cdc.verify_file(p, man), (False, []))
 
+    def test_07_deeply_nested_json_is_a_value_error(self):
+        """Fuzz bulgusu: derin ic ice JSON'da json.loads RecursionError
+        sizdiriyordu; Manifest.parse sozlesmesi tek tur (ValueError)."""
+        deep = "[" * 5000 + "]" * 5000
+        text = ('{"v":1,"algo":"fastcdc-sha256","size":0,"root":'
+                + deep + "}")
+        with self.assertRaises(ValueError):
+            cdc.Manifest.parse(text)
+
+    def test_08_recursion_error_from_json_is_converted(self):
+        """Surumden bagimsiz: json.loads RecursionError atarsa parse yine
+        ValueError verir (3.11-3.13'te 5000 seviye yetiyor, 3.14'te degil)."""
+        with mock.patch.object(cdc.json, "loads",
+                               side_effect=RecursionError("derin")):
+            with self.assertRaises(ValueError):
+                cdc.Manifest.parse("{}")
+
 
 def reference_chunk_ranges(buf, min_size=cdc.MIN_CHUNK,
                            avg_size=cdc.AVG_CHUNK, max_size=cdc.MAX_CHUNK):
@@ -652,7 +669,6 @@ class GuardTests(unittest.TestCase):
             srv.shutdown()
 
     # --------------------------------------------------------------- sinirlar
-    def test_08_manifest_rejects_oversized_and_tiny_chunks(self):
         size = cdc.MIN_CHUNK * 4
 
         def doc(chunks):

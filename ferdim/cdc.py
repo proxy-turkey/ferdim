@@ -288,7 +288,9 @@ class Manifest:
         uydurma bir bildirimle indirilen dosyayi 'dogrulanmis' saymayiz."""
         try:
             data = json.loads(text)
-        except ValueError as e:
+        except (ValueError, RecursionError) as e:
+            # derin ic ice JSON'da json.loads RecursionError sizdirir:
+            # sozlesme tek tur (ValueError) kalsin
             raise ValueError(f"gecersiz JSON: {e}") from None
         if not isinstance(data, dict):
             raise ValueError("bildirim sozluk degil")
