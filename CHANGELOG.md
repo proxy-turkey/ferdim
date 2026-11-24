@@ -4,6 +4,13 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [1.7.2] — 2026-11-24
+
+### Fixed
+- A history test read the database before the state listener had written
+  the row; on slow builders (openSUSE Leap 16.0 aarch64) the package build
+  failed, so that platform did not get the 1.7.1 security fixes.
+
 ## [1.7.1] — 2026-11-24
 
 ### Security

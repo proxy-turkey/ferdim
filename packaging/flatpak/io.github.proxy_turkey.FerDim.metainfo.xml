@@ -46,6 +46,11 @@
   </screenshots>
 
   <releases>
+    <release version="1.7.2" date="2026-11-24">
+      <description>
+        <p>Build fix for slow builders; no functional changes.</p>
+      </description>
+    </release>
     <release version="1.7.1" date="2026-11-24">
       <description>
         <p>

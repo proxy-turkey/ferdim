@@ -8,7 +8,7 @@ degrades with a clear error code without it — `aioquic` for HTTP/3,
 `cryptography` for encrypted HLS). The web UI is
 dependency-free vanilla JS. The extension is Manifest V3.
 
-State at authorship: **1.7.1 released**; test suite green (786 tests),
+State at authorship: **1.7.2 released**; test suite green (786 tests),
 `web-ext lint` 0 errors / 0 warnings, UI smoke checks green
 (`bash tests/ui/run.sh all`), `rpmlint` 0/0, `fedora-review` no failed
 checks, mock builds cleanly on Fedora 43.
