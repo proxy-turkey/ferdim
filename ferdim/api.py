@@ -17,6 +17,7 @@ from .watch import MAX_FILE, parse_url_list
 
 MAX_MIRRORS = 24              # metalink belgeleri sikca 10-20 ayna listeler
 MAX_METALINK_FILES = 64
+MAX_ALLOWED_DIRS = 32         # config.allowed_dirs ust siniri
 # metalink onden dogrulamasi (kok karsilastirmasi) icin toplam sure siniri:
 # 64 dosya x 8 sn API is parcacigini dakikalarca kilitleyemez.
 METALINK_GUARD_SECS = 10.0
@@ -149,6 +150,21 @@ def _sanitize_config(cfg: dict, env=None) -> None:
     dirs = cfg.get("watch_dirs")
     cfg["watch_dirs"] = [d for d in dirs if isinstance(d, str) and d.strip()] \
         if isinstance(dirs, list) else []
+    # HTTP API'nin yazabilecegi ek kokler: yalniz mutlak yollar, en fazla 32
+    adirs = cfg.get("allowed_dirs")
+    if isinstance(adirs, list):
+        clean = []
+        for d in adirs:
+            if not isinstance(d, str):
+                continue
+            d = os.path.expanduser(d.strip())
+            if d and "\x00" not in d and os.path.isabs(d):
+                clean.append(d)
+            if len(clean) >= MAX_ALLOWED_DIRS:
+                break
+        cfg["allowed_dirs"] = clean
+    else:
+        cfg["allowed_dirs"] = []
     sch = cfg.get("schedule")
     if not isinstance(sch, dict):
         sch = cfg["schedule"] = {}
@@ -179,6 +195,80 @@ def _recheck_download_dir(ctx) -> str:
         env.reload_download_dir(cfg)
         return "download_dir"
     return ""
+
+
+# ------------------------------------------------ yol kisitlamasi (HTTP)
+# HTTP API'yi ayni makinedeki herhangi bir yerel surec cagirabilir; Unix
+# soketi ise 0600'dur ve yalniz ayni kullaniciya aciktir. HTTP tarafinda
+# istenen indirme/cikarma dizini izinli koklerin disina cikamaz, yoksa API
+# keyfi dosya yazma ilkeli olurdu (~/.config/autostart gibi).
+_DIR_DENIED_CODE = "dir_not_allowed"
+_DIR_DENIED_MSG = "dizin izinli koklerin disinda"
+
+
+def _dir_denied() -> dict:
+    return {"ok": False, "code": _DIR_DENIED_CODE, "error": _DIR_DENIED_MSG}
+
+
+def _real_dir(raw) -> str:
+    """Istenen yolu mutlak + baglantilardan arindirilmis bicime getirir.
+    Gecersiz (bos, NUL, goreli) yolda bos dize doner."""
+    if isinstance(raw, os.PathLike):
+        raw = os.fspath(raw)
+    if not isinstance(raw, str):
+        return ""
+    if not raw.strip() or "\x00" in raw:
+        return ""
+    p = os.path.expanduser(raw)
+    if not os.path.isabs(p):
+        return ""
+    return os.path.realpath(p)
+
+
+def _allowed_roots(ctx) -> list[str]:
+    """Izinli kokler: canli indirme klasoru + watch_dirs + allowed_dirs."""
+    roots = []
+    env = ctx.get("env")
+    if env is not None:
+        try:
+            roots.append(str(env.download_dir))
+        except OSError:
+            pass
+    cfg = ctx.get("cfg") or {}
+    for key in ("watch_dirs", "allowed_dirs"):
+        for d in cfg.get(key) or []:
+            if isinstance(d, str) and d.strip():
+                roots.append(d)
+    return [os.path.realpath(os.path.expanduser(r)) for r in roots]
+
+
+def _path_allowed(ctx, raw) -> bool:
+    """Yol gercek haliyle (baglantilar cozulmus) bir izinli kokun altinda mi?"""
+    real = _real_dir(raw)
+    if not real:
+        return False
+    for root in _allowed_roots(ctx):
+        try:
+            if os.path.commonpath([real, root]) == root:
+                return True
+        except ValueError:              # farkli surucu/gecersiz eslesme
+            continue
+    return False
+
+
+def _requested_dir(params: dict):
+    return params.get("dir") or params.get("directory") or ""
+
+
+def _check_add_dir(ctx, params: dict) -> dict | None:
+    """Kisitli baglamda 'add' isteginin dizinini dogrular; reddedilirse
+    yanit sozlugu, aksi halde None."""
+    if not ctx.get("restrict_paths"):
+        return None
+    raw = _requested_dir(params)
+    if not raw:                        # dizin verilmemis: varsayilan kok
+        return None
+    return None if _path_allowed(ctx, raw) else _dir_denied()
 
 
 def _bad_checksum(params: dict) -> bool:
@@ -389,10 +479,11 @@ def _add_local_file(ctx, path) -> dict:
     return {"ok": True, "ids": ids, "count": len(ids)}
 
 
-def _archive_cmd(qm, cmd: str, params: dict) -> dict:
+def _archive_cmd(ctx, cmd: str, params: dict) -> dict:
     """Arsiv komutlari: listeleme, secmeli cikarma, onarim ve gorev durumu.
     Cikarma arka planda calisir; istemci 'archive-status' ile izler."""
     from . import archive
+    qm = ctx["qm"]
     if cmd == "archive-status":
         return archive.task_status(str(params.get("task") or ""))
     job = qm.get(str(params.get("id") or ""))
@@ -412,6 +503,11 @@ def _archive_cmd(qm, cmd: str, params: dict) -> dict:
         # daemon'un calisma dizini istemcininki degil: goreli yol belirsiz
         return {"ok": False, "error": "hedef dizin mutlak olmali"}
     dest = archive.default_dest(path, raw_dest or None)
+    if ctx.get("restrict_paths"):
+        # arsivin kendisi ve cikarma hedefi izinli koklerin icinde olmali;
+        # hedef verilmezse arsiv yanindaki '<ad>/' dizini kullanilir.
+        if not _path_allowed(ctx, path) or not _path_allowed(ctx, dest):
+            return _dir_denied()
     force = bool(params.get("force"))
     if cmd == "archive-repair":
         if not archive.has_manifest(dest):
@@ -469,7 +565,7 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         return {"ok": True, **qm.stats()}
     if cmd in ("archive-list", "archive-extract", "archive-repair",
                "archive-status"):
-        return _archive_cmd(qm, cmd, params)
+        return _archive_cmd(ctx, cmd, params)
     if cmd == "zip-preview":
         job = qm.get(params.get("id", ""))
         if not job or job.state != "done":
@@ -486,6 +582,9 @@ def handle(ctx, cmd: str, params: dict) -> dict:
             return {"ok": False, "error": "gecersiz URL"}
         if _bad_checksum(params):
             return {"ok": False, "error": "gecersiz saglama degeri"}
+        denied = _check_add_dir(ctx, params)
+        if denied:
+            return denied
         # metalink / .meta4: icindeki dosyalara ac (aynalar + saglamalar)
         if _ml.looks_like_metalink(url):
             return _add_remote_metalink(ctx, params)

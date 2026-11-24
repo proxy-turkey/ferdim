@@ -339,6 +339,11 @@ S = {
         "tr": "Merkle bildirimi okunamadı ya da geçersiz",
         "es": "no se pudo leer el manifiesto Merkle o no es válido",
         "ru": "манифест Merkle не прочитан или недействителен"},
+    "err_dir_not_allowed": {
+        "en": "the requested folder is outside the allowed folders",
+        "tr": "istenen dizin izinli dizinlerin dışında",
+        "es": "la carpeta solicitada está fuera de las carpetas permitidas",
+        "ru": "запрошенная папка вне разрешённых папок"},
     # --------------------------------------------------------------- gecmis
     "hist_title": {
         "en": "History", "tr": "Geçmiş", "es": "Historial", "ru": "История"},
