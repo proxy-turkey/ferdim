@@ -172,6 +172,28 @@ class CollectorTests(unittest.TestCase):
                       col.render())
 
 
+    def test_09_host_maps_are_bounded_at_observe_time(self):
+        """Kardesilik siniri render'a birakilirsa sozlukler zamanla
+        sinirsiz buyur: katlama ornekleme aninda yapilmali."""
+        col = metrics.Collector()
+        jobs = []
+        for i in range(metrics.MAX_HOSTS + 10):
+            host = f"h{i:03d}.example"
+            job = FakeJob(f"j{i}", host)
+            job.stats_counters["retries"][host] = 1
+            jobs.append(job)
+        col.observe(jobs)
+        for name in ("_bytes", "_retries", "_throttles"):
+            self.assertLessEqual(len(getattr(col, name)), metrics.MAX_HOSTS + 1,
+                                 name)
+        text = col.render()
+        self.assertIn('ferdim_retries_total{host="other"} 10', text)
+        # ayni orneklem yeniden geldiginde katlama degismez (belirlenimci)
+        before = col.render()
+        col.observe(jobs)
+        self.assertEqual(col.render(), before)
+
+
 class QueueWiringTests(unittest.TestCase):
     def test_01_queue_samples_jobs(self):
         env = fresh_env(self)

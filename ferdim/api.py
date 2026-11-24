@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .engine.job import JobSpec
 from . import util
@@ -15,6 +17,14 @@ from .watch import MAX_FILE, parse_url_list
 
 MAX_MIRRORS = 24              # metalink belgeleri sikca 10-20 ayna listeler
 MAX_METALINK_FILES = 64
+# metalink onden dogrulamasi (kok karsilastirmasi) icin toplam sure siniri:
+# 64 dosya x 8 sn API is parcacigini dakikalarca kilitleyemez.
+METALINK_GUARD_SECS = 10.0
+# Belgeden turetilen URL'lere tasinmayacak kimlik bilgileri. UA ve proxy
+# sizinti degildir; referer yalnizca ayni kaynakta anlamlidir.
+_METALINK_CRED_KEYS = ("cookies", "user", "password", "headers",
+                       "referer", "page")
+
 _MAX_INT = {"segments": (1, 32, 8), "max_concurrent": (1, 32, 8),
             "retries": (0, 20, 5), "timeout": (5, 300, 30),
             "stall_timeout": (5, 120, 20), "web_port": (1024, 65535, 8378),
@@ -187,7 +197,69 @@ def _bad_checksum(params: dict) -> bool:
     return False
 
 
-def _metalink_root_guard(items: list, base: dict, cfg: dict) -> str:
+def _url_origin(url) -> tuple:
+    """(sema, ana makine, port); cozulemeyen URL icin bos sema doner."""
+    try:
+        p = urlsplit(str(url or ""))
+        scheme = (p.scheme or "").lower()
+        host = (p.hostname or "").lower()
+        port = p.port
+    except ValueError:
+        return ("", "", 0)
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme, 0)
+    return (scheme, host, port)
+
+
+def _item_params(keep: dict, doc_url: str, it: dict) -> dict | None:
+    """Tek bir metalink dosyasinin 'add' parametreleri.
+
+    Belgeden turetilen URL'ler baska kaynaklara da isaret edebilir. Kimlik
+    bilgisi (cerez/Basic/ozel baslik) varsa yalniz belgenin KENDI https
+    kaynagiyla ayni kokenli URL'lerde kalir; http:// hedefine hicbir zaman
+    kimlik bilgisi tasinmaz (ayni ana makine olsa bile). Kimligi birakip
+    yabanci aynayi indirmek parolayi disari vermek olurdu. Bildirim
+    (merkle) URL'i farkli kaynakliysa dogrulama kaybolmasin diye kimlik
+    bilgileri tumden birakilir: is ya parolasiz iner ya da acikca hataya
+    duser. UA ve proxy korunur (sizinti degildir). Kimlik bilgisi yoksa
+    (herkese acik belge) turetilen URL'ler kisitlanmaz."""
+    urls = [u for u in (it.get("urls") or [])
+            if isinstance(u, str) and u]
+    if not urls:
+        return None
+    primary = urls[0]
+    mirrors = urls[1:MAX_MIRRORS]
+    merkle = str(it.get("merkle") or "")
+    doc = _url_origin(doc_url)
+
+    def same(url: str) -> bool:
+        o = _url_origin(url)
+        return o[0] == "https" and o == doc
+
+    def stripped(d: dict) -> dict:
+        return {k: v for k, v in d.items() if k not in _METALINK_CRED_KEYS}
+
+    if not any(keep.get(k) for k in _METALINK_CRED_KEYS):
+        # kimlik bilgisi yoksa turetilen URL'ler kisitlanmaz
+        cred, mirrors = keep, mirrors
+    elif same(primary):
+        cred, mirrors = keep, [u for u in mirrors if same(u)]
+        if merkle and not same(merkle):
+            cred, mirrors = stripped(keep), urls[1:MAX_MIRRORS]
+    else:
+        cred, mirrors = stripped(keep), mirrors
+    checks = it.get("hashes") or {"sha256": it.get("sha256", ""),
+                                  "md5": it.get("md5", "")}
+    add = {**cred, "url": primary, "mirrors": mirrors,
+           "filename": it["filename"], "checksums": checks}
+    if merkle:
+        # belgeye ait bildirim: dosya icin acikca verilmis sayilir
+        add["merkle"] = merkle
+    return add
+
+
+def _metalink_root_guard(items: list, keep: dict, cfg: dict,
+                         doc_url: str = "") -> str:
     """metalink icindeki Merkle kokunun indirilen bildirimle ayni oldugunu
     dogrular (bos dize: sorun yok).
 
@@ -196,22 +268,33 @@ def _metalink_root_guard(items: list, base: dict, cfg: dict) -> str:
     kendi kokuyla ayni olmalidir; tutmazsa dosya kuyruga hic alinmaz
     (yanlis eslesme "dogrulandi" demek olurdu). Bildirim bu anda
     okunamiyorsa is yine kuyruga girer: motor ayni sorunu merkle_manifest
-    koduyla bildirir."""
+    koduyla bildirir.
+
+    Onden indirme toplam METALINK_GUARD_SECS ile sinirlidir: kalan sure
+    dolunca kalan dosyalar onden dogrulanmadan kuyruga girer (motorun
+    kendi dogrulamasi yine calisir) ve API is parcacigi kilitlenmez."""
     need = [it for it in items[:MAX_METALINK_FILES]
             if it.get("merkle") and it.get("merkle_root")]
     if not need:
         return ""
     from . import cdc
     from .engine import httpcli as _hc
-    try:
-        opt = _spec_from(base, cfg).options(cfg)
-    except (TypeError, ValueError, KeyError):
-        return ""                    # secenekler kurulamadi: motor karar verir
+    deadline = time.monotonic() + METALINK_GUARD_SECS
     for it in need:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break                    # sure doldu: motor karar verir
+        add = _item_params(keep, doc_url, it)
+        if add is None:
+            continue
+        try:
+            opt = _spec_from(add, cfg).options(cfg)
+        except (TypeError, ValueError, KeyError):
+            return ""                # secenekler kurulamadi: motor karar verir
         try:
             text = _hc.fetch_small(
                 it["merkle"], opt,
-                timeout=min(max(int(opt.timeout), 2), 8),
+                timeout=min(max(int(opt.timeout), 2), 8, max(0.2, left)),
                 limit=cdc.MAX_MANIFEST)
             man = cdc.Manifest.parse(text)
         except OSError as e:            # ag hatasi / HTTP 4xx-5xx
@@ -228,23 +311,21 @@ def _metalink_root_guard(items: list, base: dict, cfg: dict) -> str:
 
 def _add_metalink_items(ctx, items: list, base: dict) -> dict:
     """Ayristirilmis metalink dosyalarini kuyruga ekler. 'base' icindeki
-    dizin, kimlik, hiz limiti gibi ayarlar her dosyaya tasinir."""
+    dizin, kimlik, hiz limiti gibi ayarlar her dosyaya tasinir; kimlik
+    bilgileri yalniz belgenin kendi kaynagiyla sinirlidir (bkz
+    _item_params)."""
     keep = {k: v for k, v in (base or {}).items()
             if k not in ("url", "filename", "mirrors", "sha256", "md5",
                          "sha1", "sha512", "checksums", "checksum", "merkle")}
-    err = _metalink_root_guard(items, keep, ctx["cfg"])
+    doc_url = str((base or {}).get("url") or "")
+    err = _metalink_root_guard(items, keep, ctx["cfg"], doc_url)
     if err:
         return {"ok": False, "error": f"metalink: {err}"}
     ids, first = [], None
     for it in items[:MAX_METALINK_FILES]:
-        checks = it.get("hashes") or {"sha256": it.get("sha256", ""),
-                                      "md5": it.get("md5", "")}
-        add = {**keep, "url": it["urls"][0],
-               "mirrors": it["urls"][1:MAX_MIRRORS],
-               "filename": it["filename"], "checksums": checks}
-        if it.get("merkle"):
-            # belgeye ait bildirim: dosya icin acikca verilmis sayilir
-            add["merkle"] = it["merkle"]
+        add = _item_params(keep, doc_url, it)
+        if add is None:
+            continue
         r = handle(ctx, "add", add)
         if r.get("ok"):
             ids.append(r["id"])

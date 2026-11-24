@@ -17,6 +17,7 @@ import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -62,6 +63,15 @@ def document(base: str, *, merkle: str = "", root: str = "",
  </file>
 </metalink>
 """
+
+
+def item(urls, merkle: str = "", root: str = "",
+         name: str = "paket.bin") -> dict:
+    """metalink.parse ciktisinin en az alan kumesini tasiyan kayit."""
+    return {"filename": name, "size": 1, "urls": list(urls),
+            "sha256": CHUNK_SHA, "md5": "",
+            "hashes": {"sha256": CHUNK_SHA},
+            "merkle": merkle, "merkle_root": root}
 
 
 class MLServer(BaseHTTPRequestHandler):
@@ -292,6 +302,143 @@ class ExpansionTests(unittest.TestCase):
         self.assertFalse(r.get("ok"), r)
         self.assertIn("merkle", r.get("error", ""))
         self.assertEqual(len(self.qm.jobs), 0)
+
+    # ------------------------------------- kimlik bilgisi kapsami (guvenlik)
+    def _cred_base(self, doc: str = "https://docs.test/doc.meta4") -> dict:
+        return {"url": doc, "paused": True,
+                "cookies": "sid=1", "user": "kullanici",
+                "password": "parola", "headers": ["X-Api-Key: gizli"],
+                "referer": "https://docs.test/sayfa",
+                "ua": "FerDimTest/1"}
+
+    def _add_items(self, items, base):
+        r = api._add_metalink_items(self.ctx, items, base)
+        self.assertTrue(r.get("ok"), r)
+        return self.qm.get(r["ids"][0])
+
+    def test_30_credentials_stay_on_the_document_origin(self):
+        """Cerez/Basic/ozel baslik yalniz belgenin https kaynaginda kalir;
+        ayni kaynakli olmayan ayna ve http hedef kimlik almaz."""
+        job = self._add_items([item([
+            "https://docs.test/a.bin",
+            "https://docs.test/mirror/a.bin",
+            "https://baska.test/a.bin",
+            "http://docs.test/a.bin"])], self._cred_base())
+        spec = job.spec
+        self.assertEqual(spec.cookies, "sid=1")
+        self.assertEqual(spec.user, "kullanici")
+        self.assertEqual(spec.password, "parola")
+        self.assertEqual(spec.headers, {"X-Api-Key": "gizli"})
+        self.assertEqual(spec.referer, "https://docs.test/sayfa")
+        self.assertEqual(spec.user_agent, "FerDimTest/1")
+        self.assertEqual(spec.mirrors, ["https://docs.test/mirror/a.bin"])
+
+    def test_30b_public_document_keeps_all_mirrors(self):
+        """Kimlik bilgisi yoksa kaynak kapsami kisitlamaz: herkese acik
+        metalinklerin cok kaynakli aynalari korunur."""
+        base = {"url": "https://docs.test/doc.meta4", "paused": True,
+                "ua": "FerDimTest/1"}
+        job = self._add_items([item([
+            "https://docs.test/a.bin", "https://baska.test/a.bin",
+            "http://ucuncu.test/a.bin"])], base)
+        self.assertEqual(job.spec.mirrors,
+                         ["https://baska.test/a.bin",
+                          "http://ucuncu.test/a.bin"])
+
+    def test_31_cross_origin_primary_drops_credentials(self):
+        job = self._add_items([item([
+            "https://baska.test/a.bin",
+            "https://docs.test/mirror/a.bin",
+            "https://ucuncu.test/a.bin"])], self._cred_base())
+        spec = job.spec
+        for attr in ("cookies", "user", "password", "referer"):
+            self.assertEqual(getattr(spec, attr), "", attr)
+        self.assertEqual(spec.headers, {})
+        self.assertEqual(spec.user_agent, "FerDimTest/1")
+        self.assertEqual(spec.mirrors,
+                         ["https://docs.test/mirror/a.bin",
+                          "https://ucuncu.test/a.bin"],
+                         "kimlik birakilinca aynalar elenmez")
+
+    def test_32_http_origin_never_carries_credentials(self):
+        job = self._add_items(
+            [item(["http://docs.test/a.bin"])],
+            self._cred_base("http://docs.test/doc.meta4"))
+        self.assertEqual(job.spec.url, "http://docs.test/a.bin")
+        self.assertEqual(job.spec.cookies, "")
+        self.assertEqual(job.spec.user, "")
+        self.assertEqual(job.spec.headers, {})
+
+    def test_33_cross_origin_merkle_drops_credentials(self):
+        """Bildirim baska kaynaktan geliyorsa dogrulama kaybolmasin diye
+        kimlik bilgisi tumden birakilir (parola yabanci sunucuya gitmez)."""
+        job = self._add_items([item(
+            ["https://docs.test/a.bin", "https://baska.test/a.bin"],
+            merkle="https://cdn.test/a.ferdim-merkle")], self._cred_base())
+        spec = job.spec
+        self.assertEqual(spec.merkle, "https://cdn.test/a.ferdim-merkle")
+        self.assertEqual(spec.cookies, "")
+        self.assertEqual(spec.user, "")
+        self.assertEqual(spec.headers, {})
+        self.assertEqual(spec.mirrors, ["https://baska.test/a.bin"])
+
+    def test_34_preflight_fetch_is_scoped_too(self):
+        """Onden kok dogrulama istegi de ayni kapsamla cikmali."""
+        for merkle, want in (
+                ("https://docs.test/m.ferdim-merkle", "sid=1"),
+                ("https://cdn.test/m.ferdim-merkle", "")):
+            seen = {}
+
+            def fake_fetch(url, opt, **kw):
+                seen.update(url=url, cookies=opt.cookies,
+                            user=opt.user, headers=dict(opt.headers))
+                return MAN.dumps()
+
+            it = item(["https://docs.test/a.bin"], merkle=merkle,
+                      root=MAN.root)
+            with mock.patch("ferdim.engine.httpcli.fetch_small",
+                            side_effect=fake_fetch):
+                err = api._metalink_root_guard(
+                    [it], self._cred_base(), self.cfg,
+                    "https://docs.test/doc.meta4")
+            self.assertEqual(err, "", err)
+            self.assertEqual(seen["url"], merkle)
+            self.assertEqual(seen["cookies"], want)
+            self.assertEqual(seen["user"], "kullanici" if want else "")
+            self.assertEqual(seen["headers"].get("X-Api-Key"),
+                             "gizli" if want else None)
+            self.assertEqual(seen["headers"].get("Referer"),
+                             "https://docs.test/sayfa" if want else None)
+
+    def test_35_preflight_total_deadline(self):
+        """64 yavas bildirim API is parcacigini kilitlememeli: toplam sure
+        dolunca kalanlar onden denenmeden kuyruga girer."""
+        calls = []
+
+        def slow(*a, **k):
+            calls.append(1)
+            time.sleep(0.1)
+            raise OSError("ag yok")
+
+        items = [item(["https://docs.test/a.bin"],
+                      merkle="https://docs.test/m.ferdim-merkle",
+                      root=MAN.root) for _ in range(api.MAX_METALINK_FILES)]
+        old = api.METALINK_GUARD_SECS
+        api.METALINK_GUARD_SECS = 0.3
+        try:
+            t0 = time.monotonic()
+            with mock.patch("ferdim.engine.httpcli.fetch_small",
+                            side_effect=slow):
+                err = api._metalink_root_guard(
+                    items, self._cred_base(), self.cfg,
+                    "https://docs.test/doc.meta4")
+            elapsed = time.monotonic() - t0
+        finally:
+            api.METALINK_GUARD_SECS = old
+        self.assertEqual(err, "")
+        self.assertLess(elapsed, 1.5, "toplam sure siniri asildi")
+        self.assertLess(len(calls), api.MAX_METALINK_FILES,
+                        "sure dolunca kalan onden denenmemeli")
 
     # ------------------------------------------------- kesin kaynak (motor)
     def test_20_bad_manifest_from_metalink_is_an_error(self):

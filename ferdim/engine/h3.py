@@ -74,9 +74,14 @@ _REDIRECT = frozenset({301, 302, 303, 307, 308})
 _API = None                     # aioquic sembolleri (tembel)
 _AVAILABLE: bool | None = None  # available() sonucu (negatif dahil) onbellek
 _PROTO = None                   # QuicConnectionProtocol alt sinifi (tembel)
+# Onbellek anahtari: origin + ("|insecure" guvenilmez TLS isleri icin).
+# Guvenilmez isin ogrendigi kayit guvenli ise sizmaz (ve tersi).
 # origin -> (host, port, bitis); host "" = kaynagin kendi adresi
 _ALT_SVC: dict[str, tuple[str, int, float]] = {}
 _BROKEN: dict[str, float] = {}                # origin -> bitis zamani
+# Onbellekler kaynak sayisiyla sinirsiz buyumez (LRU, en eski atilir).
+MAX_CACHE = 256
+
 _POOL: dict[tuple, list[_Conn]] = {}          # hedef -> canli baglantilar
 _OPENING: dict[tuple, asyncio.Future] = {}    # hedef -> kurulmakta olan
 _LOCK = threading.Lock()
@@ -180,40 +185,75 @@ def parse_alt_svc(value: str | None) -> tuple[str, int, float] | None:
     return best
 
 
-def remember_alt_svc(url: str, value: str | None) -> bool:
-    """TCP yanitindaki Alt-Svc basligini onbellege yazar (ma=0 siler)."""
+def _cache_key(url: str, insecure: bool = False) -> str:
+    """Alt-Svc anahtari: origin (+ guvenilmez TLS isaretcisi)."""
+    return origin(url) + ("|insecure" if insecure else "")
+
+
+def _insecure(opt) -> bool:
+    return bool(getattr(opt, "insecure", False))
+
+
+def _evict(cache: dict, now: float, deadline) -> None:
+    """Onbellegi MAX_CACHE'te tutar: once suresi dolanlar, sonra en eski."""
+    if len(cache) <= MAX_CACHE:
+        return
+    for key in [k for k, v in cache.items() if deadline(v) <= now]:
+        cache.pop(key, None)
+    while len(cache) > MAX_CACHE:
+        cache.pop(next(iter(cache)), None)
+
+
+def remember_alt_svc(url: str, value: str | None,
+                     insecure: bool = False) -> bool:
+    """TCP yanitindaki Alt-Svc basligini onbellege yazar (ma=0 siler).
+
+    Yalniz yanitin SON adresinin origin'i icin cagrilmalidir: yonlendirme
+    hedefi baska bir kaynagin h3 ayarini belirleyemez. Guvenilmez (TLS
+    dogrulamasiz) islerin ogrendigi kayit ayri tutulur, guvenli ise
+    sizmaz."""
     parsed = parse_alt_svc(value)
     if parsed is None:
         return False
     alt_host, port, max_age = parsed
-    key = origin(url)
+    key = _cache_key(url, insecure)
+    now = _now()
     with _LOCK:
         if max_age <= 0:
             _ALT_SVC.pop(key, None)
             return False
-        _ALT_SVC[key] = (alt_host, port, _now() + max_age)
+        _ALT_SVC.pop(key, None)          # LRU: guncellenen sona gider
+        _ALT_SVC[key] = (alt_host, port, now + max_age)
+        _evict(_ALT_SVC, now, lambda v: v[2])
     return True
 
 
-def alt_svc_target(url: str) -> tuple[str, int] | None:
+def alt_svc_target(url: str, insecure: bool = False) -> tuple[str, int] | None:
     """Onbellekteki h3 hedefi (host, port); yoksa/suresi dolduysa None.
 
     host bos ise kaynagin kendi ana makinesine baglanilir."""
-    key = origin(url)
+    key = _cache_key(url, insecure)
+    now = _now()
     with _LOCK:
         item = _ALT_SVC.get(key)
         if item is None:
             return None
-        if item[2] <= _now():
+        if item[2] <= now:
             _ALT_SVC.pop(key, None)
             return None
+        _ALT_SVC.pop(key, None)          # LRU dokunusu
+        _ALT_SVC[key] = item
         return item[0], item[1]
 
 
 def mark_broken(url: str) -> None:
     """h3 denemesi basarisiz: kaynak BROKEN_SECS boyunca TCP'de kalir."""
+    key = origin(url)
+    now = _now()
     with _LOCK:
-        _BROKEN[origin(url)] = _now() + BROKEN_SECS
+        _BROKEN.pop(key, None)
+        _BROKEN[key] = now + BROKEN_SECS
+        _evict(_BROKEN, now, lambda v: v)
 
 
 def broken(url: str) -> bool:
@@ -266,7 +306,7 @@ def use_h3(url: str, opt) -> bool:
         return False
     if mode == "force":
         return True
-    return not broken(url) and alt_svc_target(url) is not None
+    return not broken(url) and alt_svc_target(url, _insecure(opt)) is not None
 
 
 # --------------------------------------------------------- istek/yanit
@@ -1021,7 +1061,7 @@ def request(url: str, opt, headers: dict | None = None,
     auto modda TCP (yonlendirmeyi izleyen yol) kullanilsin.
     """
     session = _Session(url, opt, headers, float(timeout or 30),
-                       target=alt_svc_target(url))
+                       target=alt_svc_target(url, _insecure(opt)))
     try:
         status, msg = session.start()
         if status <= 0:
