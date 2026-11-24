@@ -254,36 +254,36 @@ Shipped in **1.7.1**.
 Nothing may ever finish as `done` with wrong bytes, and no restart may
 silently lose the queue.
 
-- [ ] Refuse to resume without a validator: when a server sends neither
+- [x] Refuse to resume without a validator: when a server sends neither
       `ETag` nor `Last-Modified`, `"" == ""` currently resumes a changed
       file (`job.py:671`). Restart, or resume only with a checksum.
-- [ ] Reject a response `Content-Encoding` other than `identity` on
+- [x] Reject a response `Content-Encoding` other than `identity` on
       ranged downloads; a server that compresses anyway now yields a
       silently corrupt file.
-- [ ] fsync the `.part` before a range leaves the checkpoint and fsync
+- [x] fsync the `.part` before a range leaves the checkpoint and fsync
       `atomic_write_json` (file + directory), so a power cut can't leave
       zero-filled "finished" ranges.
-- [ ] Corrupt state never crash-loops or empties the queue: validate
+- [x] Corrupt state never crash-loops or empties the queue: validate
       `queue.json` item by item (`queue.py:535`), quarantine a bad file
       as `queue.json.bad`, keep the last good copy, report it in the UI.
-- [ ] Schema versions and ordered migrations for `config.json`,
+- [x] Schema versions and ordered migrations for `config.json`,
       `queue.json` and `hosts.json` (as `history.py` already has), plus
       downgrade safety: unknown keys are preserved, unknown states
       degrade to `queued`.
-- [ ] Single-instance lock (`flock` on the state directory) so a stale
+- [x] Single-instance lock (`flock` on the state directory) so a stale
       PID can't let two daemons share the socket and state; reload
       `hosts.json` when another process changed it.
-- [ ] Reserve the final file name atomically (`O_EXCL`) so two jobs with
+- [x] Reserve the final file name atomically (`O_EXCL`) so two jobs with
       the same name can't overwrite each other (`util.py:64`).
-- [ ] Clean up every temporary artefact on cancel, remove and error:
+- [x] Clean up every temporary artefact on cancel, remove and error:
       orphaned `.part` files, HLS/DASH `.segs/` folders, and the `.part`
       descriptor leaked when `_prepare` fails (`job.py:684`).
-- [ ] Reset the verification fields (`checksum`, `merkle`, `verified`,
+- [x] Reset the verification fields (`checksum`, `merkle`, `verified`,
       `peer_bytes`) when a job restarts, so old warnings don't stick.
-- [ ] Detect soft-404s: an HTML body for a URL or name that promises
+- [x] Detect soft-404s: an HTML body for a URL or name that promises
       something else finishes with a warning code instead of a silent
       `done`.
-- [ ] Verify in a single cancellable pass with progress, instead of
+- [x] Verify in a single cancellable pass with progress, instead of
       hashing large files twice after the transfer.
 
 ## 1.12 — protocol completeness and edge cases

@@ -1,7 +1,7 @@
 %global srcname ferdim
 
 Name:           %{srcname}
-Version:        1.7.2
+Version:        1.8.0
 Release:        1%{?dist}
 Summary:        Dynamic self-tuning download manager with Firefox integration
 
@@ -155,6 +155,9 @@ python3 -m unittest discover -s tests -v
 # end of user-unit preun scriptlet
 
 %changelog
+* Wed Nov 25 2026 Enes Aksu <eaksu@pm.me> - 1.8.0-1
+- data integrity: no resume without validator, fsync, atomic names
+- corrupt queue recovery, state schemas, single-instance lock
 * Tue Nov 24 2026 Enes Aksu <eaksu@pm.me> - 1.7.2-1
 - tests: wait for the history row (slow builders)
 * Tue Nov 24 2026 Enes Aksu <eaksu@pm.me> - 1.7.1-1

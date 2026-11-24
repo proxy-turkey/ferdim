@@ -4,6 +4,54 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [1.8.0] — 2026-11-25
+
+Data integrity and crash safety: nothing may finish as `done` with wrong
+bytes, and no restart may silently lose the queue.
+
+### Changed
+- A download whose server sends neither `ETag` nor `Last-Modified` is no
+  longer resumed (the file may have changed); it restarts from zero,
+  unless an explicit checksum or Merkle manifest will verify it.
+- A response with a `Content-Encoding` other than `identity` (or `none`)
+  is refused with the new `content_encoding` code instead of writing
+  compressed bytes into the file.
+- Verification reads the finished file once for every digest and the
+  Merkle check, can be paused or canceled, and shows progress.
+- Only one daemon can run per state folder (`flock` on
+  `ferdim.lock`); a stale PID file no longer matters.
+
+### Added
+- Soft-404 detection: an HTML page served for a name that promises
+  another type finishes with the `soft_404` warning (web, GTK, `ferdim
+  list`) instead of a silent `done`.
+- Schema versions and ordered migrations for `config.json`, `queue.json`
+  and `hosts.json`; unknown keys survive a downgrade, unknown job states
+  load as `queued`.
+- A corrupt `queue.json` is quarantined as `queue.json.bad-<time>` (the
+  newest three are kept), the previous good copy `queue.json.prev` is
+  loaded, bad items are skipped one by one, and the UI shows a
+  `state_recovered` notice. Failed jobs keep their error reason across
+  restarts.
+
+### Fixed
+- Power cuts: the `.part` file is flushed before a checkpoint claims its
+  bytes, the finished file's rename and every state file are flushed
+  (file and folder), and HLS/DASH segments are flushed before the resume
+  cursor advances.
+- State files are written through a unique temporary file, so two
+  processes saving at once can't publish an empty file; `hosts.json`
+  updates from the daemon and the CLI are locked and merged.
+- The final file name is reserved atomically, so two jobs with the same
+  name can no longer overwrite each other.
+- Cancel, remove and "clear finished" delete the job's `.part`, HLS/DASH
+  `.segs/` folder and checkpoint; a failing start no longer leaks the
+  `.part` descriptor. Failed jobs keep their partial file so they can
+  still be resumed.
+- Restarting a job clears old checksum, Merkle and peer results.
+- A complete download that crashed before being moved into place is
+  published on the next start instead of downloaded again.
+
 ## [1.7.2] — 2026-11-24
 
 ### Fixed

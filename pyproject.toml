@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ferdim"
 # ferdim/__init__.py __version__ ile esit olmali (tests/test_h3.py dogrular);
 # surum yukseltmesinde iki yer birlikte guncellenir.
-version = "1.7.2"
+version = "1.8.0"
 description = "Dynamic, self-tuning segmented download manager for Linux"
 readme = "README.md"
 requires-python = ">=3.9"
