@@ -4,9 +4,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 from . import DEFAULT_USER_AGENT
+
+# config.json'a es zamanli kayitlar (daemon + API) birbirini ezmesin
+_CONFIG_LOCK = threading.Lock()
 
 DEFAULTS = {
     "download_dir": None,          # None -> xdg-user-dir DOWNLOAD
@@ -38,6 +42,8 @@ DEFAULTS = {
     "watch_dirs": [],              # izlenen klasorler (baglanti listesi / metalink)
     "watch_done": "delete",        # kuyruga alinan dosya: delete | rename | keep
     "watch_interval": 3,           # tarama araligi (sn)
+    # HTTP API'nin yazabilecegi ek kokler; Unix soketi kisitli degildir.
+    "allowed_dirs": [],
     # --- kuyruk gecmisi (1.5) ---
     "history_days": 365,           # 0 = gecmisi sonsuza kadar sakla
     # --- ogrenilen ana makine profilleri (1.6) ---
@@ -108,6 +114,10 @@ class AppEnv:
             os.chmod(self.state_dir, 0o700)
         except OSError:
             pass
+        try:
+            os.chmod(self.config_dir, 0o700)
+        except OSError:
+            pass
         self.config_path = self.config_dir / "config.json"
         self.socket_path = self.state_dir / "ferdim.sock"
         self.token_path = self.state_dir / "token"
@@ -150,7 +160,29 @@ class AppEnv:
         return cfg
 
     def save_config(self, cfg: dict) -> None:
-        self.config_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.config_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), "utf-8")
-        tmp.replace(self.config_path)
+        """Atomik + 0600 yazim: config.json kimlik bilgisi tasiyabilir ve
+        umask ne olursa olsun yalniz kullaniciya acik kalmali. Gecici dosya
+        O_EXCL ile acilir; yarim kalan eski gecici temizlenir. Bicim insan
+        tarafindan okunabilir kalir (indent=2)."""
+        data = json.dumps(cfg, indent=2, ensure_ascii=False)
+        with _CONFIG_LOCK:
+            self.config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            tmp = self.config_path.with_suffix(self.config_path.suffix + ".tmp")
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            try:
+                fd = os.open(tmp, flags, 0o600)
+            except FileExistsError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                fd = os.open(tmp, flags, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    fd = -1
+                    f.write(data)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+            os.replace(tmp, self.config_path)
