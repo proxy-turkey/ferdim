@@ -371,6 +371,68 @@ class SessionTest(unittest.TestCase):
         self.assertIsNone(session._target)
 
 
+class StartRaceTest(unittest.TestCase):
+    """start() zaman asimi: istek iptal edilmeli, akis slotu sizmamali."""
+
+    URL = "https://ornek.test/dosya.bin"
+
+    def setUp(self):
+        h3.reset_cache()
+        self.addCleanup(h3.close_all)
+
+    def test_handshake_timeout_cancels_and_marks_broken(self):
+        """El sikismasi zaman asimi: istek iptal, kaynak bozuk, akis yok.
+
+        Python 3.9/3.10'da `concurrent.futures.TimeoutError` builtin
+        TimeoutError'dan ayri bir siniftir; yanlis sinif yakalanirsa istek
+        iptal edilmez ve sonradan akis kaydedip slot sizdirirdi."""
+        started = threading.Event()
+        cancelled = threading.Event()
+
+        async def never(url, opt, target):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        opt = httpcli.DlOptions(http3="force", timeout=0.2)
+        session = h3._Session(self.URL, opt, {}, 0.2)
+        with mock.patch.object(h3, "_conn_get", never):
+            with self.assertRaises(TimeoutError):
+                session.start()
+        self.assertTrue(started.is_set(), "istek baslamali")
+        self.assertTrue(cancelled.wait(5),
+                        "zaman asiminda istek iptal edilmeli")
+        self.assertTrue(h3.broken(self.URL), "zaman asimi kaynagi bozmali")
+        self.assertTrue(session._stream.reader_done, "akis birakilmali")
+        self.assertEqual(h3.pool_stats()["streams"], 0)
+
+    def test_released_stream_is_not_registered(self):
+        """Birakildiktan SONRA tamamlanan istek akis kaydetmemeli."""
+        conn = mock.Mock()
+        conn.streams = {}
+        conn.closed = False
+        conn.paused = False
+        session = h3._Session(self.URL, httpcli.DlOptions(http3="auto"), {}, 5)
+        session._stream = h3._Stream()
+
+        async def late(url, opt, target):
+            # start() zaman asimina ugramis gibi: akis birakilmis donuyor
+            session._stream.reader_done = True
+            return conn
+
+        loop = h3._loop()
+        with mock.patch.object(h3, "_conn_get", late):
+            fut = asyncio.run_coroutine_threadsafe(session._open(), loop)
+            with self.assertRaises(h3.H3Error):
+                fut.result(5)
+        self.assertEqual(conn.streams, {}, "birakilmis akis kaydedilmemeli")
+        self.assertEqual(conn.proto.h3.send_headers.call_count, 0,
+                         "birakilmis akisa istek gonderilmemeli")
+
+
 class ConfigTest(unittest.TestCase):
     def test_default_off(self):
         self.assertEqual(paths.DEFAULTS["http3"], "off")
@@ -892,12 +954,36 @@ class PoolTest(unittest.TestCase):
         self.assertNotIn("ferdim-h3-loop",
                          [t.name for t in threading.enumerate()],
                          "close_all sonrasi is parcacigi kalmamali")
-        self.assertEqual(h3.pool_stats(), {"connections": 0, "streams": 0})
+        self.assertEqual(h3.pool_stats()["connections"], 0)
+        self.assertEqual(h3.pool_stats()["streams"], 0)
         with httpcli.open_range(self.url, self.opt(), 0, 9,
                                 timeout=10) as res:      # yeniden kurulabilir
             self.assertEqual(res.read(10), PAYLOAD[:10])
         self.assertIn("ferdim-h3-loop",
                       [t.name for t in threading.enumerate()])
+
+    def test_slow_reader_keeps_buffer_bounded(self):
+        """Yavas okur: okunmamis tampon siniri asmamali, veri bayt-tam.
+
+        aioquic akis kredisini alinan bayta gore otomatik artirir; geri
+        basinc UDP okumasini duraklatarak uygulanir (STREAM_BUFFER)."""
+        bound = 128 * 1024
+        opt = self.opt()
+        got = bytearray()
+        with mock.patch.object(h3, "STREAM_BUFFER", bound):
+            end = len(PAYLOAD) - 1
+            with httpcli.open_range(self.url, opt, 0, end,
+                                    timeout=30) as res:
+                while True:
+                    chunk = res.read(65536)
+                    if not chunk:
+                        break
+                    got += chunk
+                    time.sleep(0.004)      # okuru agdan yavas birak
+        self.assertEqual(bytes(got), PAYLOAD, "veri bayt-tam olmali")
+        peak = h3.pool_stats()["peak_buffered"]
+        self.assertLessEqual(peak, bound * 3,
+                             f"tampon sinirsiz buyudu: {peak} bayt")
 
 
 if __name__ == "__main__":

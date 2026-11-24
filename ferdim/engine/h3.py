@@ -29,8 +29,17 @@ dusulur).
 Veri, olay dongusu tarafindan akis basina bir kuyruga birakilir; bloklayan
 Response okumasi oradan beslenir ve akis bitince kuyrukta kalan son
 parcalar kaybolmaz (okur sentinel'i gorene kadar orada durur). Her okuma
-stall zaman asimina tabidir. Uygulama kapanirken h3.close_all() cagrilir:
-olay dongusu ve UDP soketleri boylece serbest kalir.
+stall zaman asimina tabidir.
+
+Geri basinc: aioquic akis kredisini alinan bayta gore otomatik artirdigi
+icin akis duzeyinde kredi freni yoktur. Bu yuzden tampon akis basina
+STREAM_BUFFER ile sinirlanir: sinir asilinca baglantisinin UDP okumasi
+duraklatilir (cekirdek kuyrugu ve QUIC akis kredisi peer'i durdurur), okur
+tamponu yariya indirince okuma surdurulur. Ayni baglantidaki akislar bu
+duraklamayi paylasir; veri kaybolmaz, QUIC yeniden gonderir.
+
+Uygulama kapanirken h3.close_all() cagrilir: olay dongusu ve UDP soketleri
+boylece serbest kalir.
 """
 from __future__ import annotations
 
@@ -51,6 +60,9 @@ CONNECT_SECS = 5.0              # el sikismasi ust siniri (stall'dan bagimsiz)
 POOL_IDLE_SECS = 30.0           # bos baglanti bu sure sonra kapanir
 POOL_SWEEP_SECS = 5.0           # bos baglanti tarama araligi
 MAX_STREAMS = 32                # baglanti basina es zamanli akis (= max link)
+# akis basina okunmayi bekleyen tampon siniri: asilinca baglantisinin UDP
+# okumasi duraklatilir (geri basinc), okur tamponu yariya indirince acilir
+STREAM_BUFFER = 1 << 20
 CLOSE_SECS = 5.0                # baglanti kapatma ust siniri
 LOOP_START_SECS = 5.0
 
@@ -69,6 +81,7 @@ _POOL: dict[tuple, list[_Conn]] = {}          # hedef -> canli baglantilar
 _OPENING: dict[tuple, asyncio.Future] = {}    # hedef -> kurulmakta olan
 _LOCK = threading.Lock()
 _LOOPS: "_Loop | None" = None                 # paylasilan olay dongusu
+_PEAK_BUFFERED = 0              # testler icin: okunmamis tampon zirvesi
 
 
 class H3Unavailable(RuntimeError):
@@ -216,10 +229,12 @@ def broken(url: str) -> bool:
 
 
 def reset_cache() -> None:
-    """Testler icin: Alt-Svc ve bozuk kaynak onbellegini temizler."""
+    """Testler icin: Alt-Svc/bozuk kaynak onbellegi ve tampon zirvesi."""
+    global _PEAK_BUFFERED
     with _LOCK:
         _ALT_SVC.clear()
         _BROKEN.clear()
+    _PEAK_BUFFERED = 0
 
 
 # --------------------------------------------------------- mod secimi
@@ -424,6 +439,34 @@ class _Conn:
         self.streams: dict[int, _Stream] = {}
         self.last_used = _now()
         self.closed = False
+        self.paused = False       # UDP okumasi durdu (okur geri basinci)
+
+    def pause(self) -> None:
+        """Okumayi duraklat: bir akisin tamponu STREAM_BUFFER'i asti."""
+        if self.paused:
+            return
+        self.paused = True
+        self._reading(False)
+
+    def resume(self) -> None:
+        """Okumayi surdur: tamponlar eridi (yari sinirin altinda)."""
+        if not self.paused:
+            return
+        self.paused = False
+        self._reading(True)
+
+    def _reading(self, on: bool) -> None:
+        proto = self.proto
+        transport = getattr(proto, "_transport", None) if proto else None
+        if transport is None:
+            return
+        try:
+            if on:
+                transport.resume_reading()
+            else:
+                transport.pause_reading()
+        except Exception:          # tasima kapanmis olabilir
+            pass
 
 
 class _Stream:
@@ -441,6 +484,8 @@ class _Stream:
         self.reader_done = False      # okur bitirdi: baglanti yeniden kullanilir
         self.failed = False
         self.error: BaseException | None = None
+        self.buffered = 0             # kuyrukta okunmayi bekleyen bayt
+        self._buf_lock = threading.Lock()
 
     def on_headers(self, headers) -> None:
         if self.got_headers:          # izleyen HEADERS = trailer
@@ -451,8 +496,15 @@ class _Stream:
         self._wake()
 
     def feed(self, data: bytes) -> None:
-        if self.queue is not None:
-            self.queue.put_nowait(data)
+        if self.queue is None:
+            return
+        self.queue.put_nowait(data)
+        with self._buf_lock:          # okur baska is parcaciginda sayar
+            self.buffered += len(data)
+
+    def take_buffered(self, n: int) -> None:
+        with self._buf_lock:
+            self.buffered -= n
 
     def end(self) -> None:
         if self.server_done:
@@ -505,10 +557,30 @@ def _pool_remove(conn: _Conn) -> None:
 
 
 def pool_stats() -> dict:
-    """Testler icin: canli baglanti ve akis sayilari."""
+    """Testler icin: canli baglanti/akis ve tampon sayilari."""
     conns = _pool_all()
+    streams = [s for c in conns for s in c.streams.copy().values()]
     return {"connections": len(conns),
-            "streams": sum(len(c.streams) for c in conns)}
+            "streams": len(streams),
+            "buffered": sum(s.buffered for s in streams),
+            "peak_buffered": _PEAK_BUFFERED}
+
+
+def _note_buffered(conn: _Conn) -> None:
+    """Testler icin: baglanti basina okunmamis bayt zirvesini isler."""
+    global _PEAK_BUFFERED
+    total = sum(s.buffered for s in conn.streams.values())
+    if total > _PEAK_BUFFERED:
+        _PEAK_BUFFERED = total
+
+
+def _resume_if_dry(conn: _Conn) -> None:
+    """Butun akislarin tamponu yariya indiyse okumayi surdurur (dongude)."""
+    if not conn.paused or conn.closed:
+        return
+    if any(s.buffered >= STREAM_BUFFER // 2 for s in conn.streams.values()):
+        return
+    conn.resume()
 
 
 def _key_of(url: str, opt, target: tuple[str, int] | None) -> tuple:
@@ -537,16 +609,15 @@ def _release_stream(stream: _Stream, reset: bool = False) -> None:
     if conn.streams.get(stream.stream_id) is stream:
         conn.streams.pop(stream.stream_id, None)
     conn.last_used = _now()
-    if not reset or conn.closed or stream.server_done or stream.stream_id < 0:
-        return
     proto = conn.proto
-    if proto is None:
-        return
-    try:
-        proto._quic.stop_stream(stream.stream_id, 0)
-        proto.transmit()
-    except Exception:
-        pass
+    if (reset and not conn.closed and not stream.server_done
+            and stream.stream_id >= 0 and proto is not None):
+        try:
+            proto._quic.stop_stream(stream.stream_id, 0)
+            proto.transmit()
+        except Exception:
+            pass
+    _resume_if_dry(conn)          # duraklatan akis gitti: okuma acilabilir
 
 
 def _conn_dead(conn: _Conn, err: BaseException, broken: bool = True) -> None:
@@ -708,6 +779,9 @@ def _protocol_class():
                     stream.on_headers(ev.headers)
                 elif data:
                     stream.feed(data)
+                    _note_buffered(conn)
+                    if stream.buffered >= STREAM_BUFFER:
+                        conn.pause()      # okur yetismiyor: okumayi durdur
                 if getattr(ev, "stream_ended", False):
                     stream.end()
 
@@ -751,7 +825,10 @@ class _Session:
         fut = asyncio.run_coroutine_threadsafe(self._open(), self._loop)
         try:
             fut.result(self._connect_timeout)
-        except TimeoutError:
+        except concurrent.futures.TimeoutError:
+            # 3.9/3.10'da concurrent.futures.TimeoutError ayri bir siniftir
+            # (builtin TimeoutError degil): yakalanmazsa istek iptal
+            # edilmez, sonradan akis kaydeder ve slot sizdirirdi
             fut.cancel()
             self._release(reset=True)
             mark_broken(self.url)
@@ -821,8 +898,24 @@ class _Session:
             self._release()       # okur bitti: akis kaydi kapanabilir
         else:
             self._buf += item
+            stream = self._stream
+            if stream is not None:
+                stream.take_buffered(len(item))
+                if stream.conn is not None and stream.conn.paused:
+                    self._maybe_resume()
 
     # --- akis yasami ---------------------------------------------------
+    def _maybe_resume(self) -> None:
+        """Tampon eridi: baglanti okumasi (geri basinc) acilabilir."""
+        conn = self._stream.conn if self._stream is not None else None
+        loop = self._loop
+        if conn is None or not conn.paused or loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(_resume_if_dry, conn)
+        except RuntimeError:
+            pass
+
     def _release(self, reset: bool = False) -> None:
         """Akis kaydini birakir (olay dongusunde calisir)."""
         stream, loop = self._stream, self._loop
@@ -857,6 +950,10 @@ class _Session:
             self._queue = stream.queue
         try:
             conn = await _conn_get(self.url, self.opt, self._target)
+            if stream.reader_done:
+                # start() zaman asimi ile akisi birakti: kaydetme, yoksa
+                # kimsenin kapatmayacagi bir akis slotu kalirdi
+                raise H3Error("h3: istek birakildi")
             stream.conn = conn
             stream.stream_id = conn.proto._quic.get_next_available_stream_id()
             conn.streams[stream.stream_id] = stream
