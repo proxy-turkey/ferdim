@@ -125,20 +125,23 @@ class HostProfiles:
                 del self._data[host]
 
     def _load_locked(self, now: float) -> dict[str, dict]:
-        """Dosyayi bir kez okur; bozuk dosya bos depo sayilir."""
-        if self._data is not None:
-            return self._data
-        raw = util.read_json(self.path)
-        hosts = raw.get("hosts") if isinstance(raw, dict) else None
-        data: dict[str, dict] = {}
-        if isinstance(hosts, dict):
-            for host, val in hosts.items():
-                rec = _entry(val)
-                if isinstance(host, str) and host and rec is not None:
-                    data[host.lower()] = rec
-        self._data = data
+        """Dosyayi bir kez okur; bozuk dosya bos depo sayilir.
+
+        Prune her okumada calisir: suresi dolan ana makine, araya bir
+        record() girmeden de get()/hosts() sonucunda GORUNMEZ.
+        """
+        if self._data is None:
+            raw = util.read_json(self.path)
+            hosts = raw.get("hosts") if isinstance(raw, dict) else None
+            data: dict[str, dict] = {}
+            if isinstance(hosts, dict):
+                for host, val in hosts.items():
+                    rec = _entry(val)
+                    if isinstance(host, str) and host and rec is not None:
+                        data[host.lower()] = rec
+            self._data = data
         self._prune_locked(now)
-        return data
+        return self._data
 
     def _save_locked(self) -> None:
         assert self._data is not None

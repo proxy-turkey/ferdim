@@ -1188,13 +1188,16 @@ class DownloadJob:
         if not prof:
             return
         try:
-            links = min(int(prof.get("links") or 0), self._ceiling_locked())
+            links = int(prof.get("links") or 0)
         except (TypeError, ValueError):
             return
         if links < 1:
             return
-        with self._lock:
-            self._allowed = max(1, links)
+        # tavan AYNI kilit altinda okunur ve uygulanir: araya giren
+        # set_external_cap (birlikte yasam) is tavani asamaz
+        with self._cond:
+            links = max(1, min(links, self._ceiling_locked()))
+            self._allowed = links
             if self._allowed < self._seg_max:
                 self.extra["adaptive"] = self._allowed
                 self.extra["adaptive_reason"] = "learned"
@@ -1205,6 +1208,7 @@ class DownloadJob:
                 self._gov["next_up"] = now + 60.0
             for s in self._srcs:
                 s.cap = max(1, self._allowed)
+            self._cond.notify_all()
 
     def _report_profile(self) -> None:
         """Olculen degeri ana makine profiline bildirir (bitis/duraklama).

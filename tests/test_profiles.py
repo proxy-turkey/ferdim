@@ -135,6 +135,16 @@ class StoreTests(unittest.TestCase):
         # suresi dolan kayit yeni depoda da yok (dosyada temizlendi)
         self.assertIsNone(HostProfiles(env).get("eski.test"))
 
+    def test_expiry_applies_on_read_without_a_write(self):
+        """Okuma da suresi dolani gizler: araya record() girmesi gerekmez."""
+        now = [1000.0]
+        _env, store = make_store(self, now_fn=lambda: now[0])
+        store.record("eski.test", links=4)
+        self.assertEqual(len(store.hosts()), 1)
+        now[0] += 91 * DAY
+        self.assertEqual(store.hosts(), [])          # yazim yok, yine de bos
+        self.assertIsNone(store.get("eski.test"))
+
     def test_store_is_bounded_lru(self):
         now = [1000.0]
         _env, store = make_store(self, max_hosts=3, now_fn=lambda: now[0])
@@ -220,6 +230,25 @@ class JobSeedTests(unittest.TestCase):
         job._allowed = 3                            # gercek olcum daraltti
         job._seed_profile()                         # ikinci kesif yok
         self.assertEqual(job._allowed, 3)
+
+    def test_seed_respects_external_cap(self):
+        """Birlikte yasam tavani tohumdan once kurulduysa asilmaz."""
+        job, env = make_job(self, segments=16)
+        open_profiles(env).record("ornek.test", links=9)
+        job.set_external_cap(3)
+        job._seed_profile()
+        self.assertLessEqual(job._allowed, 3)
+        self.assertEqual(job._allowed, 3)
+        self.assertLessEqual(job.snapshot()["segments_effective"], 3)
+        # tavan isin mevcut baglanti sayisinin altinda kalmazsa da
+        # tohum AYNI kilit altinda tavana kirpilir
+        job2, env2 = make_job(self, segments=16)
+        job2._allowed = 2                      # ceza isareti kurulmaz
+        job2.set_external_cap(3)
+        open_profiles(env2).record("ornek.test", links=9)
+        job2._seed_profile()
+        self.assertEqual(job2._allowed, 3)
+        self.assertLessEqual(job2._allowed, job2._ceiling_locked())
 
     def test_learn_hosts_false_disables_seed(self):
         job, env = make_job(self, segments=16)
