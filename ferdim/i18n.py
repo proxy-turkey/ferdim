@@ -227,6 +227,12 @@ S = {
     "ext_state":      {"en": "Add-on", "tr": "Eklenti", "es": "Extensión", "ru": "Расширение"},
     "add_failed":     {"en": "Could not add:", "tr": "Eklenemedi:", "es": "No se pudo añadir:", "ru": "Не удалось добавить:"},
     "warn_dir":       {"en": "Downloads folder could not be created; the default folder is used.", "tr": "İndirme dizini oluşturulamadı; varsayılan dizin kullanılıyor.", "es": "No se pudo crear la carpeta de descargas; se usa la carpeta predeterminada.", "ru": "Не удалось создать папку загрузок; используется папка по умолчанию."},
+    # ------------------------------------------------- 1.11 state: kurtarma
+    "warn_state": {
+        "en": "Saved state was damaged and has been recovered. Damaged copies are kept next to it.",
+        "tr": "Kayıtlı durum bozuktu ve kurtarıldı. Bozuk kopyalar yanında saklanıyor.",
+        "es": "El estado guardado estaba dañado y se ha recuperado. Las copias dañadas se conservan junto a él.",
+        "ru": "Сохранённое состояние было повреждено и восстановлено. Повреждённые копии сохранены рядом."},
     "limit_custom":   {"en": "custom", "tr": "özel", "es": "personalizado", "ru": "свой"},
     "cli_bad_checksum": {
         "en": "invalid checksum (use algo:digest or a hex digest)",

@@ -75,6 +75,55 @@ DEFAULTS = {
 }
 
 
+CONFIG_VERSION = 1          # config.json sema surumu
+
+
+def _config_migration_1(raw: dict) -> None:
+    """v1: ilk surum - 'version' alani; eski dosya duz bir sozluktu."""
+
+
+# ileri goc: her adim bir onceki surumun uzerine ekler (history.py gibi)
+CONFIG_MIGRATIONS = {1: _config_migration_1}
+
+
+def _migrate_config(raw: dict) -> dict:
+    """config.json'u sirali goclardan gecirir; bilinmeyen anahtarlar korunur.
+
+    Surum alani olmayan dosya v0 sayilir. Dosya bizden YENI bir surum
+    tasiyorsa (v > CONFIG_VERSION) goc calistirilmaz: bilinen anahtarlar
+    okunur, bilinmeyenler oldugu gibi birakilir (ileri uyumluluk).
+    """
+    raw = dict(raw)
+    try:
+        version = max(0, int(raw.get("version") or 0))
+    except (TypeError, ValueError):
+        version = 0
+    while version < CONFIG_VERSION:
+        CONFIG_MIGRATIONS[version + 1](raw)
+        version += 1
+        raw["version"] = version
+    return raw
+
+
+def fsync_dir(path: Path) -> None:
+    """Dizini fsync eder: os.replace sonrasi ad degisikligi diske iner.
+
+    Dosya icerigi ayrica fsync edilir (atomic_write_json / save_config);
+    dizin kaydi de inmezse guc kesintisinde eski ad gorulebilir. Dizine
+    fsync desteklemeyen dosya sistemlerinde sessizce gecilir.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _xdg(env_var: str, default: str) -> Path:
     return Path(os.environ.get(env_var) or Path.home() / default).expanduser()
 
@@ -122,6 +171,8 @@ class AppEnv:
         self.socket_path = self.state_dir / "ferdim.sock"
         self.token_path = self.state_dir / "token"
         self.pid_path = self.state_dir / "ferdim.pid"
+        # tek ornek kilidi: daemon omru boyunca flock ile tutulur
+        self.lock_path = self.state_dir / "ferdim.lock"
         self.port_path = self.state_dir / "port"
         self.jobs_dir = self.state_dir / "jobs"
         self.log_path = self.state_dir / "ferdim.log"
@@ -151,20 +202,32 @@ class AppEnv:
 
     # --- config ----------------------------------------------------------
     def load_config(self) -> dict:
+        """Varsayilanlar + dosya; dosya surum gocunden gecer.
+
+        Bozuk dosya varsayilanlara duser (kuyruk gibi karantinaya alinmaz:
+        config yeniden yazilabilir bir tercih dosyasidir). Dondurulen sozluk
+        'version' tasir; bilinmeyen anahtarlar korunur.
+        """
         cfg = dict(DEFAULTS)
         if self.config_path.exists():
             try:
-                cfg.update(json.loads(self.config_path.read_text("utf-8")))
+                raw = json.loads(self.config_path.read_text("utf-8"))
             except Exception:
-                pass
+                raw = None
+            if isinstance(raw, dict):
+                cfg.update(_migrate_config(raw))
+        cfg.setdefault("version", CONFIG_VERSION)
         return cfg
 
     def save_config(self, cfg: dict) -> None:
         """Atomik + 0600 yazim: config.json kimlik bilgisi tasiyabilir ve
         umask ne olursa olsun yalniz kullaniciya acik kalmali. Gecici dosya
         O_EXCL ile acilir; yarim kalan eski gecici temizlenir. Bicim insan
-        tarafindan okunabilir kalir (indent=2)."""
-        data = json.dumps(cfg, indent=2, ensure_ascii=False)
+        tarafindan okunabilir kalir (indent=2). Dosya ve dizin fsync edilir:
+        guc kesintisi yarim/eski config birakmaz."""
+        out = dict(cfg)
+        out.setdefault("version", CONFIG_VERSION)
+        data = json.dumps(out, indent=2, ensure_ascii=False)
         with _CONFIG_LOCK:
             self.config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             tmp = self.config_path.with_suffix(self.config_path.suffix + ".tmp")
@@ -182,7 +245,10 @@ class AppEnv:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     fd = -1
                     f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
             finally:
                 if fd >= 0:
                     os.close(fd)
             os.replace(tmp, self.config_path)
+            fsync_dir(self.config_dir)

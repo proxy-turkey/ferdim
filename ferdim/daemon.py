@@ -1,10 +1,12 @@
 """FerDim daemon: socket RPC + HTTP API + kuyruk yonetimi."""
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import secrets
 import signal
+import sys
 import threading
 
 from . import __version__
@@ -15,6 +17,23 @@ from .server import SockServer, make_server
 
 # 1.7.1 oncesi token index.html'e gomuluyordu: yukseltmede bir kez yenilensin
 TOKEN_MARKER = "token.v2"
+
+
+def instance_lock(env) -> int | None:
+    """Tek daemon kilidi: durum dizininde flock(LOCK_EX|LOCK_NB).
+
+    Basariliysa acik fd doner (daemon omru boyunca tutulur); baska bir
+    daemon kilitliyse None. Bayat bir PID dosyasi iki daemon'un ayni
+    soketi/durumu paylasmasina yol acamaz: kilit cekirdekte tutulur ve
+    surec olunce kendiliginden duser.
+    """
+    fd = os.open(env.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
 
 
 def ensure_token(env) -> str:
@@ -86,15 +105,17 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger("ferdim")
 
-    # ayni anda tek daemon
-    try:
-        pid = int(env.pid_path.read_text())
-        os.kill(pid, 0)
-        import sys
-        print("FerDim daemon zaten calisiyor (pid %d)" % pid, file=sys.stderr)
+    # ayni anda tek daemon: durum dizini kilidi (bayat PID iki daemon
+    # baslatamaz). PID dosyasi arayuz/testler icin yazilmaya devam eder.
+    lock_fd = instance_lock(env)
+    if lock_fd is None:
+        holder = ""
+        try:
+            holder = " (pid %d)" % int(env.pid_path.read_text())
+        except (OSError, ValueError):
+            pass
+        print("FerDim daemon zaten calisiyor" + holder, file=sys.stderr)
         return 1
-    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
-        pass
     env.pid_path.write_text(str(os.getpid()))
 
     token = ensure_token(env)
@@ -196,6 +217,7 @@ def main() -> int:
             web_srv.shutdown()
         env.socket_path.unlink(missing_ok=True)
         env.pid_path.unlink(missing_ok=True)
+        os.close(lock_fd)               # kilit dosyasi kalir; flock duser
         log.info("FerDim durduruldu")
     return 0
 

@@ -23,6 +23,7 @@ let jobs = [], cfg = {}, filter = "all", lastStats = {};
 let histTimer = 0;          // gecmis aramasi icin bekleme
 let states = new Map();     // is kimligi -> onceki durum (duyuru icin)
 let primed = false;         // ilk tarama yapildi mi (ilk tarama duyurulmaz)
+let stateWarned = false;    // durum kurtarma uyarisi bir kez gosterilir
 let polling = false;
 const rows = new Map();     // is kimligi -> satir ogeleri
 const histSpeed = [];       // toplam hiz ornekleri (ring)
@@ -497,6 +498,11 @@ async function poll() {
     if (s && s.ok) {
       jobs = s.jobs || []; lastStats = s; fresh = true;
       conn.textContent = "● " + tr("daemon_ok"); conn.className = "conn ok";
+      // bozuk durum dosyasindan kurtarma: bir kez, kalici bir bildirim
+      if (s.warning === "state_recovered" && !stateWarned) {
+        stateWarned = true;
+        notice(tr("warn_state"));
+      }
     } else {
       conn.textContent = "● " + tr("daemon_down"); conn.className = "conn bad";
     }

@@ -1,6 +1,8 @@
 """QueueManager: eszamanli is siniri, zamanlama penceresi, kalici kuyruk."""
 from __future__ import annotations
 
+import logging
+import os
 import threading
 import time
 
@@ -11,7 +13,65 @@ from ..paths import AppEnv
 from .job import DownloadJob, JobSpec, JobState
 
 QUEUE_FILE = "queue.json"
+QUEUE_PREV = "queue.json.prev"     # son iyi kopya (bozuk ana dosyanin yedegi)
+QUEUE_ITEM_VERSION = 1             # kayit sema surumu (dosya duz liste kalir)
 STATES_RUNNING = (JobState.CONNECTING, JobState.DOWNLOADING)
+
+log = logging.getLogger("ferdim.queue")
+
+# Bilinen kayit alanlari. Disinda kalan anahtarlar (bizden yeni surum)
+# is uzerinde saklanir ve yeniden yazimda aynen korunur.
+_QUEUE_FIELDS = frozenset({
+    "v", "id", "url", "filename", "dir", "segments", "headers", "cookies",
+    "user", "password", "proxy", "insecure", "http3", "referer", "ua",
+    "kind", "state", "created", "active", "mirrors", "checksums", "merkle",
+    "limit", "ephemeral",
+})
+
+
+def _queue_migration_1(rec: dict) -> None:
+    """v1: kayit duzeyinde surum alani; eski kayitlarda 'v' yok."""
+
+
+# ileri goc: her adim bir onceki surumun uzerine ekler (history.py gibi)
+QUEUE_MIGRATIONS = {1: _queue_migration_1}
+
+
+def _migrate_record(rec: dict) -> dict:
+    """Tek kuyruk kaydini sirali goclardan gecirir.
+
+    Surum alani olmayan kayit v0 sayilir. Bizden yeni surum (v >
+    QUEUE_ITEM_VERSION) goc ettirilmez: bilinen alanlar en iyi cabayla
+    okunur, bilinmeyenler korunur (ileri uyumluluk).
+    """
+    rec = dict(rec)
+    try:
+        version = max(0, int(rec.get("v") or 0))
+    except (TypeError, ValueError):
+        version = 0
+    while version < QUEUE_ITEM_VERSION:
+        QUEUE_MIGRATIONS[version + 1](rec)
+        version += 1
+        rec["v"] = version
+    return rec
+
+
+def _int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _text(value) -> str:
+    return value if isinstance(value, str) else ""
 
 
 def _scrub_ephemeral(rec: dict) -> None:
@@ -54,6 +114,8 @@ class QueueManager:
         self._hist_state: dict[str, str] = {}   # is -> yazilmis son durum
         # saklama suresi (gun): 0 = sonsuza kadar; hata kuyrugu durdurmaz
         self.history.prune(cfg.get("history_days", 365))
+        self.state_warning = ""      # arayuze bildirilen durum kurtarma kodu
+        self._rotate_ok = True       # ana dosya -> .prev donusumu guvenli mi
         self._load()
         self._running = True
         self._size_probed: set[str] = set()
@@ -524,7 +586,9 @@ class QueueManager:
     def _save_locked(self):
         data = []
         for j in self.jobs:
-            rec = {
+            # onceki dosyadan gelen bilinmeyen alanlar korunur (ileri surum)
+            rec = dict(getattr(j, "_rec_extra", None) or {})
+            rec.update({
                 "id": j.id, "url": j.url, "filename": j.final_filename,
                 # hedef klasor her zaman yazilir: varsayilan indirme
                 # klasoru degisse de is yeniden yuklenince yerini korur
@@ -545,58 +609,184 @@ class QueueManager:
                 "merkle": j.spec.merkle,
                 "limit": int(j.spec.limit or 0),
                 "ephemeral": bool(j.spec.ephemeral),
-            }
+            })
             if rec["ephemeral"]:
                 _scrub_ephemeral(rec)
+            # daha yeni bir surumden yuklendiyse surum numarasi dusurulmez
+            rec["v"] = max(QUEUE_ITEM_VERSION,
+                           _int(getattr(j, "_rec_version", 0), 0))
             data.append(rec)
-        util.atomic_write_json(self.env.state_dir / QUEUE_FILE, data)
+        path = self.env.state_dir / QUEUE_FILE
+        if self._rotate_ok and path.exists():
+            # son iyi kopya: ana dosya once .prev'e tasinir (ad degisikligi,
+            # kopya degil). Cokme iki ad arasinda olursa _load .prev'e duser.
+            try:
+                os.replace(path, path.with_name(QUEUE_PREV))
+            except OSError:
+                pass
+        util.atomic_write_json(path, data)
+
+    # -------------------------------------------------- bozuk durum kurtarma
+    def _warn_state(self, msg: str) -> None:
+        """Durum kurtarma kodunu arayuze isaretler (stats 'warning')."""
+        self.state_warning = "state_recovered"
+        log.warning("%s", msg)
+
+    def _quarantine(self, path) -> None:
+        """Bozuk kuyruk dosyasini zaman damgali adla saklar.
+
+        Var olan bir .bad dosyasinin uzerine asla yazilmaz; ayni saniyede
+        ikinci cagri sayacla ayrisir. Dosya tasinamazsa silinir; o da
+        olmazsa .prev donusumu kapatilir (bozuk kopya iyi yedegi ezmesin).
+        """
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        bad = path.with_name(f"{path.name}.bad-{stamp}")
+        n = 1
+        while bad.exists():
+            bad = path.with_name(f"{path.name}.bad-{stamp}-{n}")
+            n += 1
+        try:
+            os.replace(path, bad)
+        except OSError as exc:
+            try:
+                path.unlink()
+            except OSError:
+                self._rotate_ok = False
+            log.warning("bozuk kuyruk karantinaya alinamadi: %s", exc)
 
     def _load(self):
-        data = util.read_json(self.env.state_dir / QUEUE_FILE) or []
+        """Kuyrugu diskten yukler; bozuk kayit tum kuyrugu dusurmez.
+
+        Sirasi: ana dosya -> son iyi kopya (.prev) -> bos kuyruk. Ana dosya
+        ayristirilamazsa zaman damgali .bad kopyasi saklanir ve arayuze
+        'state_recovered' uyarisi cikar. Her kayit tek tek dogrulanir:
+        kullanilamaz kayit atlanir ve loglanir, digerleri yuklenir.
+        """
+        path = self.env.state_dir / QUEUE_FILE
+        prev = path.with_name(QUEUE_PREV)
+        data: list = []
+        if path.exists():
+            raw = util.read_json(path)
+            if isinstance(raw, list):
+                data = raw
+            else:
+                self._quarantine(path)
+                self._warn_state("kuyruk dosyasi bozuk; karantinaya alindi")
+                data = self._load_prev(prev)
+        elif prev.exists():
+            # atomik yazim iki ad arasinda kesildiyse ana dosya yoktur
+            self._warn_state("kuyruk dosyasi eksik; son iyi kopya yuklendi")
+            data = self._load_prev(prev)
+        skipped = 0
         for item in data:
-            if not isinstance(item, dict):
+            job = self._job_from_record(item)
+            if job is None:
+                skipped += 1
                 continue
-            checks = util.normalize_checksums(item.get("checksums") or {})
-            spec = JobSpec(
-                url=item.get("url", ""),
-                filename=item.get("filename", ""),
-                directory=item.get("dir", ""),
-                segments=int(item.get("segments", 8)),
-                headers=item.get("headers") or {},
-                cookies=item.get("cookies", ""),
-                user=item.get("user", ""), password=item.get("password", ""),
-                proxy=item.get("proxy", ""), insecure=bool(item.get("insecure")),
-                http3=str(item.get("http3") or ""),
-                referer=item.get("referer", ""), user_agent=item.get("ua", ""),
-                mirrors=[m for m in (item.get("mirrors") or [])
-                         if isinstance(m, str)
-                         and m.startswith(("http://", "https://"))],
-                sha256=checks.get("sha256", ""),
-                md5=checks.get("md5", ""),
-                checksums={a: v for a, v in checks.items()
-                           if a not in ("sha256", "md5")},
-                limit=int(item.get("limit", 0) or 0),
-                merkle=str(item.get("merkle") or ""),
-                # ozel pencere kaydi cerezsiz saklanir (bkz. _scrub_ephemeral)
-                ephemeral=bool(item.get("ephemeral")),
-            )
-            job = DownloadJob(self.env, self.cfg, spec, job_id=item.get("id"))
-            job.kind = item.get("kind", "http")
-            job.created = item.get("created", time.time())
-            job._active_secs = max(0.0, float(item.get("active", 0) or 0))
-            st = item.get("state")
-            if st in (JobState.DONE,):
-                # dosya yerinde mi?
-                if job.final_path.exists():
-                    job.state = JobState.DONE
-                    job.total = job.done = job.final_path.stat().st_size
-                else:
-                    job.state = JobState.QUEUED
-            elif st in (JobState.PAUSED, JobState.ERROR, JobState.CANCELED):
-                job.state = JobState.PAUSED if st != JobState.CANCELED else JobState.CANCELED
+            self.jobs.append(job)
+        if skipped:
+            self._warn_state(f"{skipped} bozuk kuyruk kaydi atlandi")
+        if self.state_warning:
+            # onarilmis/elenmis kuyrugu hemen diske yaz (uyari tekrar etmesin);
+            # yazim hatasi baslatiyi dusurmez - kuyruk bellekte calismaya devam eder
+            try:
+                self._save()
+            except Exception as exc:
+                log.warning("onarilmis kuyruk yazilamadi: %s", exc)
+
+    def _load_prev(self, prev) -> list:
+        """Son iyi kopyayi okur; o da bozuksa silinir (sonsuz dongu olmasin)."""
+        raw = util.read_json(prev) if prev.exists() else None
+        if isinstance(raw, list):
+            return raw
+        if prev.exists():
+            try:
+                prev.unlink()
+            except OSError:
+                pass
+        return []
+
+    def _job_from_record(self, item) -> DownloadJob | None:
+        """Tek kuyruk kaydindan is uretir; kullanilamaz kayit None (atlanir).
+
+        Alan turleri tek tek dogrulanir: bir kaydin bozuk alani (orn.
+        segments: "abc", headers: liste) tum kuyrugu dusurmemeli. URL'si
+        olmayan kayit indirilemez, atlanir. Bilinmeyen durum 'queued'a duser.
+        """
+        if not isinstance(item, dict):
+            log.warning("kuyruk kaydi sozluk degil: %s",
+                        type(item).__name__)
+            return None
+        rec = _migrate_record(item)
+        url = rec.get("url")
+        if not isinstance(url, str) or not url.strip():
+            log.warning("kuyruk kaydi atlandi: url yok")
+            return None
+        headers = self._record_headers(rec.get("headers"))
+        mirrors = rec.get("mirrors")
+        if headers is None or not isinstance(mirrors, (list, type(None))):
+            log.warning("kuyruk kaydi atlandi: bozuk alan turu")
+            return None
+        checks = util.normalize_checksums(rec.get("checksums") or {})
+        spec = JobSpec(
+            url=url,
+            filename=_text(rec.get("filename")),
+            directory=_text(rec.get("dir")),
+            segments=max(1, _int(rec.get("segments"), 8)),
+            headers=headers,
+            cookies=_text(rec.get("cookies")),
+            user=_text(rec.get("user")), password=_text(rec.get("password")),
+            proxy=_text(rec.get("proxy")), insecure=bool(rec.get("insecure")),
+            http3=_text(rec.get("http3")),
+            referer=_text(rec.get("referer")), user_agent=_text(rec.get("ua")),
+            mirrors=[m for m in (mirrors or [])
+                     if isinstance(m, str)
+                     and m.startswith(("http://", "https://"))],
+            sha256=checks.get("sha256", ""),
+            md5=checks.get("md5", ""),
+            checksums={a: v for a, v in checks.items()
+                       if a not in ("sha256", "md5")},
+            limit=max(0, _int(rec.get("limit"), 0)),
+            merkle=_text(rec.get("merkle")),
+            # ozel pencere kaydi cerezsiz saklanir (bkz. _scrub_ephemeral)
+            ephemeral=bool(rec.get("ephemeral")),
+        )
+        job = DownloadJob(self.env, self.cfg, spec,
+                          job_id=_text(rec.get("id")) or None)
+        job.kind = _text(rec.get("kind")) or "http"
+        job.created = _float(rec.get("created"), time.time())
+        job._active_secs = max(0.0, _float(rec.get("active"), 0.0))
+        # bilinmeyen alanlar ve daha yeni surum numarasi korunur
+        job._rec_extra = {k: v for k, v in rec.items()
+                          if k not in _QUEUE_FIELDS}
+        job._rec_version = max(QUEUE_ITEM_VERSION,
+                               _int(rec.get("v"), QUEUE_ITEM_VERSION))
+        st = rec.get("state")
+        if st in (JobState.DONE,):
+            # dosya yerinde mi?
+            if job.final_path.exists():
+                job.state = JobState.DONE
+                job.total = job.done = job.final_path.stat().st_size
             else:
                 job.state = JobState.QUEUED
-            self.jobs.append(job)
+        elif st in (JobState.PAUSED, JobState.ERROR, JobState.CANCELED):
+            job.state = JobState.PAUSED if st != JobState.CANCELED else JobState.CANCELED
+        else:
+            # bilinmeyen/gelecek durum: guvenli varsayilan kuyrukta bekle
+            job.state = JobState.QUEUED
+        return job
+
+    @staticmethod
+    def _record_headers(raw) -> dict | None:
+        """{ad: deger} sozlugu; None = kayit atlanir (bozuk tur)."""
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            return None
+        try:
+            return {str(k): str(v) for k, v in raw.items()}
+        except (TypeError, ValueError):
+            return None
 
     # ---------------------------------------------------------------- stats
     def stats(self) -> dict:
@@ -618,6 +808,8 @@ class QueueManager:
             "turbo": bool(self.cfg.get("turbo_mode")),
             "coexist": self.coexist_status(),
             "language": self.cfg.get("language", "auto"),
+            # durum dosyasi kurtarildiysa arayuz uyarabilsin ("" = sorun yok)
+            "warning": self.state_warning,
             "version": _version(),
         }
 
