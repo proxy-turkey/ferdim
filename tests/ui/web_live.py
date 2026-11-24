@@ -205,7 +205,10 @@ with sync_playwright() as p:
             j["error"] = '<svg onload="window.__xss=2"></svg>'
             j["state"] = "error"
             j["url"] = 'javascript:window.__xss=3'
-        route.fulfill(response=resp, body=json.dumps(data))
+        try:
+            route.fulfill(response=resp, body=json.dumps(data))
+        except Exception:   # unroute ile yarisan istek: zaten islendi
+            pass
     page.route("**/api/stats", poison)
     page.wait_for_timeout(1300)
     check(" XSS: script calismadi", page.evaluate("window.__xss") is None)
