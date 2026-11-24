@@ -1,7 +1,7 @@
 %global srcname ferdim
 
 Name:           %{srcname}
-Version:        1.6.0
+Version:        1.7.0
 Release:        1%{?dist}
 Summary:        Dynamic self-tuning download manager with Firefox integration
 
@@ -155,6 +155,11 @@ python3 -m unittest discover -s tests -v
 # end of user-unit preun scriptlet
 
 %changelog
+* Tue Nov 24 2026 Enes Aksu <eaksu@pm.me> - 1.7.0-1
+- Manifest V3 extension; host profiles and integrity badges in web and GTK
+- HTTP/3 connection reuse; latency-aware coexistence; speed plan; metrics
+- TCP_INFO congestion awareness; opt-in LAN peer cache; ferdim publish
+- security: Host/Origin checks on the local web server, scoped cookies
 * Tue Nov 24 2026 Enes Aksu <eaksu@pm.me> - 1.6.0-1
 - learned per-host connection profiles; coexistence mode (opt-in)
 - archive browsing: nested ZIP / tar, selective extraction, repair

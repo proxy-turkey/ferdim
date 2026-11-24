@@ -4,7 +4,7 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
-## [Unreleased]
+## [1.7.0] — 2026-11-24
 
 ### Added
 - The Firefox extension is Manifest V3: links are grabbed through the
@@ -58,6 +58,27 @@ semantic versioning.
   longer abort listing or extraction.
 - Deeply nested JSON in a Merkle manifest raised `RecursionError`.
 - Pausing an HLS/DASH download under a speed limit was not synchronous.
+
+### Security
+- The local web server only answers requests addressed to
+  `127.0.0.1`, `localhost` or `[::1]` on its own port, and refuses
+  cross-origin API posts: a DNS-rebinding page can no longer read the API
+  token from the web UI.
+- The extension forwards a site's full cookies only for downloads started
+  from that site; cross-site downloads carry `SameSite=None` cookies only.
+  Only the extension's own pages may trigger grab, download or turbo.
+- Metalink expansion keeps cookies, credentials and custom headers on the
+  document's own https origin; other mirrors and manifest links get none.
+- Alt-Svc is learned only for the final URL of a redirect and cached per
+  verification mode (bounded).
+- `ferdim publish` and Merkle manifests are written through a private
+  temporary file and renamed into place, never through a planted symlink;
+  symlinked artefacts are not published.
+- Peer cache: connection and per-address caps, 10 s socket timeout,
+  streamed responses, beacon flood limits, an absolute prefill deadline,
+  and turning `peer_cache` off stops the node at once.
+- The native messaging bridge accepts the same fields for batch downloads
+  as for single ones and survives malformed frames.
 
 ## [1.6.0] — 2026-11-24
 

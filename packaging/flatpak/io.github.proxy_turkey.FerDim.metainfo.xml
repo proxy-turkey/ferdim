@@ -46,6 +46,16 @@
   </screenshots>
 
   <releases>
+    <release version="1.7.0" date="2026-11-24">
+      <description>
+        <p>
+          Manifest V3 browser extension, time-of-day speed plan, a local
+          metrics endpoint, congestion-aware link scaling, HTTP/3 connection
+          reuse, an opt-in LAN peer cache and hardening of the local web
+          server.
+        </p>
+      </description>
+    </release>
     <release version="1.6.0" date="2026-11-24">
       <description>
         <p>

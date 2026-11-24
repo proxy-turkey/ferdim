@@ -5,7 +5,7 @@ Fedora-first, with a Firefox WebExtension. The engine, CLI and daemon
 are **Python stdlib only** — no pip dependencies, ever. The web UI is
 dependency-free vanilla JS. The extension is Manifest V3.
 
-State at authorship: **1.6.0 released**; test suite green (381 tests),
+State at authorship: **1.7.0 released**; test suite green (685 tests),
 `web-ext lint` 0 errors / 0 warnings, UI smoke checks green
 (`bash tests/ui/run.sh all`), `rpmlint` 0/0, `fedora-review` no failed
 checks, mock builds cleanly on Fedora 43.
