@@ -21,7 +21,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from .. import cdc, util
+from .. import cdc, tcpinfo, util
 from ..coexist import LatencySignal
 from ..paths import AppEnv
 from ..profiles import host_key, open_profiles
@@ -37,6 +37,9 @@ SIDECAR_ALGOS = ("sha256", "sha512", "md5", "sha1")   # en gucluden
 SIDECAR_WAIT = 5.0         # sn: bitiste henuz aranan yan dosya bu kadar beklenir
 PROFILE_MIN_BYTES = 1 << 20   # daha az aktarim profil ogrenmek icin yetersiz
 MERKLE_REPAIR_MAX = 2      # bozuk parca onarim turu (sonra merkle_mismatch)
+TCP_SAMPLE_BYTES = 4 << 20  # TCP_INFO ornekleme araligi (link basina)
+CONGESTION_UP_BACKOFF = 30.0  # sn: tikaniklik tavaninda yukari kesif arasi
+CONGESTION_GAIN = 1.05     # "+1 link" kazanci esigi (altinda kazanc yok)
 
 
 def backoff_delay(attempt: int, cap: float = 15.0,
@@ -355,6 +358,10 @@ class DownloadJob:
         self._safe_links = 0       # 429/503 sonrasi sunucunun kabul ettigi sayi
         # gecikme sinyali (birlikte yasam): aralik isteklerinin TTFB'si
         self._lat = LatencySignal()
+        # tikaniklik sinyali (2.x): cekirdek TCP_INFO ornekleri (istege
+        # bagli; kapaliyken governor davranisi birebir eskisi gibi kalir)
+        self._tcp_on = bool(cfg.get("tcp_info", True))
+        self._cong = tcpinfo.CongestionSignal()
         self._reset_sources()
 
     # ----------------------------------------------------------------- durum
@@ -678,6 +685,7 @@ class DownloadJob:
         except (TypeError, ValueError):
             self._stall = 20
         self._load_merkle(opt)
+        self._peer_prefill(opt)     # esbaz onbellegi (istege bagli): eksik parcalar
         self._start_sidecar(opt)
 
     def _fresh_start(self, p: httpcli.ProbeResult):
@@ -826,6 +834,8 @@ class DownloadJob:
                     self.extra["adaptive"] = n
                 else:
                     self.extra.pop("adaptive", None)
+                    if self.extra.get("adaptive_reason") == "congestion":
+                        self.extra.pop("adaptive_reason", None)
                 self._cond.notify_all()
 
     def _start_probe(self, direction: int, ema: float, now: float) -> None:
@@ -839,6 +849,19 @@ class DownloadJob:
             g["next_up"] = now + (25.0 if ema < g["best"] * 0.8 else 45.0)
         else:
             g["next_down"] = now + 20.0
+
+    def _congested(self) -> bool:
+        """Kernel TCP_INFO tikaniklik sinyali (kapaliyken daima False)."""
+        return bool(self._tcp_on and self.kind == "http"
+                    and self._cong.congested())
+
+    def _flag_congestion_locked(self) -> None:
+        """Tikaniklik tavanini gorunur kilar (birlikte yasam nedenini ezmez)."""
+        if self.extra.get("adaptive_reason") == "coexist":
+            return
+        if self._allowed < self._seg_max:
+            self.extra["adaptive"] = self._allowed
+            self.extra["adaptive_reason"] = "congestion"
 
     def _governor_tick(self):
         """2.5 sn'de bir: toplam hizi olc, baglanti sayisini kalibre et.
@@ -878,6 +901,16 @@ class DownloadJob:
                 # esnek esik: anlik dalgalanmalar (CPU/wifi) kesfi yanlis
                 # reddetmesin; gercek kayip belirginse geri alinir
                 accept = sample > 0 and ema >= g["ref_speed"] * 0.85
+                gain = sample > 0 and ema > g["ref_speed"] * CONGESTION_GAIN
+                if g["dir"] > 0 and accept and not gain and self._congested():
+                    # ek baglanti hiz getirmedi + yeniden iletim/RTT
+                    # tirmandi: bunu bir tavan say (varsayilan davranis
+                    # yalnizca tcp_info acikken bu kadar muhafazakar)
+                    self._set_allowed(g["ref_allowed"])
+                    g["cooldown"] = now + 15.0
+                    g["next_up"] = now + CONGESTION_UP_BACKOFF
+                    self._flag_congestion_locked()
+                    return
                 if accept:
                     g["best"] = max(g["best"], ema)
                     g["best_workers"] = self._allowed
@@ -895,10 +928,18 @@ class DownloadJob:
 
             if now < g["cooldown"]:
                 return
+            cong = self._congested()
+            if cong:
+                # tikaniklik varken yukari kesif yok; asagi kesif kosulu
+                # (ema >= best*0.9) degismeden calisir
+                g["next_up"] = max(g["next_up"], now + CONGESTION_UP_BACKOFF)
+                self._flag_congestion_locked()
+            elif self.extra.get("adaptive_reason") == "congestion":
+                self.extra.pop("adaptive_reason", None)
             limit_free = (now - self._last_limit_ts) > 60.0
             allowed = self._allowed
-            if allowed < self._ceiling_locked() and limit_free and (
-                    ema < g["best"] * 0.8 or now >= g["next_up"]):
+            if allowed < self._ceiling_locked() and limit_free and not cong \
+                    and (ema < g["best"] * 0.8 or now >= g["next_up"]):
                 self._start_probe(+1, ema, now)
             elif (ema >= g["best"] * 0.9
                   and allowed > max(2, self._server_floor)
@@ -913,6 +954,7 @@ class DownloadJob:
         duraklatilip devam edilen is, onceki denemede olumlu sayilan
         aynalari yeniden dener."""
         seen, srcs = set(), []
+        self._cong.reset()          # kaynaklar tazelenir: eski link ornekleri gecersiz
         for i, u in enumerate([self.url] + list(self.spec.mirrors or [])):
             if not isinstance(u, str) \
                     or not u.startswith(("http://", "https://")) or u in seen:
@@ -1379,6 +1421,24 @@ class DownloadJob:
                 raise SourceInvalid("farkli dosya (boyut/aralik)", "size_mismatch")
         return resp
 
+    def _sample_tcp(self, resp, wid: int) -> None:
+        """Range yanitinin soketinden TCP_INFO ornegi alir (ucuz, hata yutmaz).
+
+        h3 (QUIC) yanitinda TCP soketi yoktur; ornek atlanir. Ornekleme
+        kapaliysa (`tcp_info=false`) hicbir sey yapilmaz: governor birebir
+        eski davranista kalir."""
+        if not self._tcp_on or self.kind != "http":
+            return
+        try:
+            sock = httpcli.response_socket(resp)
+            if sock is None:
+                return
+            info = tcpinfo.read(sock)
+            if info:
+                self._cong.add((wid, id(sock)), info, time.monotonic())
+        except Exception:
+            pass
+
     def _process_range(self, rng, opt, wid: int = -1,
                        gen: int | None = None) -> tuple[float, bool]:
         """Bir aralik isler. (cooldown, cikis) dondurur.
@@ -1427,6 +1487,7 @@ class DownloadJob:
                 if gen == self._gen:
                     self._lat.add(host_key(src.url),
                                   time.monotonic() - t_open)
+                    self._sample_tcp(resp, wid)
             except SourceInvalid as ex:
                 # ayna baska dosya veriyor / Range desteklemiyor: isi bastan
                 # baslatmak YANLIS olur (sonsuz restart dongusu); ayna elenir,
@@ -1514,6 +1575,7 @@ class DownloadJob:
             with self._lock:
                 src.active += 1
             nbytes = 0
+            next_tcp = TCP_SAMPLE_BYTES
             progressed = False
             win_t = time.monotonic()
             win_b = 0
@@ -1546,6 +1608,10 @@ class DownloadJob:
                         self._inflight[wid] = (cursor, e)
                     nbytes += len(chunk)
                     win_b += len(chunk)
+                    if nbytes >= next_tcp:
+                        # tikaniklik sinyali: link basina ~4 MB'da bir ornek
+                        self._sample_tcp(resp, wid)
+                        next_tcp += TCP_SAMPLE_BYTES
                     if not progressed and nbytes >= (1 << 20):
                         # belirgin ilerleme: basarisizlik serisi sifirlanir
                         progressed = True
@@ -1676,6 +1742,61 @@ class DownloadJob:
         except Exception as e:
             raise MerkleError(f"merkle bildirimi okunamadi: {e}") from e
         self._merkle_auto = False      # acikca verilen bildirim: kesin
+
+    # ------------------------------------------------------ LAN esbaz onbellegi
+    def _peer_prefill(self, opt) -> None:
+        """Merkle parcalarini once LAN esbazlarindan doldurur (istege bagli).
+
+        Yalnizca TAMAMEN bekleyen bir araliga dusen parcalar denenir; her
+        parca SHA-256 ile dogrulanmadan .part'a yazilmaz (esbazlar
+        guvenilmez). Esbaz yoksa, bildirim yoksa ya da hata olursa indirme
+        normal kaynak araliklariyla aynen surer.
+        """
+        if self.kind != "http" or not bool(self.cfg.get("peer_cache")) \
+                or self._stop.is_set() or self.total <= 0 \
+                or self.extra.get("no_ranges"):
+            return
+        if self._merkle is None:
+            # yan dosya bildirimi normalde arka planda aranir; esbaz
+            # yolundan once kisa bir senkron deneme yapilir (yalnizca bu
+            # ozellik acikken; kapaliyken zamanlama degismez)
+            try:
+                self._merkle_sidecar(opt)
+            except Exception:
+                pass
+        man = self._merkle
+        if man is None or man.size != self.total:
+            return
+        try:
+            from .. import peer
+            filled = peer.open_peer(self.env).fetch_chunks(
+                man, list(self._pending), self._fd, stop=self._stop.is_set)
+        except Exception:
+            return
+        if not filled:
+            return
+        with self._lock:
+            holes = [(off, off + ln - 1) for off, ln in filled]
+            self._pending = peer.subtract_ranges(self._pending, holes)
+            nbytes = sum(ln for _, ln in filled)
+            self.done += nbytes
+            self._gov["done"] = self.done
+            self.extra["peer_chunks"] = int(
+                self.extra.get("peer_chunks", 0)) + len(filled)
+            self.extra["peer_bytes"] = int(
+                self.extra.get("peer_bytes", 0)) + nbytes
+        self._checkpoint(force=True)
+
+    def _peer_index_add(self, dest: Path) -> None:
+        """Merkle ile dogrulanmis bitmis dosyayi esbaz indeksine yazar."""
+        man = self._merkle
+        if man is None or not bool(self.cfg.get("peer_cache")):
+            return
+        try:
+            from .. import peer
+            peer.open_peer(self.env).add_verified(man, dest)
+        except Exception:
+            pass
 
     def _start_sidecar(self, opt):
         """Yan dosya saglamasi: <url>.ferdim-merkle ve <url>.sha256 / .md5 /
@@ -1971,6 +2092,7 @@ class DownloadJob:
         self._fold_threads()
         self._restarts += 1
         self._lat.reset()      # kaynak degisti: eski TTFB tabani anlamsiz
+        self._cong.reset()     # eski TCP_INFO ornekleri de gecersiz
         with self._lock:
             self._restart_needed = False
             self._threads = []
@@ -2097,6 +2219,9 @@ class DownloadJob:
             self._verify(dest, found)
             if self.state != JobState.ERROR and not self._stopped():
                 self._verify_merkle(dest)
+                if self.extra.get("merkle") in ("ok", "repaired"):
+                    # dogrulanmis parcalar esbaz onbellegine yazilir
+                    self._peer_index_add(dest)
             self.extra.pop("verifying", None)
             if self.state != JobState.ERROR and not self._stopped():
                 # duraklat/iptal dogrulama sirasinda geldiyse DONE yazilmaz

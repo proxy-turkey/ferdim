@@ -50,6 +50,16 @@ DEFAULTS = {
     # Kendi baglantilarimizin TTFB sismesi esigi: guncel EMA / taban
     # (1.2-20). Hat doymadan yavaslamayi yakalar.
     "coexist_latency": 2.5,
+    # --- tikaniklik / LAN esbaz onbellegi (2.x) ---
+    # Cekirdek TCP_INFO (RTT, yeniden iletim) governor'a EK tavan sinyali
+    # verir; kapatmak eski davranisi birebir korur.
+    "tcp_info": True,
+    # Esbaz onbellegi istege baglidir: acikken beacon duyurulur ve parca
+    # sunulur. Beacon'lar hangi Merkle koklerine sahip oldugumuzu LAN'a
+    # bildirir; bu yuzden varsayilan kapalidir.
+    "peer_cache": False,
+    "peer_port": 8379,
+    "peer_dirs": [],               # bos = indirme klasoru taranir
 }
 
 

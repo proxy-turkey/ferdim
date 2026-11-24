@@ -18,7 +18,8 @@ MAX_METALINK_FILES = 64
 _MAX_INT = {"segments": (1, 32, 8), "max_concurrent": (1, 32, 8),
             "retries": (0, 20, 5), "timeout": (5, 300, 30),
             "stall_timeout": (5, 120, 20), "web_port": (1024, 65535, 8378),
-            "history_days": (0, 3650, 365)}
+            "history_days": (0, 3650, 365),
+            "peer_port": (1024, 65535, 8379)}
 
 
 def _default_segments(cfg: dict) -> int:
@@ -119,6 +120,16 @@ def _sanitize_config(cfg: dict, env=None) -> None:
             1.2, min(20.0, float(cfg.get("coexist_latency", 2.5))))
     except (TypeError, ValueError):
         cfg["coexist_latency"] = 2.5
+    # 2.x: TCP_INFO tikaniklik sinyali ve LAN esbaz onbellegi (istege bagli)
+    for _k, _default in (("tcp_info", True), ("peer_cache", False)):
+        _v = cfg.get(_k, _default)
+        if isinstance(_v, str):
+            _v = _v.strip().lower() not in ("", "0", "false", "no", "off")
+        cfg[_k] = bool(_v)
+    _peer_dirs = cfg.get("peer_dirs")
+    cfg["peer_dirs"] = [str(d).strip() for d in _peer_dirs
+                        if isinstance(d, str) and d.strip()] \
+        if isinstance(_peer_dirs, list) else []
     dirs = cfg.get("watch_dirs")
     cfg["watch_dirs"] = [d for d in dirs if isinstance(d, str) and d.strip()] \
         if isinstance(dirs, list) else []

@@ -159,6 +159,16 @@ denemeler ve zaman aşımları (\fItimeout\fR, \fIstall_timeout\fR), birlikte
 yaşam modu (\fIcoexist\fR, \fIcoexist_threshold\fR) ve indirme
 geçmişinin saklanma süresi (\fIhistory_days\fR, varsayılan 365 gün,
 \fB0\fR sonsuza kadar saklar).
+Çekirdek tıkanıklık farkındalığı (\fItcp_info\fR, varsayılan açık) her
+bağlantının gidiş-dönüş süresini ve yeniden iletimlerini örnekleyip hız
+denetleyicisine ek bir tavan sinyali verir; \fBfalse\fR önceki davranışı
+birebir geri getirir. İsteğe bağlı LAN eşbaz önbelleği (\fIpeer_cache\fR,
+varsayılan kapalı) aynı ağdaki diğer FerDim makineleriyle doğrulanmış
+Merkle parçalarını \fIpeer_port\fR (varsayılan 8379) üzerinden paylaşır ve
+\fIpeer_dirs\fR içinde bulunan bildirimleri dizinler (boş: indirme
+klasörü). Bir multicast beacon hangi Merkle köklerine sahip olduğumuzu
+duyurduğu için özellik varsayılan kapalıdır; eşbazdan gelen parçalar
+güvenilmez sayılır ve yazılmadan önce SHA-256 ile doğrulanır.
 .TP
 .BI hosts " [\-\-forget SUNUCU | \-\-clear]"
 Öğrenilmiş sunucu bağlantı profillerini gösterir: hız denetleyicisinin
@@ -208,7 +218,8 @@ Web arayüzünü varsayılan tarayıcıda açar.
 Soket, jeton, PID, kuyruk durumu, iş üst verisi ve indirme geçmişi
 veritabanı (\fIhistory.db\fR, kip 0600); öğrenilmiş sunucu profilleri
 \fIhosts.json\fR dosyasındadır (aynı kip, en çok 500 sunucu, 90 günden eski
-kayıtlar silinir).
+kayıtlar silinir) ve LAN eşbaz önbelleği dizini \fIpeer-index.json\fR
+dosyasındadır.
 .TP
 .I ~/.config/ferdim/config.json
 Kullanıcı yapılandırması (bkz. \fBferdim config\fR; geçersiz değerler

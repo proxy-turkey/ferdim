@@ -82,6 +82,17 @@ def main() -> int:
     except Exception as e:
         log.warning("klasor izleyici baslatilamadi: %s", e)
 
+    # LAN esbaz onbellegi (istege bagli): peer_cache kapaliyken no-op.
+    # Acikken parca sunucusu ve beacon'lar burada baslar; kapanista durur.
+    peer_node = None
+    try:
+        from .peer import open_peer
+        peer_node = open_peer(env)
+        if peer_node.start(cfg):
+            log.info("esbaz onbellegi acik (port %s)", peer_node.server.port)
+    except Exception as e:
+        log.warning("esbaz onbellegi baslatilamadi: %s", e)
+
     # masaustu bildirimleri: is bitince/hata verince (arka planda) bildir.
     # Bildirim kapaliysa isci sessizce bekler; config-set ile acilip
     # kapatilabilsin diye kosulsuz baslatilir.
@@ -115,6 +126,8 @@ def main() -> int:
         if notifier is not None:
             notifier.stop()
         qm.shutdown()
+        if peer_node is not None:
+            peer_node.stop()
         from .engine import h3      # paylasilan QUIC dongusu + UDP soketleri
         h3.close_all()
         sock_srv.shutdown()

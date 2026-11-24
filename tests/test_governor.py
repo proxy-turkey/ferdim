@@ -127,6 +127,57 @@ class GovernorTests(unittest.TestCase):
         self.assertEqual(job._server_floor, 4)
         self.assertGreater(job._last_limit_ts, 0.0)
 
+    # ------------------------------------------------ tikaniklik (TCP_INFO)
+    def _inject_congestion(self, job):
+        """Sahte TCP_INFO ornekleri: %10 yeniden iletim + 2x RTT."""
+        t = self.ft.t
+        for dt, rtt, sent, rb in ((4.0, 20_000, 1_000_000, 0),
+                                  (2.0, 40_000, 2_000_000, 100_000),
+                                  (0.0, 40_000, 3_000_000, 200_000)):
+            job._cong.add("link", {
+                "rtt_us": rtt, "total_retrans": rb // 10_000,
+                "segs_out": sent // 1000, "bytes_sent": sent,
+                "bytes_retrans": rb}, now=t - dt)
+
+    def test_congestion_reverts_up_probe_treated_as_ceiling(self):
+        """Ek link hiz getirmedi + tikaniklik: kesif geri alinir, tavan sayilir."""
+        job = make_job(self, segments=6, allowed=2)
+        self._tick(job, 1_000_000)            # probe: 2 -> 3
+        self.assertEqual(job._allowed, 3)
+        self._inject_congestion(job)
+        self.assertTrue(job._congested())
+        self._tick(job, 1_000_000)            # ayni hiz: kazanc yok
+        self.assertEqual(job._allowed, 2)
+        self.assertEqual(job.extra.get("adaptive_reason"), "congestion")
+        self.assertEqual(job.extra.get("adaptive"), 2)
+        self.assertGreaterEqual(job._gov["next_up"],
+                                self.ft.t + jobmod.CONGESTION_UP_BACKOFF - 0.1)
+
+    def test_congestion_skips_next_up_probe(self):
+        """Tikaniklik varken yukari kesif baslatilmaz (asagi kosul korunur)."""
+        job = make_job(self, segments=6, allowed=2)
+        job._gov["best"] = 4_000_000
+        job._gov["best_workers"] = 2
+        job._gov["next_up"] = 0.0
+        job._gov["next_down"] = self.ft.t + 3600
+        self._inject_congestion(job)
+        self._tick(job, 4_000_000)
+        self.assertEqual(job._allowed, 2)
+        self.assertEqual(job.extra.get("adaptive_reason"), "congestion")
+        self.assertGreaterEqual(job._gov["next_up"],
+                                self.ft.t + jobmod.CONGESTION_UP_BACKOFF - 0.1)
+
+    def test_tcp_info_disabled_keeps_previous_behaviour(self):
+        """tcp_info=false: enjekte ornekler bile governor'u etkilemez."""
+        job = make_job(self, segments=6, allowed=2)
+        job._tcp_on = False
+        self._tick(job, 1_000_000)            # probe 2 -> 3
+        self._inject_congestion(job)
+        self.assertFalse(job._congested())
+        self._tick(job, 1_000_000)            # eski kural: sabit hiz kabul
+        self.assertEqual(job._allowed, 3)
+        self.assertNotEqual(job.extra.get("adaptive_reason"), "congestion")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

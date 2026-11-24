@@ -239,6 +239,24 @@ def _open_any(url: str, opt: DlOptions, headers: dict, timeout: float):
     return _open_tcp(url, opt, headers, timeout)
 
 
+def response_socket(resp):
+    """Yanitin altindaki TCP soketi (yoksa None).
+
+    TCP_INFO orneklemesi icin: urllib/http.client yanitinda `fp.raw._sock`
+    gercek sokettir; h3 (QUIC) yanitinda ve sahte yanitlarda TCP soketi
+    yoktur, None doner. Soket bulunamazsa indirme yolu etkilenmez.
+    """
+    if resp is None:
+        return None
+    fp = getattr(resp, "fp", None)
+    raw = getattr(fp, "raw", None)
+    for cand in (getattr(raw, "_sock", None), raw,
+                 getattr(resp, "_sock", None), getattr(resp, "sock", None)):
+        if cand is not None and callable(getattr(cand, "getsockopt", None)):
+            return cand
+    return None
+
+
 def _probe_from(res) -> ProbeResult:
     """Yanit nesnesinden (urllib ya da h3) kaynak ozellikleri."""
     res_probe = ProbeResult()

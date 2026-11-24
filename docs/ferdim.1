@@ -160,6 +160,16 @@ reports failures only), retries and
 timeouts (\fItimeout\fR, \fIstall_timeout\fR), coexistence mode
 (\fIcoexist\fR, \fIcoexist_threshold\fR) and download history
 retention (\fIhistory_days\fR, default 365 days, \fB0\fR keeps forever).
+Kernel congestion awareness (\fItcp_info\fR, default true) samples the
+round-trip time and retransmissions of each link and adds an extra ceiling
+signal to the throughput governor; \fBfalse\fR restores the previous
+behaviour exactly. The opt-in LAN peer cache (\fIpeer_cache\fR, default
+false) shares already-verified Merkle chunks with other FerDim machines on
+the same network over \fIpeer_port\fR (default 8379) and indexes manifests
+found in \fIpeer_dirs\fR (empty: the downloads folder). A multicast beacon
+announces which Merkle roots this machine holds, so the feature is off by
+default; peer chunks are untrusted and every one is verified by SHA-256
+before it is written.
 .TP
 .BI history " [QUERY]"
 Show the persistent job history (SQLite database in the state directory),
@@ -200,7 +210,7 @@ Open the web UI in the default browser.
 Socket, token, PID, queue state, job metadata and the download history
 database (\fIhistory.db\fR, mode 0600); learned host profiles live in
 \fIhosts.json\fR (same mode, at most 500 hosts, entries older than 90
-days are dropped).
+days are dropped) and the LAN peer cache index in \fIpeer-index.json\fR.
 .TP
 .I ~/.config/ferdim/config.json
 User configuration (see \fBferdim config\fR; invalid values are reset to
