@@ -84,6 +84,21 @@ def secure_log(env) -> None:
 
 def main() -> int:
     env = AppEnv()
+
+    # ayni anda tek daemon: durum dizini kilidi (bayat PID iki daemon
+    # baslatamaz). Kilit config/kuyruk okunup YAZILMADAN once alinir:
+    # ikinci ornek birincinin config'ini ezemez. PID dosyasi arayuz ve
+    # testler icin yazilmaya devam eder.
+    lock_fd = instance_lock(env)
+    if lock_fd is None:
+        holder = ""
+        try:
+            holder = " (pid %d)" % int(env.pid_path.read_text())
+        except (OSError, ValueError):
+            pass
+        print("FerDim daemon zaten calisiyor" + holder, file=sys.stderr)
+        return 1
+
     raw = env.load_config()
     cfg = dict(raw)
     # el ile duzenlenmis config.json'daki bozuk degerler (ya da acilamayan
@@ -105,17 +120,6 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger("ferdim")
 
-    # ayni anda tek daemon: durum dizini kilidi (bayat PID iki daemon
-    # baslatamaz). PID dosyasi arayuz/testler icin yazilmaya devam eder.
-    lock_fd = instance_lock(env)
-    if lock_fd is None:
-        holder = ""
-        try:
-            holder = " (pid %d)" % int(env.pid_path.read_text())
-        except (OSError, ValueError):
-            pass
-        print("FerDim daemon zaten calisiyor" + holder, file=sys.stderr)
-        return 1
     env.pid_path.write_text(str(os.getpid()))
 
     token = ensure_token(env)
