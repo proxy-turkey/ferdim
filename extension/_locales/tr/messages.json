@@ -48,6 +48,7 @@
   "hostOk": {"message": "bağlı"},
   "hostOff": {"message": "servis kapalı"},
   "webUi": {"message": "Web arayüzünü aç"},
+  "webUiUnavailable": {"message": "Web arayüzü kullanılamıyor"},
   "notifyStartFail": {"message": "FerDim: indirme başlatılamadı"},
   "notifyServiceOff": {"message": "FerDim: servise ulaşılamıyor"},
   "notifyServiceOffBody": {"message": "FerDim daemon çalışmıyor olabilir. Terminalde 'ferdim daemon' deneyin."}

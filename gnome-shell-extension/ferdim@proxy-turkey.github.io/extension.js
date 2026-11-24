@@ -221,21 +221,24 @@ class FerDimIndicator extends PanelMenu.Button {
     }
 
     _openWebUI() {
-        const state = GLib.getenv('XDG_STATE_HOME') ||
-            GLib.build_filenamev([GLib.get_home_dir(), '.local', 'state']);
-        let port = '8378';
-        try {
-            const [ok, data] = GLib.file_get_contents(
-                GLib.build_filenamev([state, 'ferdim', 'port']));
-            if (ok) {
-                const text = new TextDecoder('utf-8').decode(data).trim();
-                if (text)
-                    port = text;
-            }
-        } catch (e) {
-            // varsayilan port
+        // URL daemon'dan gelir: tek kullanimlik nonce, adres onbelleklenmez.
+        if (!this._proxy) {
+            logError(new Error('FerDim: D-Bus bridge unavailable'));
+            return;
         }
-        Gio.AppInfo.launch_default_for_uri(`http://127.0.0.1:${port}/`, null);
+        this._proxy.call('WebUrl', null, Gio.DBusCallFlags.NONE, -1, null,
+            (proxy, result) => {
+                // disable() sonrasi gec gelen yanit: artikel yok sayilir
+                if (this._proxy === null)
+                    return;
+                try {
+                    const [url] = proxy.call_finish(result).deepUnpack();
+                    if (url)
+                        Gio.AppInfo.launch_default_for_uri(url, null);
+                } catch (e) {
+                    logError(e);
+                }
+            });
     }
 
     // disable() buradan gecer: once sinyaller, sonra kaynaklar, sonra

@@ -54,6 +54,9 @@ _FALLBACK_XML = """<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Intro
     <method name="Stats">
       <arg type="s" name="json" direction="out"/>
     </method>
+    <method name="WebUrl">
+      <arg type="s" name="url" direction="out"/>
+    </method>
     <property name="Version" type="s" access="read"/>
     <signal name="Changed">
       <arg type="s" name="json"/>
@@ -84,6 +87,8 @@ def client_command(method: str, args=()) -> tuple[str, dict]:
         return "list", {}
     if method == "Stats":
         return "stats", {}
+    if method == "WebUrl":
+        return "web-session", {}
     raise BridgeError("bilinmeyen yontem: %s" % method)
 
 
@@ -102,11 +107,17 @@ class Bridge:
             self.client.close()
             resp = self.client.request(cmd, **params)
         if not resp.get("ok"):
-            raise BridgeError(str(resp.get("error") or "ferdim hatasi"))
+            raise BridgeError(str(resp.get("error") or resp.get("code")
+                                  or "ferdim hatasi"))
         if method == "Add":
             return str(resp.get("id") or "")
         if method in ("List", "Stats"):
             return json.dumps(resp, ensure_ascii=False)
+        if method == "WebUrl":
+            url = str(resp.get("url") or "")
+            if not url:
+                raise BridgeError("web-session: URL donmedi")
+            return url
         return None
 
 

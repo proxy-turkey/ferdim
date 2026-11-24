@@ -22,6 +22,7 @@ function humanSize(n) {
   return (i ? n.toFixed(1) : n) + " " + u[i];
 }
 const send = (m) => browser.runtime.sendMessage(m);
+const NATIVE = "ferdim";
 
 async function init() {
   applyI18n();
@@ -37,9 +38,30 @@ function renderHost(r) {
   const el = $("#hostState");
   el.textContent = r && r.hostOk ? "● " + _("hostOk") : "○ " + _("hostOff");
   el.className = "state " + (r && r.hostOk ? "ok" : "bad");
-  $("#webUi").href = "http://127.0.0.1:" + ((r && r.port) || 8378);
   renderTurbo(!!(r && r.turbo));
 }
+
+/* Web arayuzu: URL daemon'dan tek kullanimlik olarak alinir (jeton
+ * adreste tasinmaz). Her tiklamada yeniden sorulur; hata yerellesir. */
+$("#webUi").onclick = async (e) => {
+  e.preventDefault();
+  const link = $("#webUi");
+  let url = "";
+  try {
+    const r = await browser.runtime.sendNativeMessage(NATIVE, { cmd: "web-url" });
+    if (r && r.ok && r.url) url = r.url;
+  } catch (err) {
+    url = "";
+  }
+  if (url) {
+    await browser.tabs.create({ url });
+    window.close();
+    return;
+  }
+  link.textContent = _("webUiUnavailable");
+  link.removeAttribute("href");
+  link.setAttribute("aria-disabled", "true");
+};
 
 function renderTurbo(on) {
   const b = $("#turboBtn");

@@ -21,6 +21,9 @@
     <method name="Stats">
       <arg type="s" name="json" direction="out"/>
     </method>
+    <method name="WebUrl">
+      <arg type="s" name="url" direction="out"/>
+    </method>
     <property name="Version" type="s" access="read"/>
     <signal name="Changed">
       <arg type="s" name="json"/>

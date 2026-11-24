@@ -48,6 +48,7 @@
   "hostOk": {"message": "подключено"},
   "hostOff": {"message": "сервис выключен"},
   "webUi": {"message": "Открыть веб-интерфейс"},
+  "webUiUnavailable": {"message": "Веб-интерфейс недоступен"},
   "notifyStartFail": {"message": "FerDim: не удалось начать загрузку"},
   "notifyServiceOff": {"message": "FerDim: сервис недоступен"},
   "notifyServiceOffBody": {"message": "Возможно, демон FerDim не запущен. Попробуйте «ferdim daemon» в терминале."}

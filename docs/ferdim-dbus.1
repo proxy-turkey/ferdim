@@ -11,7 +11,8 @@ and exports the object
 with the interface
 .BR org.ferdim.Daemon1 :
 methods \fBAdd\fR(url), \fBPause\fR(id), \fBResume\fR(id), \fBCancel\fR(id),
-\fBList\fR() and \fBStats\fR() (both return JSON), the \fBVersion\fR property
+\fBList\fR() and \fBStats\fR() (both return JSON), \fBWebUrl\fR() (returns a
+single-use web UI address), the \fBVersion\fR property
 and the \fBChanged\fR(json) signal. It forwards every call to the
 .BR ferdim (1)
 daemon over its local socket. D-Bus activation starts the bridge on demand;

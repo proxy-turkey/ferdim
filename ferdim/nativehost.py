@@ -17,6 +17,7 @@ from .paths import AppEnv
 # Eklentiden daemon'a gecebilecek indirme alanlari (alan -> varsayilan).
 # Tek 'download' ve toplu 'download-batch' AYNI kumeyi kullanir: merkle,
 # proxy, insecure, checksum, headers gibi alanlar eklenti mesajindan gecmez.
+# 'dir' de bilerek yoktur: tarayicidan gelen mesaj hedef klasoru secemez.
 # 'page' tek indirme sozlesmesindeki referer esidir (api cozer).
 DOWNLOAD_DEFAULTS = {
     "url": "",
@@ -26,7 +27,6 @@ DOWNLOAD_DEFAULTS = {
     "cookies": "",
     "ua": "",
     "segments": None,
-    "dir": "",
 }
 
 
@@ -135,6 +135,9 @@ def main() -> int:
                       "downloaddir": str(env.download_dir)})
         elif cmd == "download-batch":
             r = c.request("add-batch", items=batch_items(msg))
+        elif cmd == "web-url":
+            # Tek kullanimlik web oturumu: her istekte yeniden alinir.
+            r = c.request("web-session")
         else:
             r = {"ok": False, "error": f"bilinmeyen komut {cmd!r}"}
         r["inReplyTo"] = cmd

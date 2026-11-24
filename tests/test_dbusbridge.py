@@ -89,6 +89,26 @@ class BridgeMappingTests(unittest.TestCase):
         self.assertEqual(client.closed, 1)
         self.assertEqual(client.calls[-1][0], "list")
 
+    def test_web_url_maps_to_web_session(self):
+        client = FakeClient({"ok": True,
+                             "url": "http://127.0.0.1:8378/#s=abc"})
+        bridge = dbusbridge.Bridge(client)
+        self.assertEqual(bridge.call("WebUrl"),
+                         "http://127.0.0.1:8378/#s=abc")
+        self.assertEqual(client.calls, [("web-session", {})])
+
+    def test_web_url_disabled_becomes_bridge_error(self):
+        bridge = dbusbridge.Bridge(
+            FakeClient({"ok": False, "code": "web_disabled"}))
+        with self.assertRaises(dbusbridge.BridgeError) as ctx:
+            bridge.call("WebUrl")
+        self.assertIn("web_disabled", str(ctx.exception))
+
+    def test_web_url_without_address_is_an_error(self):
+        bridge = dbusbridge.Bridge(FakeClient({"ok": True}))
+        with self.assertRaises(dbusbridge.BridgeError):
+            bridge.call("WebUrl")
+
     def test_unknown_method_rejected(self):
         with self.assertRaises(dbusbridge.BridgeError):
             dbusbridge.client_command("Explode")
@@ -100,7 +120,8 @@ class BridgeMappingTests(unittest.TestCase):
     def test_introspection_xml_covers_interface(self):
         xml = dbusbridge.introspection_xml()
         for token in ("org.ferdim.Daemon1", "Add", "Pause", "Resume",
-                      "Cancel", "List", "Stats", "Changed", "Version"):
+                      "Cancel", "List", "Stats", "WebUrl", "Changed",
+                      "Version"):
             self.assertIn(token, xml)
         if HAVE_GI:
             node = Gio.DBusNodeInfo.new_for_xml(xml)
@@ -148,6 +169,8 @@ class _FakeDaemonHandler(socketserver.StreamRequestHandler):
             resp = {"ok": True, "req_id": msg.get("req_id")}
             if msg.get("cmd") in ("list", "stats"):
                 resp.update({"jobs": [], "total_speed": 0})
+            elif msg.get("cmd") == "web-session":
+                resp["url"] = "http://127.0.0.1:8378/#s=e2e"
             self.wfile.write((json.dumps(resp) + "\n").encode())
             self.wfile.flush()
 
@@ -189,6 +212,10 @@ class BridgeEndToEndTests(unittest.TestCase):
                                    dbusbridge.OBJECT_PATH,
                                    dbusbridge.INTERFACE),
             "gdbus call --session --dest %s --object-path %s"
+            " --method %s.WebUrl" % (dbusbridge.BUS_NAME,
+                                     dbusbridge.OBJECT_PATH,
+                                     dbusbridge.INTERFACE),
+            "gdbus call --session --dest %s --object-path %s"
             " --method org.freedesktop.DBus.Properties.Get %s Version"
             % (dbusbridge.BUS_NAME, dbusbridge.OBJECT_PATH,
                dbusbridge.INTERFACE),
@@ -200,6 +227,7 @@ class BridgeEndToEndTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, output)
         self.assertIn("jobs", proc.stdout)
         self.assertIn(__version__, proc.stdout)
+        self.assertIn("http://127.0.0.1:8378/#s=e2e", proc.stdout)
 
 
 if __name__ == "__main__":
