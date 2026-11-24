@@ -83,7 +83,8 @@ def cmd_add(a, env):
         r = c.request("add", url=a.url, filename=a.output, dir=a.dir,
                       segments=a.segments, headers=a.header, cookies=a.cookie,
                       user=a.user, password=a.password, proxy=a.proxy,
-                      insecure=a.insecure, referer=a.referer,
+                      insecure=a.insecure, http3=a.http3 or "",
+                      referer=a.referer,
                       limit=a.limit, mirrors=a.mirror,
                       sha256=a.sha256, md5=a.md5,
                       sha1=a.sha1, sha512=a.sha512, checksums=checks)
@@ -355,6 +356,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", help="is basina hiz limiti (orn 2MB)")
     sp.add_argument("-k", "--insecure", action="store_true",
                     help="TLS sertifikasi dogrulama")
+    sp.add_argument("--http3", choices=("off", "auto", "force"),
+                    help="HTTP/3 (QUIC) tasima: aioquic gerekir")
     sp.add_argument("--wait", action="store_true", help="bitmesini bekle")
     sp.add_argument("--sha256", help="bitiste SHA-256 dogrulamasi")
     sp.add_argument("--md5", help="bitiste MD5 dogrulamasi")

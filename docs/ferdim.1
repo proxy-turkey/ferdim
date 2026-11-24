@@ -57,6 +57,10 @@ omitted when it is unambiguous from the digest length,
 per-job speed limit (e.g. 2MB; KB, MB and GB are 1024-based),
 .B \-k
 skip TLS verification,
+.BI \-\-http3 " off|auto|force"
+HTTP/3 (QUIC) transport (optional \fBaioquic\fR module): \fBauto\fR uses it
+when the server advertised it in Alt-Svc and falls back to TCP on failure;
+\fBforce\fR never falls back. Default: the \fIhttp3\fR setting (\fBoff\fR),
 .B \-\-wait
 follow progress until completion; returns only after verification.
 .IP

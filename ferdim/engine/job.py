@@ -207,6 +207,7 @@ class JobSpec:
     password: str = ""
     proxy: str = ""
     insecure: bool = False
+    http3: str = ""                  # "" -> cfg["http3"] (off|auto|force)
     limit: int = 0  # is basina bayt/sn
     mirrors: list = field(default_factory=list)  # alternatif kaynak URL'leri
     sha256: str = ""   # bitiste dogrulanir
@@ -235,6 +236,7 @@ class JobSpec:
             insecure=self.insecure or not cfg.get("verify_tls", True),
             timeout=int(cfg.get("timeout", 30)),
             retries=int(cfg.get("retries", 5)),
+            http3=self.http3 or str(cfg.get("http3", "off")),
         )
 
 

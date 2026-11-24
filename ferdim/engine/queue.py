@@ -333,6 +333,7 @@ class QueueManager:
                 "headers": j.spec.headers, "cookies": j.spec.cookies,
                 "user": j.spec.user, "password": j.spec.password,
                 "proxy": j.spec.proxy, "insecure": j.spec.insecure,
+                "http3": j.spec.http3,
                 "referer": j.spec.referer, "ua": j.spec.user_agent,
                 "kind": j.kind, "state": j.state, "created": j.created,
                 # gecmis 'sure' alani aktif saniyeleri tasir: daemon yeniden
@@ -361,6 +362,7 @@ class QueueManager:
                 cookies=item.get("cookies", ""),
                 user=item.get("user", ""), password=item.get("password", ""),
                 proxy=item.get("proxy", ""), insecure=bool(item.get("insecure")),
+                http3=str(item.get("http3") or ""),
                 referer=item.get("referer", ""), user_agent=item.get("ua", ""),
                 mirrors=[m for m in (item.get("mirrors") or [])
                          if isinstance(m, str)

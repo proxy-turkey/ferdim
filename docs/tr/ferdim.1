@@ -61,6 +61,10 @@ uzunluğundan tek anlamlı olduğunda algoritma atlanabilir,
 iş başına hız sınırı (ör. 2MB; KB, MB ve GB 1024 tabanlıdır),
 .B \-k
 TLS doğrulamasını atla,
+.BI \-\-http3 " off|auto|force"
+HTTP/3 (QUIC) taşıma (isteğe bağlı \fBaioquic\fR modülü): \fBauto\fR, sunucu
+Alt-Svc ile duyurduysa kullanır ve hata olursa TCP'ye döner; \fBforce\fR
+hiç geri dönmez. Varsayılan: \fIhttp3\fR ayarı (\fBoff\fR),
 .B \-\-wait
 tamamlanana kadar ilerlemeyi izle; yalnızca doğrulama bittikten sonra
 döner.

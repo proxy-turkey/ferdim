@@ -62,6 +62,8 @@ def _spec_from(params: dict, cfg: dict) -> JobSpec:
         password=params.get("password") or "",
         proxy=params.get("proxy") or "",
         insecure=bool(params.get("insecure")),
+        http3=(str(params.get("http3") or "")
+               if params.get("http3") in ("off", "auto", "force") else ""),
         referer=params.get("referer") or params.get("page") or "",
         user_agent=params.get("ua") or params.get("user_agent") or "",
         limit=util.parse_size(params.get("limit")) if params.get("limit") else 0,
