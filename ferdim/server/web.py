@@ -55,12 +55,12 @@ def _decode_proc_addr(text: str, v6: bool) -> tuple[str, int]:
     if v6:
         if len(addr) != 32:
             raise ValueError(text)
-        raw = b"".join(struct.pack("<I", int(addr[i:i + 8], 16))
+        raw = b"".join(struct.pack("=I", int(addr[i:i + 8], 16))
                        for i in range(0, 32, 8))
     else:
         if len(addr) != 8:
             raise ValueError(text)
-        raw = struct.pack("<I", int(addr, 16))
+        raw = struct.pack("=I", int(addr, 16))
     ip = ip_address(raw)
     if ip.version == 6 and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped          # ::ffff:127.0.0.1 -> 127.0.0.1

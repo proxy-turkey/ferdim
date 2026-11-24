@@ -26,6 +26,17 @@ semantic versioning.
   Socket RPC lines are capped at 1 MiB and the socket is created 0600.
 - Token, configuration and log files are always owner-only (0600), the
   state and config folders 0700.
+- The web server only answers connections from the daemon's own user
+  account (checked through `/proc/net/tcp`; refused when that cannot be
+  read).
+- The API token is replaced once on the first start of 1.7.1, because
+  earlier versions exposed it in the web page. Scripts that cached it must
+  re-read `~/.local/state/ferdim/token`.
+- Over HTTP, `allowed_dirs` and `peer_dirs` can't be changed, and a new
+  downloads or watched folder must lie inside the home folder and outside
+  hidden folders. Token rotation also invalidates pending one-time links.
+- `Proxy-Authorization` no longer follows a redirect to another origin;
+  an `http` → `https` upgrade on the same host keeps the credentials.
 
 ### Added
 - D-Bus `WebUrl()` method; native-messaging `web-url` message.

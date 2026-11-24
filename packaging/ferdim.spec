@@ -158,6 +158,7 @@ python3 -m unittest discover -s tests -v
 * Tue Nov 24 2026 Enes Aksu <eaksu@pm.me> - 1.7.1-1
 - security: no API token in the web page; one-time launcher links
 - security: confine HTTP download folders; scope credentials to origin
+- security: web server answers only the daemon's user; token rotated once
 * Tue Nov 24 2026 Enes Aksu <eaksu@pm.me> - 1.7.0-1
 - Manifest V3 extension; host profiles and integrity badges in web and GTK
 - HTTP/3 connection reuse; latency-aware coexistence; speed plan; metrics
