@@ -8,6 +8,11 @@
   {v, algo, size, root, chunks: [[offset, length, hex]...]}
 - Dogrulama parca ofsetlerini bildirimden alir (yeniden parcalamaz):
   hashlib hizinda calisir, indirme bitisinde pahali degildir.
+
+Merkle make tarafi saf Python'da yavas kalirdi: bayt bayt yuruyen gear
+dongusu yerine (bkz. _first_cut) sinir ADAYLARI toplu aritmetikle elenir.
+Uretilen sinirlar klasik algoritmayla BAYT BAYT AYNIDIR; yayinlanmis
+bildirimler gecerliligini korur.
 """
 from __future__ import annotations
 
@@ -48,6 +53,136 @@ def _masks(avg_size: int) -> tuple[int, int]:
     return (1 << (bits + 2)) - 1, (1 << (bits - 2)) - 1
 
 
+# --------------------------------------------------------------- hizli tarama
+# h_j (j konumundaki gear ozeti) yalnizca son baytlara baglidir: h_j'nin
+# dusuk `n` bitini b[j-n..j-1] belirler. Bu yuzden sinir ADAYLARI bayt bayt
+# yurumek yerine toplu aritmetikle elenir:
+#   - her bayt gear'in dusuk 8 bitine cevrilir (bytes.translate, C hizi)
+#   - her bayt 16 bitlik dilime acilir (utf-16-le, C hizi)
+#   - acc * _POLY carpimi her konumun (h mod 2^8) degerini tek islemde verir
+#   - sifir dilimler bytes.find ile atlanir (C hizi)
+# On eleme yalniz GEREKLI kosulu ("dusuk 8 bit sifir") test eder: sinir
+# kacmaz, her aday tam maske ile tek tek dogrulanir. _first_cut bu yolu
+# yalniz buyuk bolgelerde kullanir; sonuc klasik donguyle aynidir.
+
+_WIN = 8                     # on eleme penceresi (bayt, 2^8 kosulu icin)
+_POLY = sum(1 << (17 * m) for m in range(_WIN))   # dilime 2^m agirlik
+_GEAR_LO = bytes(g & 0xFF for g in GEAR)
+_MAP_LO = bytes.maketrans(bytes(range(256)), _GEAR_LO)
+_BLOCK = 1 << 14             # on eleme blok boyu (bayt)
+_BULK_MIN = 1 << 15          # bundan kisa bolgede klasik dongu
+_MAX_CAND = _BLOCK // 32     # blok basina aday siniri (asilirsa klasik yol)
+
+
+def _candidates(part: bytes):
+    """`part` icindeki aday konumlarin dilim ofsetleri (artan).
+
+    Bir dilim, o dilimle biten konumun (h mod 2^8) degeridir
+    (konum = taban + ofset + 1). Dilim degeri
+    sum(2^m * (gear[b] & 0xFF)) < 2^16 oldugundan komsu dilime tasmaz:
+    sifir dilim = iki sifir bayt (kucuk-endian dilim)."""
+    n = len(part)
+    acc = int.from_bytes(part.translate(_MAP_LO).decode("latin-1")
+                         .encode("utf-16-le"), "little")
+    raw = (acc * _POLY).to_bytes(2 * (n + _WIN - 1), "little")
+    pos = 2 * (_WIN - 1)     # ilk tam pencere burada biter
+    end = 2 * n
+    while pos < end:
+        i = raw.find(b"\x00", pos)
+        if i < 0 or i >= end:
+            return
+        if i & 1:            # dilimin ust bayti: aday degil
+            pos = i + 1
+            continue
+        yield i >> 1
+        pos = i + 2
+
+
+def _win_hash(buf, end: int, nbits: int) -> int:
+    """`end` konumundan onceki `nbits` baytin gear ozeti (h_end)."""
+    h = 0
+    for j in range(end - nbits, end):
+        h = ((h << 1) + GEAR[buf[j]]) & M64
+    return h
+
+
+def _scan_classic(buf, lo: int, hi: int, mask: int, floor: int) -> int:
+    """Bayt bayt dongu: [lo, hi] konumlarinda ilk sinir (yoksa 0).
+
+    h `floor` konumunda sifirlanir; `lo`'dan onceki konumlar yalniz
+    hesaplanir, test edilmez."""
+    h = 0
+    j = floor
+    while j < hi:
+        h = ((h << 1) + GEAR[buf[j]]) & M64
+        j += 1
+        if j >= lo and not h & mask:
+            return j
+    return 0
+
+
+def _bulk_cut(buf, lo: int, hi: int, mask: int, nbits: int) -> int:
+    """Toptan tarama: [lo, hi] konumlarinda ilk sinir (yoksa 0).
+
+    `lo` konumunun tam penceresi vardir (cagiran garanti eder)."""
+    start = lo
+    while start <= hi:
+        stop = min(hi, start + _BLOCK - 1)
+        base = start - _WIN
+        part = buf[base:stop + 1]
+        if not isinstance(part, bytes):
+            part = bytes(part)
+        seen = 0
+        for r in _candidates(part):
+            p = base + r + 1         # dilimin son bayti = konum - 1
+            if not _win_hash(buf, p, nbits) & mask:
+                return p
+            seen += 1
+            if seen > _MAX_CAND:
+                # adaylar yogun (koti niyetli/duzenli veri): dogrulama
+                # maliyeti klasik dongunun uzerine cikar
+                return _scan_window(buf, start, hi, mask, nbits)
+        start = stop + 1
+    return 0
+
+
+def _scan_window(buf, start: int, hi: int, mask: int, nbits: int) -> int:
+    """Klasik dongu, h son `nbits` bayttan kurularak: [start, hi] araligi.
+
+    Test yalnizca h'nin dusuk `nbits` bitine baktigi icin hazir pencere
+    ozeti yeterlidir (ust bitler onemsiz)."""
+    h = _win_hash(buf, start, nbits)
+    if not h & mask:
+        return start
+    j = start
+    while j < hi:
+        h = ((h << 1) + GEAR[buf[j]]) & M64
+        j += 1
+        if not h & mask:
+            return j
+    return 0
+
+
+def _first_cut(buf, lo: int, hi: int, mask: int, floor: int) -> int:
+    """[lo, hi] konumlarinda (h & mask) == 0 olan ilk konum (yoksa 0).
+
+    h `floor` konumunda sifirlanir. Konumun dusuk `mask.bit_length()`
+    biti son o kadar bayttan geldigi icin pencere dolduktan sonra
+    konumlar bagimsiz dogrulanabilir (toptan tarama)."""
+    if lo > hi:
+        return 0
+    nbits = mask.bit_length()
+    p0 = max(lo, floor + nbits, _WIN)     # tam pencereli ilk konum
+    if lo < p0:
+        cut = _scan_classic(buf, lo, min(hi, p0 - 1), mask, floor)
+        if cut or p0 > hi:
+            return cut
+    # on eleme "dusuk 8 bit sifir" der: maske 8 bitten kisaysa aday kacirir
+    if hi - p0 + 1 >= _BULK_MIN and nbits >= 8:
+        return _bulk_cut(buf, p0, hi, mask, nbits)
+    return _scan_classic(buf, p0, hi, mask, floor)
+
+
 def chunk_ranges(buf, min_size: int = MIN_CHUNK, avg_size: int = AVG_CHUNK,
                  max_size: int = MAX_CHUNK):
     """Icerik-tanimli parca araliklari: (bas, son) uretir.
@@ -55,7 +190,6 @@ def chunk_ranges(buf, min_size: int = MIN_CHUNK, avg_size: int = AVG_CHUNK,
     `buf` bayt benzeri (bytes, memoryview, mmap): yalnizca okunur.
     Son parca kisa olabilir; digerleri min_size..max_size arasindadir.
     """
-    gear = GEAR
     mask_s, mask_l = _masks(avg_size)
     n = len(buf)
     if min_size < 1:
@@ -70,22 +204,11 @@ def chunk_ranges(buf, min_size: int = MIN_CHUNK, avg_size: int = AVG_CHUNK,
             return
         limit = n if left <= max_size else i + max_size
         mid = min(i + avg_size, limit)
-        j = i + min_size
-        h = 0
-        cut = 0
-        while j < mid:
-            h = ((h << 1) + gear[buf[j]]) & M64
-            j += 1
-            if not h & mask_s:
-                cut = j
-                break
+        floor = i + min_size
+        # ilk faz siki, ikinci faz gevsek maske; iki faz da ayni h'yi surer
+        cut = _first_cut(buf, floor + 1, mid, mask_s, floor)
         if not cut:
-            while j < limit:
-                h = ((h << 1) + gear[buf[j]]) & M64
-                j += 1
-                if not h & mask_l:
-                    cut = j
-                    break
+            cut = _first_cut(buf, mid + 1, limit, mask_l, floor)
             if not cut:
                 cut = limit
         yield i, cut
@@ -165,7 +288,9 @@ class Manifest:
         uydurma bir bildirimle indirilen dosyayi 'dogrulanmis' saymayiz."""
         try:
             data = json.loads(text)
-        except ValueError as e:
+        except (ValueError, RecursionError) as e:
+            # derin ic ice JSON'da json.loads RecursionError sizdirir:
+            # sozlesme tek tur (ValueError) kalsin
             raise ValueError(f"gecersiz JSON: {e}") from None
         if not isinstance(data, dict):
             raise ValueError("bildirim sozluk degil")
