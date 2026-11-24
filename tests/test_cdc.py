@@ -262,6 +262,58 @@ class ChunkerStabilityTests(unittest.TestCase):
         with mock.patch.object(cdc, "_MAX_CAND", 1):
             self.assertEqual(list(cdc.chunk_ranges(data, **par)), want)
 
+    def _synthetic_gear(self):
+        """Yapay gear tablosu: yalniz bayt 1 hash'e katkir. Boylece h'nin
+        dusuk `nbits` biti 'son nbits bayt sifir mi' sorusuna indirgenir ve
+        maske eslesmesi ISTENEN konuma konabilir."""
+        gear = tuple(1 if i == 1 else 0 for i in range(256))
+        map_lo = bytes.maketrans(bytes(range(256)),
+                                 bytes(g & 0xFF for g in gear))
+        return gear, map_lo
+
+    def test_44_bulk_scan_never_cuts_past_the_limit(self):
+        """Toptan tarama hi+1 konumunu aday sayiyordu: parca max_size+1
+        bayt olur ve Manifest.parse bildirimi reddeder (klasik dongu ise
+        limiti dondurur). Maske eslesmesi TAM olarak limit+1'e konur."""
+        gear, map_lo = self._synthetic_gear()
+        avg, max_size = 1 << 20, 100          # mask_s 22 bit: 22 bayt pencere
+        nbits = cdc._masks(avg)[0].bit_length()
+        self.assertEqual(nbits, 22)
+        # govde '1', kuyruk sifir: ilk maske eslesmesi son '1'den nbits+1
+        # sonra, yani tam olarak max_size+1 konumunda
+        body = max_size + 1 - nbits
+        data = b"\x01" * body + b"\x00" * (nbits + 41)
+        par = dict(min_size=1, avg_size=avg, max_size=max_size)
+        with mock.patch.object(cdc, "GEAR", gear), \
+                mock.patch.object(cdc, "_MAP_LO", map_lo), \
+                mock.patch.object(cdc, "_BULK_MIN", 1):
+            want = list(reference_chunk_ranges(data, **par))
+            got = list(cdc.chunk_ranges(data, **par))
+            self.assertEqual(want[0], (0, max_size))
+            self.assertEqual(got, want)
+            # dogrudan cagri da hi+1 hicbir zaman donmemeli
+            mask_s = cdc._masks(avg)[0]
+            self.assertEqual(cdc._first_cut(data, 2, max_size, mask_s, 1), 0)
+
+    def test_45_equivalence_near_max_boundaries(self):
+        """max_size sinirina yakin boylarda toptan tarama klasik donguyle
+        ayni sinirlari vermeli (hicbir parca max_size'i asmaz)."""
+        pars = [dict(min_size=1, avg_size=1 << 15, max_size=1 << 17),
+                dict(min_size=4096, avg_size=1 << 16, max_size=1 << 18),
+                dict(min_size=1024, avg_size=1 << 17, max_size=1 << 17)]
+        for k, par in enumerate(pars):
+            mx = par["max_size"]
+            for size in sorted({mx - 1, mx, mx + 1, 2 * mx + 3}):
+                data = hashlib.shake_256(
+                    b"cdc-max-%d-%d" % (k, size)).digest(size)
+                with self.subTest(par=par, size=size):
+                    want = list(reference_chunk_ranges(data, **par))
+                    got = list(cdc.chunk_ranges(data, **par))
+                    self.assertEqual(got, want)
+                    for s, e in got:
+                        self.assertLessEqual(e - s, mx)
+                        self.assertLessEqual(e, size)
+
     def test_42_buffer_types_agree(self):
         data = hashlib.shake_128(b"cdc-buf").digest(900_000)
         want = list(cdc.chunk_ranges(data, **SMALL))

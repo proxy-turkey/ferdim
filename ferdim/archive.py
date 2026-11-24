@@ -137,6 +137,30 @@ def _view(path, fmt: str):
         raise ArchiveError(f"arsiv okunamadi: {e}") from e
 
 
+def _open_member(view, name: str):
+    """Uye akisi. Sifreli uyede zipfile RuntimeError atar ("password
+    required"): tek uye hatasi olsun, cikarmanin tamami dusmesin.
+    NotImplementedError (desteklenmeyen yontem) zaten _READ_ERRORS
+    icindedir, oldugu gibi gecer. RuntimeError yalniz burada ve uye
+    okumasinda yakalanir."""
+    try:
+        return view.open(name)
+    except NotImplementedError:
+        raise
+    except RuntimeError as e:
+        raise ArchiveError(f"okunamaz uye: {e}") from e
+
+
+def _read_member(src) -> bytes:
+    """Uye akisindan okuma (bkz. _open_member)."""
+    try:
+        return src.read(CHUNK)
+    except NotImplementedError:
+        raise
+    except RuntimeError as e:
+        raise ArchiveError(f"okunamaz uye: {e}") from e
+
+
 def _detect(path: Path) -> str:
     """Bicim: 'zip', 'tar' (gz/bz2/xz dahil) ya da '' (desteklenmez).
 
@@ -173,7 +197,7 @@ def _ratio(meta: _Meta) -> float:
 def _copy_limited(src, dst, limit: int) -> int:
     n = 0
     while True:
-        chunk = src.read(CHUNK)
+        chunk = _read_member(src)
         if not chunk:
             return n
         n += len(chunk)
@@ -187,7 +211,7 @@ def _expand(view, meta: _Meta, prefix: str, chain: list, depth: int,
     """Ic arsivi gecici akisa kopyalayip ust seviyeyle ayni sekilde gezer."""
     buf = tempfile.SpooledTemporaryFile(max_size=SPOOL)
     try:
-        with view.open(meta.name) as src:
+        with _open_member(view, meta.name) as src:
             _copy_limited(src, buf, MAX_INNER)
         buf.seek(0)
         if not zipfile.is_zipfile(buf):
@@ -406,7 +430,7 @@ def _member_stream(path: Path, fmt: str, entry: dict):
         for name in segs[:-1]:
             buf = tempfile.SpooledTemporaryFile(max_size=SPOOL)
             spools.append(buf)
-            with view.open(name) as src:
+            with _open_member(view, name) as src:
                 _copy_limited(src, buf, MAX_INNER)
             buf.seek(0)
             if not zipfile.is_zipfile(buf):
@@ -414,7 +438,7 @@ def _member_stream(path: Path, fmt: str, entry: dict):
             buf.seek(0)
             view = _ZipView(zipfile.ZipFile(buf))
             views.append(view)
-        with view.open(segs[-1]) as f:
+        with _open_member(view, segs[-1]) as f:
             yield f
     finally:
         for v in reversed(views):
@@ -485,7 +509,7 @@ def _write_part(stream, part: Path, budget: int) -> tuple:
     try:
         with stream as src, open(part, "wb") as out:
             while True:
-                chunk = src.read(CHUNK)
+                chunk = _read_member(src)
                 if not chunk:
                     break
                 size += len(chunk)
@@ -624,7 +648,8 @@ def extract(path, members=None, dest=None, repair: bool = False,
                         continue
                     key, entry, rel, parts = item
                     try:
-                        store(key, entry, rel, parts, view.open(meta.name))
+                        store(key, entry, rel, parts,
+                              _open_member(view, meta.name))
                     except failures as e:
                         errors.append(f"{key}: {e}")
         except (ArchiveError,) + _READ_ERRORS as e:

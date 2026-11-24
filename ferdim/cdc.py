@@ -135,6 +135,11 @@ def _bulk_cut(buf, lo: int, hi: int, mask: int, nbits: int) -> int:
         seen = 0
         for r in _candidates(part):
             p = base + r + 1         # dilimin son bayti = konum - 1
+            if p > stop:
+                # part bir bayt fazla uzar: son aday blok sinirini asar.
+                # Bu konum sonraki blogun ilk adayidir (son blogun disinda
+                # kalir): burada test edilirse parca max_size+1 bayt olur.
+                break
             if not _win_hash(buf, p, nbits) & mask:
                 return p
             seen += 1

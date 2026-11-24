@@ -150,9 +150,12 @@ def build_segment_list(mpd_text: str, mpd_url: str):
     if seg_list is not None:
         init = _el(seg_list, "Initialization")
         init_url = u(_attr(init, "sourceURL")) if init is not None else None
-        seg_urls = [u(_attr(s, "media")) for s in _els(seg_list, "SegmentURL")]
-        if not seg_urls:
+        items = _els(seg_list, "SegmentURL")
+        if not items:
             raise DashError("SegmentList bos")
-        return init_url, seg_urls
+        # SegmentList de ayni sinirlidir: liste dogrudan MPD'den gelir
+        if len(items) > MAX_SEGMENTS:
+            raise DashError("segment sayisi ust sinirin uzerinde")
+        return init_url, [u(_attr(s, "media")) for s in items]
 
     raise DashError("SegmentTemplate/SegmentList bulunamadi")

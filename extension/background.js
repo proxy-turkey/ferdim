@@ -80,6 +80,9 @@ const sessionArea = (browser.storage && browser.storage.session) || null;
 const MEDIA_KEY = "mediaByTab";
 const mediaByTab = new Map();
 let mediaReadyPromise = null;
+/* Hidrasyon bitmeden yazma yok: soguk baslangicta onRemoved gibi bir olay
+ * bos haritayi storage.session'a yazip onceki sekme kayitlarini silmesin. */
+let mediaHydrated = false;
 
 function mediaSnapshot() {
   const out = {};
@@ -89,7 +92,7 @@ function mediaSnapshot() {
 
 let persistQueued = false;
 function persistMedia() {
-  if (!sessionArea || persistQueued) return;
+  if (!sessionArea || !mediaHydrated || persistQueued) return;
   persistQueued = true;
   Promise.resolve().then(async () => {
     persistQueued = false;
@@ -100,15 +103,20 @@ function persistMedia() {
 }
 
 async function hydrateMedia() {
-  if (sessionArea) {
-    const st = await sessionArea.get(MEDIA_KEY);
-    for (const [key, hits] of Object.entries((st && st[MEDIA_KEY]) || {})) {
-      const tabId = Number(key);
-      if (!Number.isInteger(tabId) || !Array.isArray(hits)) continue;
-      const map = new Map();
-      for (const h of hits) if (h && h.url) map.set(h.url, h);
-      if (map.size) mediaByTab.set(tabId, map);
+  try {
+    if (sessionArea) {
+      const st = await sessionArea.get(MEDIA_KEY);
+      for (const [key, hits] of Object.entries((st && st[MEDIA_KEY]) || {})) {
+        const tabId = Number(key);
+        if (!Number.isInteger(tabId) || !Array.isArray(hits)) continue;
+        const map = new Map();
+        for (const h of hits) if (h && h.url) map.set(h.url, h);
+        if (map.size) mediaByTab.set(tabId, map);
+      }
     }
+  } finally {
+    // Okuma hata verse de kilit acilir: durum kalici olarak yazilamaz kalmasin
+    mediaHydrated = true;
   }
   // Kapanmis sekmelerin kaydi kalmasin (sekme kimligi yeniden kullanilir).
   const tabs = await browser.tabs.query({});
@@ -275,7 +283,9 @@ function updateBadge(tabId) {
   else pageButton.hide(tabId).catch(() => {});
 }
 
-browser.tabs.onRemoved.addListener((tabId) => {
+browser.tabs.onRemoved.addListener(async (tabId) => {
+  // Hidrasyon beklemeden yazmak onceki sekme kayitlarini siler
+  await mediaReady();
   if (mediaByTab.delete(tabId)) persistMedia();
 });
 

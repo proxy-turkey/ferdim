@@ -51,6 +51,25 @@ def make_tar(path, members: dict, mode: str = "w:gz"):
     return Path(path)
 
 
+def flag_encrypted(data: bytes, member: str) -> bytes:
+    """ZIP baytlarinda `member` icin sifreleme bitini (bit 0) acar: hem
+    yerel baslikta (offset 6) hem merkezi dizinde (offset 8)."""
+    buf = bytearray(data)
+    for sig, at in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        off = 0
+        while True:
+            off = buf.find(sig, off)
+            if off < 0:
+                break
+            nlen_at = off + (26 if at == 6 else 28)
+            nlen = int.from_bytes(buf[nlen_at:nlen_at + 2], "little")
+            name_at = off + (30 if at == 6 else 46)
+            if bytes(buf[name_at:name_at + nlen]) == member.encode():
+                buf[off + at] |= 0x01
+            off += 4
+    return bytes(buf)
+
+
 class ArchiveCase(unittest.TestCase):
     def setUp(self):
         self.root = tmp_root(self, "ferdim-arc-")
@@ -448,6 +467,51 @@ class ExtractSafetyTests(ArchiveCase):
             status = self.wait_task(snap["id"])
             self.assertEqual(status["state"], "done")
             self.assertIn(snap["id"], archive._TASKS)
+
+
+class EncryptedMemberTests(ArchiveCase):
+    """Sifreli uye: zipfile RuntimeError atar ("password required"). Bu
+    tek uyenin hatasi olmali; cikarmanin tamami dusmemeli."""
+
+    def _zip(self, encrypted: str) -> Path:
+        data = zip_bytes({"a.txt": b"a" * 16, "b.txt": b"b" * 16,
+                          "inner.zip": zip_bytes({"c.txt": b"c" * 8})})
+        path = self.root / "enc.zip"
+        path.write_bytes(flag_encrypted(data, encrypted))
+        return path
+
+    def test_30_encrypted_member_is_a_per_member_error(self):
+        arc = self._zip("b.txt")
+        with self.assertRaises(RuntimeError):   # bozulmanin gercekten
+            with zipfile.ZipFile(arc) as zf:    # sifreleme oldugunu dogrula
+                zf.open("b.txt")
+        dest = self.root / "out"
+        res = archive.extract(arc, dest=dest)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["extracted"], 3)   # digerleri cikarildi
+        self.assertTrue(any("b.txt" in err for err in res["errors"]),
+                        res["errors"])
+        self.assertEqual((dest / "a.txt").read_bytes(), b"a" * 16)
+        self.assertFalse((dest / "b.txt").exists())
+        self.assertFalse((dest / "b.txt.part").exists())
+        # secmeli cikarma da ayni sekilde tek uyeyle sinirli kalir
+        sel = archive.extract(arc, members=["b.txt"], dest=self.root / "sel")
+        self.assertFalse(sel["ok"])
+        self.assertEqual(sel["extracted"], 0)
+        self.assertTrue(any("b.txt" in err for err in sel["errors"]),
+                        sel["errors"])
+
+    def test_31_encrypted_inner_archive_is_a_note(self):
+        """Sifreli ic arsiv listelemede not olur, describe() dusmez."""
+        arc = self._zip("inner.zip")
+        info = archive.describe(arc)
+        inner = {e["path"]: e for e in info["entries"]}[
+            "enc.zip!/inner.zip"]
+        self.assertIn("okunamaz uye", inner.get("note", ""))
+        res = archive.extract(arc, dest=self.root / "out2")
+        self.assertFalse(res["ok"])
+        self.assertEqual((self.root / "out2" / "a.txt").read_bytes(),
+                         b"a" * 16)
 
 
 class ApiArchiveTests(ArchiveCase):

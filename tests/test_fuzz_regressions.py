@@ -171,6 +171,22 @@ class DashRegressionTest(unittest.TestCase):
                 dash.build_segment_list(
                     _mpd(three, period='duration="PT5S"'), MPD_URL)
 
+    def test_segment_list_is_capped(self):
+        """SegmentList yolu da MAX_SEGMENTS sinirina uyar (liste MPD'den
+        gelir; sinirsiz liste URL uretimini sisirir)."""
+        segs = "".join('<SegmentURL media="s%d.m4s"/>' % i for i in range(5))
+        mpd = _mpd('<SegmentList><Initialization sourceURL="i.mp4"/>'
+                   + segs + '</SegmentList>')
+        with mock.patch.object(dash, "MAX_SEGMENTS", 5):
+            init, urls = dash.build_segment_list(mpd, MPD_URL)
+            self.assertEqual(init, "https://cdn.example/vod/i.mp4")
+            self.assertEqual(len(urls), 5)
+            self.assertEqual(urls[4], "https://cdn.example/vod/s4.m4s")
+        with mock.patch.object(dash, "MAX_SEGMENTS", 4):
+            with self.assertRaises(dash.DashError) as ctx:
+                dash.build_segment_list(mpd, MPD_URL)
+            self.assertIn("ust sinirin", str(ctx.exception))
+
     def test_period_lookup_avoids_element_truthiness(self):
         """Cocuksuz eleman 'or' ile falsy sayilmamali (AGENTS.md gotcha)."""
         mpd = _mpd('<SegmentTemplate media="s$Number$" duration="1"/>',
