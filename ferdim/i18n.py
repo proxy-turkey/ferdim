@@ -467,6 +467,25 @@ S = {
         "tr": "{n} sağlama uyarısı",
         "es": "{n} con aviso de suma",
         "ru": "{n} с предупреждением о сумме"},
+    # ------------------------------------------------------------ gtk 1.7
+    "hosts_title": {
+        "en": "Host profiles", "tr": "Ana makine profilleri",
+        "es": "Perfiles de servidor", "ru": "Профили серверов"},
+    "hosts_forget": {
+        "en": "Forget", "tr": "Unut", "es": "Olvidar", "ru": "Забыть"},
+    "hosts_forget_all": {
+        "en": "Forget all", "tr": "Tümünü unut",
+        "es": "Olvidar todos", "ru": "Забыть все"},
+    "hosts_confirm_clear": {
+        "en": "Forget every learned host profile?",
+        "tr": "Öğrenilmiş tüm ana makine profilleri unutulsun mu?",
+        "es": "¿Olvidar todos los perfiles de servidor aprendidos?",
+        "ru": "Забыть все изученные профили серверов?"},
+    "chk_merkle_warn": {
+        "en": "Merkle manifest mismatch (automatic); file kept",
+        "tr": "Merkle bildirimi uyuşmadı (otomatik); dosya korundu",
+        "es": "el manifiesto Merkle no coincide (automático); archivo conservado",
+        "ru": "манифест Merkle не совпал (автоматически); файл сохранён"},
 }
 
 

@@ -23,15 +23,20 @@ except (ImportError, ValueError) as e:  # pragma: no cover
 
 from .. import __version__, util
 from ..client import FerdimClient, ensure_daemon
-from ..i18n import LANGS, LANG_NAMES, detect_lang, t
+from ..i18n import LANGS, LANG_NAMES
 from ..paths import AppEnv
-
-STATES = ("queued", "connecting", "downloading", "paused",
-          "done", "error", "canceled")
+from . import present
+from .archive_win import ArchiveWindow
+from .history_win import HistoryWindow
+from .hosts_win import HostsWindow
+from .widgets import (STATES, _a11y, _bind_escape, _button, _check, _field,
+                      _grid_field, _mnemonic, _time_entry, _under, gtr, lang,
+                      set_gui_lang, tr_state)
 # (eylem, i18n anahtari, simge)
 ACTIONS = (("resume", "act_resume", "media-playback-start"),
            ("pause", "act_pause", "media-playback-pause"),
            ("restart", "act_restart", "view-refresh"),
+           ("archive", "zip_title", "package-x-generic"),
            ("remove", "act_remove", "user-trash"))
 # web arayuzuyle ayni kategori kumesi ve hiz on ayarlari
 CATEGORIES = ("video", "music", "compressed", "program", "document", "other")
@@ -39,108 +44,25 @@ SPEED_PRESETS = (0, 128 * 1024, 512 * 1024, 1024 * 1024,
                  2 * 1024 * 1024, 5 * 1024 * 1024)
 _HM = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
 
-_LANG = "tr"
-
-
-def set_gui_lang(cfg_lang: str | None) -> None:
-    global _LANG
-    _LANG = detect_lang(cfg_lang)
-
-
-def tr_state(state: str) -> str:
-    return t("st_" + state, _LANG) if state in STATES else state
-
-
-def _a11y(widget, name: str, values: list) -> None:
-    """Erisilebilirlik ozelligi (Gtk.AccessibleProperty): yalniz simgeli
-    dugmenin adi, giris alaninin ipucu. GTK surumunde yoksa atlanir."""
-    try:
-        widget.update_property([getattr(Gtk.AccessibleProperty, name)], values)
-    except (AttributeError, TypeError):
-        pass
-
-
-def _under(txt: str) -> str:
-    """Cevirideki '_' harfi animsatici isaret olarak kacirilir."""
-    return "_" + txt.replace("_", "__")
-
-
-def _mnemonic(key: str, widget, target=None) -> Gtk.Label:
-    """Animsatici etiket: Alt+harf alana gecer; GTK etiket <-> alan
-    iliskisini (LABELLED_BY / LABEL_FOR) ekran okuyuculara da verir."""
-    lab = Gtk.Label(xalign=0, use_underline=True,
-                    mnemonic_widget=target or widget)
-    lab.set_label(_under(t(key, _LANG)))
-    return lab
-
-
-def _field(parent, widget, key: str, target=None) -> None:
-    parent.append(_mnemonic(key, widget, target))
-    parent.append(widget)
-
-
-def _grid_field(grid, row: int, widget, key: str, target=None) -> None:
-    widget.set_hexpand(True)
-    grid.attach(_mnemonic(key, widget, target), 0, row, 1, 1)
-    grid.attach(widget, 1, row, 1, 1)
-
-
-def _button(key: str, suggested: bool = False) -> Gtk.Button:
-    b = Gtk.Button(use_underline=True)
-    b.set_label(_under(t(key, _LANG)))
-    if suggested:
-        b.get_style_context().add_class("suggested-action")
-    return b
-
-
-def _check(key: str, active: bool) -> Gtk.CheckButton:
-    c = Gtk.CheckButton(use_underline=True, active=active)
-    c.set_label(_under(t(key, _LANG)))
-    return c
-
-
-def _time_entry(value: str, a11y_name: str | None = None) -> Gtk.Entry:
-    e = Gtk.Entry(text=value or "", width_chars=5, max_length=5,
-                  placeholder_text="HH:MM")
-    if a11y_name:
-        _a11y(e, "LABEL", [a11y_name])
-    return e
-
-
-def _bind_escape(win: Gtk.Window) -> None:
-    """Escape pencereyi kapatir (eski dialog penceresinin davranisi)."""
-    def _close(*_a):
-        win.close()
-        return True
-    ctrl = Gtk.ShortcutController()
-    ctrl.add_shortcut(Gtk.Shortcut.new(
-        Gtk.ShortcutTrigger.parse_string("Escape"),
-        Gtk.CallbackAction.new(_close)))
-    win.add_controller(ctrl)
-
 
 def row_notes(job: dict) -> list[str]:
-    """Satirin ikinci satirindaki kisa notlar (sunucu limiti, saglama,
-    kaynak, zamanlama penceresi)."""
+    """Satirin ikinci satirindaki kisa notlar (sunucu limiti, dogrulama,
+    kaynak, zamanlama penceresi). Saglama/Merkle ayrintisi basliktaki
+    rozetin ipucundadir."""
     out = []
     if job.get("adaptive") and job.get("adaptive") < job.get("segments_cfg", 0):
-        out.append("⚙ " + t("adaptive_limit", _LANG).replace(
+        out.append("⚙ " + gtr("adaptive_limit").replace(
             "{n}", str(job["adaptive"])))
     if job.get("verifying"):
-        out.append("⏳ " + t("st_verifying", _LANG))
+        out.append("⏳ " + gtr("st_verifying"))
     if job.get("error"):
         out.append("⚠ " + job["error"])
     if job.get("sched_wait") and job.get("window"):
-        out.append("⏱ " + t("sched_wait", _LANG).replace(
+        out.append("⏱ " + gtr("sched_wait").replace(
             "{w}", job["window"]))
     if job.get("sources_dead"):
-        out.append("⛔ " + t("mirrors_dead", _LANG).replace(
+        out.append("⛔ " + gtr("mirrors_dead").replace(
             "{n}", str(job["sources_dead"])))
-    if job.get("state") == "done" and job.get("checksum") == "warn":
-        out.append("⚠ " + t("chk_warn", _LANG))
-    verified = job.get("verified") or []
-    if job.get("state") == "done" and verified:
-        out.append("✓ " + t("chk_ok", _LANG).replace("{a}", ", ".join(verified)))
     return out
 
 
@@ -158,9 +80,10 @@ class JobRow(Gtk.ListBoxRow):
         self.name = Gtk.Label(label=job["filename"], hexpand=True, xalign=0,
                               ellipsize=3)
         self.name.get_style_context().add_class("heading")
+        self.badge = Gtk.Label(visible=False)      # saglama/bildirim rozeti
         self.state = Gtk.Label()
         self.state.get_style_context().add_class("dim-label")
-        head.append(self.name); head.append(self.state)
+        head.append(self.name); head.append(self.badge); head.append(self.state)
         box.append(head)
 
         self.progress = Gtk.ProgressBar(hexpand=True, pulse_step=0.08)
@@ -174,7 +97,7 @@ class JobRow(Gtk.ListBoxRow):
         info.append(self.info)
 
         for action, key, icon in ACTIONS:
-            tip = t(key, _LANG)
+            tip = gtr(key)
             b = Gtk.Button(icon_name=icon, tooltip_text=tip,
                            valign=Gtk.Align.CENTER)
             b.connect("clicked", self._act, action)
@@ -192,6 +115,7 @@ class JobRow(Gtk.ListBoxRow):
     def update(self, job):
         st = job["state"]
         self.state.set_label(tr_state(st))
+        self._show_badge(job)
         if job["size"] > 0:
             frac = min(1.0, job["done"] / job["size"])
             self.progress.set_fraction(frac)
@@ -203,14 +127,32 @@ class JobRow(Gtk.ListBoxRow):
         self.btn["resume"].set_visible(
             st in ("paused", "error", "queued", "canceled"))
         self.btn["pause"].set_visible(playing)
+        self.btn["archive"].set_visible(present.is_archive(job))
         parts = [f"{util.human_size(job['done'])} / "
                  f"{util.human_size(job['size'])}"]
         if playing:
-            parts.append(f"{util.human_size(job['speed'])}{t('per_sec', _LANG)}"
-                         f"   {t('col_eta', _LANG)}: {util.human_eta(job['eta'])}")
+            parts.append(f"{util.human_size(job['speed'])}{gtr('per_sec')}"
+                         f"   {gtr('col_eta')}: {util.human_eta(job['eta'])}")
         parts.extend(row_notes(job))
         parts.append(job["fullpath"])
         self.info.set_text("   ".join(parts))
+
+    def _show_badge(self, job) -> None:
+        """Saglama/Merkle rozeti: simge + renk; ayrinti ipucunda ve ekran
+        okuyucu adinda (ok / warn / mismatch)."""
+        badge = present.integrity_badge(job, lang())
+        if badge is None:
+            self.badge.set_visible(False)
+            return
+        symbol, tip, css = badge
+        ctx = self.badge.get_style_context()
+        for name in ("success", "warning", "error"):
+            ctx.remove_class(name)
+        ctx.add_class(css)
+        self.badge.set_label(symbol)
+        self.badge.set_tooltip_text(tip)
+        _a11y(self.badge, "LABEL", [tip])
+        self.badge.set_visible(True)
 
 
 class AddWindow(Gtk.Window):
@@ -223,7 +165,7 @@ class AddWindow(Gtk.Window):
 
     def __init__(self, app, parent):
         super().__init__(transient_for=parent, modal=True,
-                         title=t("h_new", _LANG), default_width=460)
+                         title=gtr("h_new"), default_width=460)
         self.app = app
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.set_margin_top(12); box.set_margin_bottom(12)
@@ -250,7 +192,7 @@ class AddWindow(Gtk.Window):
             self.seg.set_value(8)
         _field(box, self.seg, "lbl_segments")
 
-        self.chk = Gtk.Entry(placeholder_text=t("ph_checksum", _LANG),
+        self.chk = Gtk.Entry(placeholder_text=gtr("ph_checksum"),
                              hexpand=True)
         _field(box, self.chk, "lbl_checksum")
 
@@ -275,11 +217,11 @@ class AddWindow(Gtk.Window):
         """Dogrular; hata penceresi acik kalir, basarida pencere kapanir."""
         url = self.url.get_text().strip()
         if not url.lower().startswith(("http://", "https://", "ftp://", "ftps://")):
-            self.app._error(t("err_url", _LANG), self)
+            self.app._error(gtr("err_url"), self)
             return
         digest = self.chk.get_text().strip()
         if digest and not util.parse_checksum_spec(digest)[0]:
-            self.app._error(t("cli_bad_checksum", _LANG), self)
+            self.app._error(gtr("cli_bad_checksum"), self)
             return
         buf = self.mirrors.get_buffer()
         text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
@@ -295,7 +237,7 @@ class AddWindow(Gtk.Window):
             except Exception as e:
                 r = {"ok": False, "error": str(e)}
         if not r.get("ok"):
-            self.app._error(t("add_failed", _LANG) + " "
+            self.app._error(gtr("add_failed") + " "
                             + str(r.get("error", "")), self)
             return
         self.close()
@@ -310,7 +252,7 @@ class SettingsWindow(Gtk.Window):
 
     def __init__(self, app, parent):
         super().__init__(transient_for=parent, modal=True,
-                         title=t("h_settings", _LANG), default_width=560,
+                         title=gtr("h_settings"), default_width=560,
                          default_height=660)
         self.app = app
         cfg = app.fetch_config()
@@ -332,11 +274,11 @@ class SettingsWindow(Gtk.Window):
                         margin_start=14, margin_end=14)
         row = 0
         self.dir = Gtk.Entry(text=cfg.get("download_dir") or "",
-                             placeholder_text=t("auto", _LANG))
+                             placeholder_text=gtr("auto"))
         _grid_field(grid, row, self.dir, "lbl_dl_dir"); row += 1
 
         self.lang_codes = ["auto"] + list(LANGS)
-        names = [t("lang_auto", _LANG)] + [LANG_NAMES[k] for k in LANGS]
+        names = [gtr("lang_auto")] + [LANG_NAMES[k] for k in LANGS]
         cur = str(self.initial_lang)
         idx = self.lang_codes.index(cur) if cur in self.lang_codes else 0
         self.lang = Gtk.DropDown.new_from_strings(names)
@@ -372,21 +314,21 @@ class SettingsWindow(Gtk.Window):
         self.sched_stop = _time_entry(stop if _HM.match(stop) else "08:00")
         _grid_field(grid, row, self.sched_stop, "lbl_sched_stop"); row += 1
 
-        frame = Gtk.Frame(label=t("lbl_cat_sched", _LANG))
+        frame = Gtk.Frame(label=gtr("lbl_cat_sched"))
         cbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         cbox.set_margin_top(6); cbox.set_margin_bottom(6)
         cbox.set_margin_start(8); cbox.set_margin_end(8)
         self.cat_rows = {}
         for cat in CATEGORIES:
             w = cats.get(cat) or {}
-            name = t("tab_" + cat, _LANG)
+            name = gtr("tab_" + cat)
             on = w.get("start") and w.get("stop")
             cb = Gtk.CheckButton(use_underline=True, active=bool(on))
             cb.set_label(_under(name))
             a = _time_entry(w.get("start") or "02:00",
-                            name + " — " + t("win_start", _LANG))
+                            name + " — " + gtr("win_start"))
             b = _time_entry(w.get("stop") or "08:00",
-                            name + " — " + t("win_stop", _LANG))
+                            name + " — " + gtr("win_stop"))
             a.set_sensitive(bool(on)); b.set_sensitive(bool(on))
             cb.connect("toggled", lambda c, x=a, y=b:
                        (x.set_sensitive(c.get_active()),
@@ -414,8 +356,8 @@ class SettingsWindow(Gtk.Window):
 
         self.watch_modes = ["delete", "keep", "rename"]
         self.watch_done = Gtk.DropDown.new_from_strings(
-            [t("watch_delete", _LANG), t("watch_keep", _LANG),
-             t("watch_rename", _LANG)])
+            [gtr("watch_delete"), gtr("watch_keep"),
+             gtr("watch_rename")])
         self.watch_done.set_selected(
             self.watch_modes.index(cfg.get("watch_done"))
             if cfg.get("watch_done") in self.watch_modes else 0)
@@ -426,8 +368,11 @@ class SettingsWindow(Gtk.Window):
         self.clipboard = _check("lbl_clipboard",
                                 bool(cfg.get("clipboard_watch")))
         grid.attach(self.clipboard, 0, row, 2, 1); row += 1
+        self.coexist = _check("lbl_coexist", bool(cfg.get("coexist")))
+        self.coexist.set_tooltip_text(gtr("coexist_hint"))
+        grid.attach(self.coexist, 0, row, 2, 1); row += 1
 
-        adv = Gtk.Expander(label=t("lbl_advanced", _LANG))
+        adv = Gtk.Expander(label=gtr("lbl_advanced"))
         ag = Gtk.Grid(column_spacing=12, row_spacing=6, margin_top=6)
         self.retries = Gtk.SpinButton.new_with_range(0, 20, 1)
         self.retries.set_value(int(cfg.get("retries") or 0))
@@ -468,11 +413,11 @@ class SettingsWindow(Gtk.Window):
 
     # --------------------------------------------------------------- yardimci
     def _limit_labels(self) -> list[str]:
-        out = [t("unlimited", _LANG)]
+        out = [gtr("unlimited")]
         for v in self.speeds[1:]:
-            label = util.human_size(v) + t("per_sec", _LANG)
+            label = util.human_size(v) + gtr("per_sec")
             if v not in SPEED_PRESETS:
-                label += " (" + t("limit_custom", _LANG) + ")"
+                label += " (" + gtr("limit_custom") + ")"
             out.append(label)
         return out
 
@@ -577,6 +522,7 @@ class SettingsWindow(Gtk.Window):
             if cfg.get("watch_done") in self.watch_modes else 0)
         self.sidecar.set_active(bool(cfg.get("checksum_sidecar")))
         self.clipboard.set_active(bool(cfg.get("clipboard_watch")))
+        self.coexist.set_active(bool(cfg.get("coexist")))
         self.retries.set_value(int(cfg.get("retries") or 0))
         self.timeout.set_value(int(cfg.get("timeout") or 30))
         self.stall.set_value(int(cfg.get("stall_timeout") or 20))
@@ -585,7 +531,7 @@ class SettingsWindow(Gtk.Window):
         start = self.sched_start.get_text().strip()
         stop = self.sched_stop.get_text().strip()
         if not (_HM.match(start) and _HM.match(stop)):
-            self.app._error(t("err_time", _LANG), self)
+            self.app._error(gtr("err_time"), self)
             return
         cats = {}
         for cat, (cb, a, b) in self.cat_rows.items():
@@ -594,7 +540,7 @@ class SettingsWindow(Gtk.Window):
             w_start = a.get_text().strip()
             w_stop = b.get_text().strip()
             if not (_HM.match(w_start) and _HM.match(w_stop)):
-                self.app._error(t("err_time", _LANG), self)
+                self.app._error(gtr("err_time"), self)
                 return
             cats[cat] = {"start": w_start, "stop": w_stop}
         buf = self.watch_view.get_buffer()
@@ -618,6 +564,7 @@ class SettingsWindow(Gtk.Window):
             "watch_done": self.watch_modes[self.watch_done.get_selected()],
             "checksum_sidecar": self.sidecar.get_active(),
             "clipboard_watch": self.clipboard.get_active(),
+            "coexist": self.coexist.get_active(),
             "retries": int(self.retries.get_value()),
             "timeout": timeout,
             "stall_timeout": stall,
@@ -633,7 +580,7 @@ class SettingsWindow(Gtk.Window):
                     if not r.get("ok"):
                         raise RuntimeError(str(r.get("error", "")))
                     if r.get("warning") == "download_dir":
-                        notes.append(t("warn_dir", _LANG))
+                        notes.append(gtr("warn_dir"))
                 turbo_changed = turbo_want != self.initial_turbo
                 if turbo_changed:
                     self.app.client.request("turbo", on=turbo_want)
@@ -644,15 +591,15 @@ class SettingsWindow(Gtk.Window):
                     self.app.client.request("limit", value=limit)
                 cfg1 = self.app.fetch_config()
             except Exception as e:
-                self.app._error(t("save_failed", _LANG) + " " + str(e), self)
+                self.app._error(gtr("save_failed") + " " + str(e), self)
                 return
             lang_changed = lang != self.initial_lang
             self._apply_config(cfg1)     # etkin (kirpilmis) degerler ekranda
             if lang_changed:
                 # simdilik yalniz yeni pencereler yeni dili kullanir
                 set_gui_lang(lang)
-                notes.append(t("lang_restart", _LANG))
-        self.status.set_text(" ".join(notes) if notes else t("saved", _LANG))
+                notes.append(gtr("lang_restart"))
+        self.status.set_text(" ".join(notes) if notes else gtr("saved"))
         self.app.refresh()
 
 
@@ -666,50 +613,66 @@ class FerdimApp(Gtk.Application):
         self.win: Gtk.Window | None = None
         self.add_win: AddWindow | None = None
         self.settings_win: SettingsWindow | None = None
+        self.archive_win: ArchiveWindow | None = None
+        self.history_win: HistoryWindow | None = None
+        self.hosts_win: HostsWindow | None = None
 
     # ------------------------------------------------------------- lifecycle
     def do_activate(self):
         set_gui_lang(self.env.load_config().get("language"))
         win = Gtk.ApplicationWindow(application=self)
         self.win = win
-        win.set_title(f"FerDim {__version__} — {t('app_title', _LANG)}")
+        win.set_title(f"FerDim {__version__} — {gtr('app_title')}")
         win.set_default_size(780, 480)
 
         hb = Gtk.HeaderBar()
         win.set_titlebar(hb)
 
-        add_btn = Gtk.Button(label=t("h_new", _LANG))
+        add_btn = Gtk.Button(label=gtr("h_new"))
         add_btn.get_style_context().add_class("suggested-action")
         add_btn.connect("clicked", self.on_add)
         hb.pack_start(add_btn)
 
-        self.turbo_btn = Gtk.Button(label="⚡ " + t("turbo", _LANG),
-                                    tooltip_text=t("turbo_hint", _LANG))
+        self.turbo_btn = Gtk.Button(label="⚡ " + gtr("turbo"),
+                                    tooltip_text=gtr("turbo_hint"))
         self.turbo_btn.connect("clicked", self.on_turbo)
         hb.pack_start(self.turbo_btn)
 
-        set_btn = Gtk.Button(label=t("h_settings", _LANG))
+        hist_btn = Gtk.Button(label=gtr("hist_title"))
+        hist_btn.connect("clicked", self.on_history)
+        hb.pack_start(hist_btn)
+
+        hosts_btn = Gtk.Button(label=gtr("hosts_title"))
+        hosts_btn.connect("clicked", self.on_hosts)
+        hb.pack_start(hosts_btn)
+
+        set_btn = Gtk.Button(label=gtr("h_settings"))
         set_btn.connect("clicked", self.on_settings)
         hb.pack_end(set_btn)
 
-        web_btn = Gtk.Button(label=t("web_ui", _LANG))
+        web_btn = Gtk.Button(label=gtr("web_ui"))
         web_btn.connect("clicked", self.on_web)
         hb.pack_end(web_btn)
 
-        self.status = Gtk.Label(label=t("daemon_ok", _LANG), xalign=0,
+        self.status = Gtk.Label(label=gtr("daemon_ok"), xalign=0,
                                 ellipsize=2)
         self.status.get_style_context().add_class("dim-label")
         self.status.set_margin_start(8); self.status.set_margin_end(8)
+        # birlikte yasam durumu (stats.coexist): hat mesgulse baglanti kisilir
+        self.coexist_lbl = Gtk.Label(label="", xalign=0, ellipsize=2)
+        self.coexist_lbl.get_style_context().add_class("dim-label")
+        self.coexist_lbl.set_margin_start(8); self.coexist_lbl.set_margin_end(8)
 
         self.listbox = Gtk.ListBox(valign=Gtk.Align.START,
                                    selection_mode=Gtk.SelectionMode.NONE)
-        self.listbox.set_placeholder(Gtk.Label(label=t("empty_title", _LANG)))
+        self.listbox.set_placeholder(Gtk.Label(label=gtr("empty_title")))
         sw = Gtk.ScrolledWindow(vexpand=True)
         sw.set_child(self.listbox)
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.set_margin_top(6); box.set_margin_bottom(6)
         box.append(sw)
+        box.append(self.coexist_lbl)
         box.append(self.status)
         win.set_child(box)
         win.present()
@@ -719,7 +682,7 @@ class FerdimApp(Gtk.Application):
             GLib.timeout_add(500, self.refresh)
             self.refresh()
         else:
-            self.status.set_text(t("daemon_down", _LANG))
+            self.status.set_text(gtr("daemon_down"))
 
     def connect_client(self):
         try:
@@ -742,7 +705,7 @@ class FerdimApp(Gtk.Application):
             self.failures += 1
             if self.failures == 2:
                 ensure_daemon(self.env)
-            self.status.set_text(t("daemon_lost", _LANG))
+            self.status.set_text(gtr("daemon_lost"))
             return True
         self.failures = 0
         jobs = st["jobs"]
@@ -760,21 +723,37 @@ class FerdimApp(Gtk.Application):
             if jid not in seen:
                 self.listbox.remove(self.rows[jid])
                 del self.rows[jid]
-        nm = t("nm_ok", _LANG) if st.get("nm_connected") else t("nm_off", _LANG)
+        nm = gtr("nm_ok") if st.get("nm_connected") else gtr("nm_off")
         self.status.set_text(
-            f"{t('total_speed', _LANG)}: "
-            f"{util.human_size(st['total_speed'])}{t('per_sec', _LANG)}   "
-            f"{t('active_jobs', _LANG)}: {st['active']}/{st['max_concurrent']}   "
-            f"{t('ext_state', _LANG)}: {nm}")
+            f"{gtr('total_speed')}: "
+            f"{util.human_size(st['total_speed'])}{gtr('per_sec')}   "
+            f"{gtr('active_jobs')}: {st['active']}/{st['max_concurrent']}   "
+            f"{gtr('ext_state')}: {nm}")
+        self._show_coexist(st.get("coexist") or {})
         turbo = bool(st.get("turbo"))
         self.turbo_btn.set_label(
-            "⚡ " + (t("turbo_on", _LANG) if turbo else t("turbo", _LANG)))
+            "⚡ " + (gtr("turbo_on") if turbo else gtr("turbo")))
         ctx = self.turbo_btn.get_style_context()
         if turbo:
             ctx.add_class("destructive-action")
         else:
             ctx.remove_class("destructive-action")
         return True
+
+    def _show_coexist(self, co: dict) -> None:
+        """stats.coexist: mod acik mi, hat mesgulse baglanti kisildi mi."""
+        on = bool(co.get("enabled"))
+        text = (f"{gtr('coexist')}: "
+                + (gtr("coexist_on") if on else gtr("coexist_off")))
+        active = on and bool(co.get("active"))
+        if active:
+            text += " — " + gtr("coexist_active")
+        self.coexist_lbl.set_text(text)
+        ctx = self.coexist_lbl.get_style_context()
+        if active:
+            ctx.add_class("warning")
+        else:
+            ctx.remove_class("warning")
 
     def on_turbo(self, _btn):
         if not self.client:
@@ -789,8 +768,15 @@ class FerdimApp(Gtk.Application):
     def action(self, job_id, action):
         if action == "remove":
             self._confirm_remove(job_id)
+        elif action == "archive":
+            self.on_archive(job_id)
         else:
             self._do_action(job_id, action)
+
+    def on_archive(self, job_id):
+        win = ArchiveWindow(self, self._parent_window(), {"id": job_id})
+        self.archive_win = win
+        win.present()
 
     def _do_action(self, job_id, action):
         if not self.client:
@@ -806,21 +792,27 @@ class FerdimApp(Gtk.Application):
 
     def _confirm_remove(self, job_id):
         """Silme onayi; GTK < 4.10'da onay penceresi yok, dogrudan silinir."""
+        self.confirm(gtr("confirm_remove"),
+                     lambda: self._do_action(job_id, "remove"),
+                     gtr("act_remove"))
+
+    def confirm(self, message: str, on_yes, yes_label: str) -> None:
+        """Genel onay penceresi (silme, profilleri unutma). GTK < 4.10'da
+        kapanis yoktur: eylem dogrudan uygulanir."""
         win = self.get_active_window()
         if not hasattr(Gtk, "AlertDialog"):
-            self._do_action(job_id, "remove")
+            on_yes()
             return
-        ad = Gtk.AlertDialog(message=t("confirm_remove", _LANG),
-                             buttons=[t("btn_cancel", _LANG),
-                                      t("act_remove", _LANG)])
+        ad = Gtk.AlertDialog(message=message,
+                             buttons=[gtr("btn_cancel"), yes_label])
         ad.set_cancel_button(0)
         ad.set_default_button(1)
-        ad.choose(win, None, lambda d, res: self._confirm_done(d, res, job_id))
+        ad.choose(win, None, lambda d, res: self._confirm_done(d, res, on_yes))
 
-    def _confirm_done(self, dialog, res, job_id):
+    def _confirm_done(self, dialog, res, on_yes):
         try:
             if dialog.choose_finish(res) == 1:
-                self._do_action(job_id, "remove")
+                on_yes()
         except Exception:
             pass
 
@@ -857,6 +849,16 @@ class FerdimApp(Gtk.Application):
     def on_settings(self, _btn):
         win = SettingsWindow(self, self._parent_window())
         self.settings_win = win
+        win.present()
+
+    def on_history(self, _btn):
+        win = HistoryWindow(self, self._parent_window())
+        self.history_win = win
+        win.present()
+
+    def on_hosts(self, _btn):
+        win = HostsWindow(self, self._parent_window())
+        self.hosts_win = win
         win.present()
 
     def on_web(self, _btn):

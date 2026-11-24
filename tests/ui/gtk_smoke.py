@@ -1,9 +1,18 @@
 """GTK duman testi (xvfb altinda, bagimsiz kokinlu daemon ile; bkz. run.sh).
+
 Pencere acilir, satir tum durumlarda guncellenir, ekleme kapanisi dogru ve
-hatali girisle gonderilir, onay akisi denetlenir; GLib uyari/kritik mesaji
-ve beklenmeyen kural disi durum yok. XDG_* cevre degiskenleri run.sh verir."""
+hatali girisle gonderilir, onay akisi denetlenir; ayrica 1.7 pencereleri
+(arsiv, gecmis, ana makine profilleri), birlikte yasam anahtari ve saglama
+rozeti gercek daemon uzerinden denenir. Kucuk bir ZIP yerel HTTP
+sunucusundan indirilir; cikarma/gecmis/profil akislari bu is uzerinde
+kosar. GLib uyari/kritik mesaji ve beklenmeyen kural disi durum olmamali.
+XDG_* cevre degiskenleri run.sh verir."""
+import http.server
 import os
 import sys
+import tempfile
+import threading
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -11,6 +20,9 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib
 from ferdim.gui import app as A
+from ferdim.gui.archive_win import ArchiveWindow
+from ferdim.gui.history_win import HistoryWindow
+from ferdim.gui.hosts_win import HostsWindow
 
 LOG = []
 
@@ -21,6 +33,28 @@ def _log(_d, _lvl, msg, _u):
 
 for _dom in ("Gtk", "GLib-GObject", "GLib", "Pango", "Gdk"):
     GLib.log_set_handler(_dom, GLib.LogLevelFlags.LEVEL_WARNING, _log, None)
+
+# --------------------------------------------------------------- yerel sunucu
+WWW = tempfile.mkdtemp(prefix="ferdim-gtk-www-")
+ZIP_NAME = "arsiv.zip"
+with zipfile.ZipFile(os.path.join(WWW, ZIP_NAME), "w") as _z:
+    _z.writestr("a.txt", "a" * 3000)
+    _z.writestr("b.txt", "b" * 2000)
+with open(os.path.join(WWW, "belge.bin"), "wb") as _f:
+    _f.write(b"x" * 5000)
+
+
+class _Quiet(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *_a):
+        pass
+
+
+SRV = http.server.ThreadingHTTPServer(
+    ("127.0.0.1", 0), lambda *a, **k: _Quiet(*a, directory=WWW, **k))
+threading.Thread(target=SRV.serve_forever, daemon=True).start()
+BASE_URL = f"http://127.0.0.1:{SRV.server_address[1]}"
+ZIP_URL = BASE_URL + "/" + ZIP_NAME
+ADD_URL = BASE_URL + "/belge.bin"
 
 JOB = {"id": "smoke1", "filename": "ornek.zip", "url": "http://h/ornek.zip",
        "state": "downloading", "size": 1000, "done": 420, "speed": 123456,
@@ -37,15 +71,53 @@ class Smoke(A.FerdimApp):
         super().__init__()
         self.actions = []
         self.row = None
+        self.zip_job = ""
+        self._finished = False
 
     def _error(self, msg, parent=None):
         self.actions.append(("error", msg))
         Gtk.AlertDialog(message=msg).show(parent or self.get_active_window())
 
+    def until(self, name, cond, then, tries=80, detail=None):
+        """Kosul saglanana kadar 150 ms'de bir yoklar; saglanmazsa zaman
+        asimi kaydedip yine de devam eder (duman testi kilitlenmesin)."""
+        left = [tries]
+
+        def tick():
+            try:
+                ok = bool(cond())
+            except Exception:
+                ok = False
+            if ok or left[0] <= 0:
+                if not ok:
+                    self.actions.append(("timeout", name))
+                    if detail is not None:
+                        try:
+                            print("   DETAIL", name, detail())
+                        except Exception:
+                            pass
+                try:
+                    then()
+                except Exception as e:
+                    self.actions.append(("exception", repr(e)))
+                return False
+            left[0] -= 1
+            return True
+        GLib.timeout_add(150, tick)
+
+    def snapshot(self, job_id):
+        try:
+            for j in self.client.request("stats").get("jobs") or []:
+                if j.get("id") == job_id:
+                    return j
+        except Exception:
+            pass
+        return None
+
     def do_activate(self):
         super().do_activate()
         GLib.timeout_add(900, self.step)
-        GLib.timeout_add(7000, self.finish)
+        GLib.timeout_add(60000, self._finish_once)
 
     @staticmethod
     def windows(cls):
@@ -54,6 +126,7 @@ class Smoke(A.FerdimApp):
 
     def step(self):
         try:
+            self.seed_profile()
             self.row = A.JobRow(self, dict(JOB))
             self.listbox.append(self.row)
             for st in A.STATES:
@@ -62,17 +135,47 @@ class Smoke(A.FerdimApp):
                                  "error": "ornek hata" if st == "error" else ""})
             self.actions.append(("done-buttons", sorted(
                 a for a, b in self.row.btn.items() if b.get_visible())))
+            self.badge_flow()
             self.action("yok", "pause")
             self.on_add(None)
             GLib.timeout_add(300, self.submit_add, False)
             GLib.timeout_add(900, self.submit_bad)
             GLib.timeout_add(1800, self.open_settings)
             GLib.timeout_add(2400, self.settings_flows)
-            GLib.timeout_add(3000, self.confirm)
+            GLib.timeout_add(3000, self.start_confirm)
+            GLib.timeout_add(4200, self.start_zip)
         except Exception as e:
             self.actions.append(("exception", repr(e)))
         return False
 
+    def seed_profile(self):
+        """Kucuk duman dosyalari profil ogrenme esigini (1 MiB) gecmez:
+        hosts penceresini denemek icin depoya bir profil tohumla. Tohum,
+        daemon deposu dosyayi okumadan ONCE yazilir (acilista is yok)."""
+        try:
+            from ferdim.paths import AppEnv
+            from ferdim.profiles import open_profiles
+            open_profiles(AppEnv()).record("127.0.0.1", links=4,
+                                           per_link_bps=500000)
+        except Exception as e:
+            self.actions.append(("exception", repr(e)))
+
+    def badge_flow(self):
+        """Saglama/Merkle rozeti: ok / warn / mismatch ve yok durumu."""
+        ok = True
+        self.row.update({**JOB, "checksum": "ok", "merkle": "ok"})
+        ok = ok and self.row.badge.get_visible() \
+            and self.row.badge.get_text() == "✓"
+        self.row.update({**JOB, "checksum": "warn", "merkle": ""})
+        ok = ok and self.row.badge.get_text() == "⚠"
+        self.row.update({**JOB, "checksum": "mismatch", "merkle": ""})
+        ok = ok and self.row.badge.get_text() == "✗"
+        self.row.update({**JOB, "checksum": "", "merkle": "",
+                         "verified": []})
+        ok = ok and not self.row.badge.get_visible()
+        self.actions.append(("integrity-badge", ok))
+
+    # --------------------------------------------------------- ekleme akisi
     def submit_add(self, bad):
         try:
             wins = self.windows(A.AddWindow)
@@ -80,7 +183,7 @@ class Smoke(A.FerdimApp):
                 self.actions.append(("exception", "ekleme penceresi yok"))
                 return False
             w = wins[-1]
-            w.url.set_text("http://127.0.0.1:1/dosya.bin")
+            w.url.set_text(ADD_URL)
             if bad:
                 w.chk.set_text("zzz")
             w.submit()
@@ -102,6 +205,7 @@ class Smoke(A.FerdimApp):
         except Exception:
             return {}
 
+    # --------------------------------------------------------- ayar akisi
     def open_settings(self):
         if self.client:      # taban: turbo acik (varsayilan azami guc)
             try:
@@ -126,7 +230,7 @@ class Smoke(A.FerdimApp):
             self.actions.append(("settings-untouched", all(
                 after.get(k) == base[k] for k in base)))
             self.actions.append(("settings-saved-label",
-                                 w.status.get_text() == A.t("saved", A._LANG)))
+                                 w.status.get_text() == A.gtr("saved")))
             # turbo acikken secilen limit yok sayilir (celiski olmaz)
             w.limit.set_selected(3)      # 1 MB; alan etkisiz olsa da secilir
             w.save()
@@ -205,7 +309,7 @@ class Smoke(A.FerdimApp):
             self.actions.append(("exception", repr(e)))
         return False
 
-    def confirm(self):
+    def start_confirm(self):
         self._confirm_remove("yok")
         GLib.timeout_add(400, self.confirm_check)
         return False
@@ -224,15 +328,200 @@ class Smoke(A.FerdimApp):
             def choose_finish(self, res):
                 calls.append(res)
                 return self.answer
-        self._confirm_done(Fake(0), None, "is1")
-        self._confirm_done(Fake(1), None, "is1")
-        self.actions.append(("confirm-flow", (done == [("is1", "remove")], len(calls) == 2)))
+        self._confirm_done(Fake(0), None, lambda: done.append(("no", "x")))
+        self._confirm_done(Fake(1), None, lambda: done.append(("is1", "remove")))
+        self.actions.append(("confirm-flow", (done == [("is1", "remove")],
+                                              len(calls) == 2)))
+        return False
+
+    # ------------------------------------------------------- arsiv akisi
+    def start_zip(self):
+        """Kucuk ZIP'i kuyruga ekler; bitince arsiv penceresini acar."""
+        try:
+            r = self.client.request("add", url=ZIP_URL, segments=2,
+                                    paused=False)
+            self.zip_job = r.get("id", "") if r.get("ok") else ""
+
+        except Exception as e:
+            self.actions.append(("exception", repr(e)))
+        self.until("zip-download", lambda: (self.snapshot(self.zip_job) or {})
+                   .get("state") == "done", self.open_archive)
+        return False
+
+    def debug_zip(self):
+        snap = self.snapshot(self.zip_job) or {}
+        st = self.client.request("stats")
+        print("   zip-state:", snap.get("state"), snap.get("done"),
+              snap.get("size"), snap.get("error"), snap.get("error_code"),
+              "sched:", st.get("schedule_active"),
+              "cat:", snap.get("category"))
+        print("   jobs:", [(j.get("id")[:4], j.get("state"),
+                            j.get("category")) for j in st.get("jobs") or []])
+        cfg = self.cfg()
+        print("   cfg:", {k: cfg.get(k) for k in
+                          ("max_concurrent", "speed_limit", "turbo_mode",
+                           "schedule", "smart_queue")})
+        return False
+
+    def open_archive(self):
+        self.action(self.zip_job, "archive")
+        wins = self.windows(ArchiveWindow)
+        self.actions.append(("archive-window", len(wins) == 1))
+        if not wins:
+            return
+        w = wins[-1]
+        self.until("archive-list", lambda: len(w.checks) >= 2,
+                   lambda: self.extract_zip(w))
+
+    def extract_zip(self, w):
+        self.actions.append(("archive-entries", len(w.checks)))
+        for cb, _key in w.checks[1:]:
+            cb.set_active(False)          # yalniz ilk uyeyi cikar
+        self.until("archive-extract",
+                   lambda: w.status.get_text() != "" and w.task == "",
+                   lambda: self.archive_extracted(w))
+        w.extract()
+
+    def archive_extracted(self, w):
+        dest = os.path.join(self.cfg().get("download_dir") or "", "arsiv")
+        want = A.gtr("zip_extracted", n=1, dest=dest)
+        self.actions.append(("archive-extract",
+                             w.status.get_text().startswith(want)))
+        # yalniz secilen uye cikarildi mi
+        self.actions.append(("archive-files", os.path.isfile(
+            os.path.join(dest, "a.txt"))
+            and not os.path.isfile(os.path.join(dest, "b.txt"))))
+        w.close()
+        self.phase_history()
+
+    # ------------------------------------------------------ gecmis akisi
+    def phase_history(self):
+        self.on_history(None)
+        wins = self.windows(HistoryWindow)
+        self.actions.append(("history-window", len(wins) == 1))
+        if not wins:
+            return
+        w = wins[-1]
+        self.until("history-list", lambda: len(w.recs) >= 1,
+                   lambda: self.history_search(w))
+
+    def history_search(self, w):
+        self.actions.append(("history-rows", len(w.recs) >= 1))
+        w.search.set_text("arsiv")
+        w.load()
+        self.until("history-search",
+                   lambda: len(w.recs) == 1 and "arsiv" in
+                   str(w.recs[0][1].get("filename") or ""),
+                   lambda: self.history_redownload(w))
+
+    def history_redownload(self, w):
+        if not w.recs:
+            self.actions.append(("exception", "gecmis satiri yok"))
+            return
+        rec = w.recs[0][1]
+        before = len(self.client.request("stats").get("jobs") or [])
+        w._redownload(None, str(rec.get("id") or ""))
+        self.until("history-redownload",
+                   lambda: w.status.get_text() != "",
+                   lambda: self.history_done(w, before, rec))
+
+    def history_done(self, w, before, rec):
+        after = len(self.client.request("stats").get("jobs") or [])
+        want = A.gtr("hist_redownloaded",
+                     name=rec.get("filename") or rec.get("url") or "")
+        self.actions.append(("history-redownload",
+                             after == before + 1
+                             and w.status.get_text() == want))
+        w.close()
+        self.phase_hosts()
+
+    # ---------------------------------------------------- profil akisi
+    def phase_hosts(self):
+        self.on_hosts(None)
+        wins = self.windows(HostsWindow)
+        self.actions.append(("hosts-window", len(wins) == 1))
+        if not wins:
+            return
+        w = wins[-1]
+        self.until("hosts-list", lambda: w.listbox.get_first_child()
+                   is not None, lambda: self.hosts_forget(w))
+
+    def hosts_forget(self, w):
+        row = w.listbox.get_first_child()
+        text = row.get_child().get_first_child().get_text()
+        self._host = text.split()[0] if text else ""
+        self.actions.append(("hosts-row", bool(self._host)))
+        w._forget(None, self._host)
+        marked = []
+
+        def forgotten_ok():
+            ok = (w.listbox.get_first_child() is None
+                  and w.status.get_text()
+                  == A.gtr("hosts_forgotten", host=self._host))
+            if ok and not marked:
+                marked.append(True)
+                self.actions.append(("hosts-forget", True))
+            return ok
+
+        self.until("hosts-forget", forgotten_ok, lambda: self.hosts_clear(w),
+                   detail=lambda: (self._host, w.status.get_text(),
+                                   len(self.client.request("hosts")
+                                       .get("hosts") or [])))
+
+    def hosts_clear(self, w):
+        self.confirm = lambda msg, on_yes, label: on_yes()
+        w.forget_all()
+        marked = []
+
+        def cleared_ok():
+            ok = (not w.forget_all_btn.get_sensitive()
+                  and w.status.get_text() != "")
+            if ok and not marked:
+                marked.append(True)
+                self.actions.append(("hosts-forget-all", True))
+            return ok
+
+        self.until("hosts-forget-all", cleared_ok,
+                   lambda: self.phase_coexist(w))
+
+    def phase_coexist(self, w):
+        w.close()
+        self.on_settings(None)
+        wins = self.windows(A.SettingsWindow)
+        if not wins:
+            self.actions.append(("exception", "ayar penceresi yok"))
+            return
+        sw = wins[-1]
+        sw.coexist.set_active(True)
+        sw.save()
+        st = self.client.request("stats").get("coexist") or {}
+        label = self.coexist_lbl.get_text()
+        self.actions.append(("coexist-toggle", bool(st.get("enabled"))))
+        self.actions.append(("coexist-label",
+                             A.gtr("coexist") in label
+                             and A.gtr("coexist_on") in label))
+        sw.coexist.set_active(False)          # ayari geri birak
+        sw.save()
+        self.actions.append(("coexist-restore",
+                             not (self.client.request("stats")
+                                  .get("coexist") or {}).get("enabled")))
+        sw.close()
+        self._finish_once()
+
+    # ------------------------------------------------------------- bitis
+    def _finish_once(self):
+        if self._finished:
+            return False
+        self._finished = True
+        self.finish()
         return False
 
     def finish(self):
         ok = True
         leftovers = [type(w).__name__ for w in Gtk.Window.list_toplevels()
-                     if isinstance(w, (A.AddWindow, A.SettingsWindow))]
+                     if isinstance(w, (A.AddWindow, A.SettingsWindow,
+                                       ArchiveWindow, HistoryWindow,
+                                       HostsWindow))]
         self.actions.append(("windows-closed", leftovers == []))
         for kind, val in self.actions:
             print("  ", kind, ":", val)
@@ -242,10 +531,10 @@ class Smoke(A.FerdimApp):
         loud = [m for m in LOG if "CRITICAL" in m or "Warning" in m]
         if loud or any(k == "exception" for k, _ in self.actions):
             ok = False
-        if ("error", A.t("cli_bad_checksum", A._LANG)) not in self.actions:
+        if ("error", A.gtr("cli_bad_checksum")) not in self.actions:
             print("   EKSIK: gecersiz saglama hatasi gosterilmedi")
             ok = False
-        if ("error", A.t("err_url", A._LANG)) in self.actions:
+        if ("error", A.gtr("err_url")) in self.actions:
             ok = False
         for item in (("add-window", "ok"), ("add-window", "bad"),
                      ("settings-window", True),
@@ -256,6 +545,21 @@ class Smoke(A.FerdimApp):
                      ("settings-stall-clamp", True),
                      ("settings-turbo-restore", True),
                      ("settings-turbo-reopen", True),
+                     ("integrity-badge", True),
+                     ("archive-window", True),
+                     ("archive-entries", 2),
+                     ("archive-extract", True),
+                     ("archive-files", True),
+                     ("history-window", True),
+                     ("history-rows", True),
+                     ("history-redownload", True),
+                     ("hosts-window", True),
+                     ("hosts-row", True),
+                     ("hosts-forget", True),
+                     ("hosts-forget-all", True),
+                     ("coexist-toggle", True),
+                     ("coexist-label", True),
+                     ("coexist-restore", True),
                      ("windows-closed", True)):
             if item not in self.actions:
                 print("   EKSIK:", item)
@@ -263,7 +567,6 @@ class Smoke(A.FerdimApp):
         print("GTK SMOKE:", "OK" if ok else "FAIL")
         sys.stdout.flush()
         self.quit()
-        return False
 
 
 app = Smoke()
