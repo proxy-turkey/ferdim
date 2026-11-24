@@ -86,7 +86,8 @@ def cmd_add(a, env):
                       insecure=a.insecure, referer=a.referer,
                       limit=a.limit, mirrors=a.mirror,
                       sha256=a.sha256, md5=a.md5,
-                      sha1=a.sha1, sha512=a.sha512, checksums=checks)
+                      sha1=a.sha1, sha512=a.sha512, checksums=checks,
+                      merkle=a.merkle)
         if not r.get("ok"):
             print(_("cli_error") + ":", r.get("error"), file=sys.stderr)
             return 1
@@ -332,6 +333,58 @@ def cmd_archive(a, env):
             return 0
 
 
+def cmd_merkle(a, env):
+    """Parca bazli butunluk: bildirim uret / dogrula / degisen parcalari indir.
+
+    make ve verify yereldir (daemon gerekmez); update tek akisli HTTP Range
+    kullanir ve yalnizca yerel dosyada eslesmeyen parcalari indirir."""
+    from . import cdc
+    if a.action == "make":
+        try:
+            man = cdc.make_manifest(a.file)
+            out = a.out or str(a.file) + cdc.SUFFIX
+            cdc.write_manifest(man, out)
+        except (OSError, ValueError) as e:
+            print(_("cli_error") + ":", e, file=sys.stderr)
+            return 1
+        print(f"{_('merkle_manifest')}: {out}")
+        print(f"{_('merkle_chunks')}: {len(man.chunks)}")
+        print(f"{_('merkle_root')}: {man.root}")
+        return 0
+    if a.action == "verify":
+        try:
+            man = cdc.read_manifest(a.manifest or str(a.file) + cdc.SUFFIX)
+            size_ok, bad = cdc.verify_file(a.file, man)
+        except (OSError, ValueError) as e:
+            print(_("cli_error") + ":", e, file=sys.stderr)
+            return 1
+        if not size_ok:
+            print(_("merkle_size_bad"), file=sys.stderr)
+            return 1
+        if bad:
+            print(_("merkle_bad", n=len(bad)), file=sys.stderr)
+            for off, ln in bad:
+                print(f"  {off}-{off + ln - 1}")
+            return 1
+        print(f"{_('merkle_root')}: {man.root}")
+        print(_("merkle_ok"))
+        return 0
+    from .engine import httpcli
+    opt = httpcli.DlOptions(user_agent=f"FerDim/{__version__}", timeout=30)
+    try:
+        man = cdc.read_manifest(a.manifest)
+        res = cdc.update_file(a.file, a.url, man, a.out, opt)
+    except (OSError, ValueError) as e:
+        print(_("cli_error") + ":", e, file=sys.stderr)
+        return 1
+    print(res["path"])
+    print(_("merkle_update", reused=util.human_size(res["reused"]),
+            fetched=util.human_size(res["fetched"])))
+    print(f"{_('merkle_chunks')}: {res['chunks']}")
+    print(f"{_('merkle_root')}: {res['root']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ferdim",
@@ -365,6 +418,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "anlasilan ozet")
     sp.add_argument("--mirror", action="append", default=[],
                     help="aynak URL (tekrarlanabilir; .metalink otomatik)")
+    sp.add_argument("--merkle",
+                    help="parca bazli dogrulama bildirimi (URL ya da yerel yol)")
     sp.set_defaults(fn=cmd_add)
 
     sp = sub.add_parser("add-file",
@@ -444,6 +499,26 @@ def build_parser() -> argparse.ArgumentParser:
             one.add_argument("members", nargs="*",
                              help="uye yollari (bos = tumu)")
         one.set_defaults(fn=cmd_archive)
+
+    sp = sub.add_parser("merkle",
+                        help="parca bazli butunluk: bildirim uret/dogrula/onar")
+    msp = sp.add_subparsers(dest="action", required=True)
+    one = msp.add_parser("make", help="FILE.ferdim-merkle bildirimi uret")
+    one.add_argument("file")
+    one.add_argument("-o", "--out", help="bildirim yolu")
+    one.set_defaults(fn=cmd_merkle)
+    one = msp.add_parser("verify", help="dosyayi bildirimle dogrula")
+    one.add_argument("file")
+    one.add_argument("manifest", nargs="?",
+                     help="bildirim (varsayilan: FILE.ferdim-merkle)")
+    one.set_defaults(fn=cmd_merkle)
+    one = msp.add_parser("update",
+                         help="eski dosyayi koru, yalnizca degisen parcalari indir")
+    one.add_argument("file")
+    one.add_argument("url")
+    one.add_argument("--manifest", required=True, help="yeni bildirim")
+    one.add_argument("-o", "--out", help="cikti (varsayilan: FILE)")
+    one.set_defaults(fn=cmd_merkle)
 
     sp = sub.add_parser("daemon", help="arka plan servisini on planda calistir")
     sp.set_defaults(fn=cmd_daemon)

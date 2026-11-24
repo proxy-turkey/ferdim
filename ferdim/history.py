@@ -110,6 +110,7 @@ def _options(job, spec) -> str:
         "ua": spec.user_agent,
         "mirrors": list(spec.mirrors or []),
         "checksums": spec.wanted(),
+        "merkle": spec.merkle,
         "limit": int(spec.limit or 0),
     }
     return json.dumps({k: v for k, v in opts.items() if v}, ensure_ascii=False)

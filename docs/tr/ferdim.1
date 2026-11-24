@@ -57,6 +57,10 @@ hesaplanır; geçersiz bir değer reddedilir),
 .BI \-\-checksum " ALG:HEX"
 desteklenen herhangi bir özet (sha256, sha512, md5, sha1); özet
 uzunluğundan tek anlamlı olduğunda algoritma atlanabilir,
+.BI \-\-merkle " URL|DOSYA"
+parça bazlı bütünlük bildirimi (\fB.ferdim-merkle\fR, aşağıdaki \fBmerkle\fR
+komutuna bakın); doğrulamada başarısız olan parçaların yalnızca bayt
+aralıkları yeniden indirilir,
 .BI \-\-limit " HIZ"
 iş başına hız sınırı (ör. 2MB; KB, MB ve GB 1024 tabanlıdır),
 .B \-k
@@ -98,6 +102,26 @@ kapasitesinin %15'i) birkaç saniye aşarsa her iş bağlantılarının yarısı
 bırakır (en az biri kalır) ve denetleyici yukarı yoklamayı durdurur; on
 saniyelik sessizlikten sonra tavan kalkar ve bağlantılar yeniden kurulur.
 Durum web arayüzünün alt bilgisinde görünür.
+.TP
+.BI merkle " make DOSYA"
+\fIDOSYA.ferdim-merkle\fR yazar: içerik tanımlı (FastCDC, 256 KiB / 1 MiB /
+4 MiB) parça ofsetleri, parça başına SHA-256 ve parça özetleri üzerinde
+Merkle kökü. Yayıncı bildirimi dosyanın yanında \&.sha256 yan dosyası gibi
+barındırabilir; indirici \fI<url>.ferdim-merkle\fR adresini kendiliğinden
+bulur.
+.TP
+.BI merkle " verify DOSYA [BİLDİRİM]"
+Bildirimde listelenen parçaları yeniden özetler (varsayılan
+\fIDOSYA.ferdim-merkle\fR) ve ya eşleşen kökü ya da bozuk parçaların bayt
+aralıklarını bildirir. Doğrulama dosyayı tek geçişte okur; parçalama
+yeniden çalıştırılmaz.
+.TP
+.BI merkle " update DOSYA URL \-\-manifest " BİLDİRİM
+\fIURL\fR'nin yeni sürümünü, baytları \fIDOSYA\fR içinde zaten bulunan her
+parçayı koruyarak kurar (içerik tanımlı sınırlar ekleme/silmeye dayanıklıdır)
+ve yalnızca eksik bayt aralıklarını HTTP Range ile indirir. Sonuç parça parça
+doğrulanır ve ancak ondan sonra hedefin yerine taşınır (\fB\-o\fR başka bir
+hedef seçer).
 .TP
 .BI config " [\-\-set JSON]"
 Ayarları gösterir ya da değiştirir: parçalar, eşzamanlılık, zamanlayıcı

@@ -342,6 +342,7 @@ class QueueManager:
                 # baslasa da kaybolmasin
                 "mirrors": list(j.spec.mirrors or []),
                 "checksums": j.spec.wanted(),
+                "merkle": j.spec.merkle,
                 "limit": int(j.spec.limit or 0),
             })
         util.atomic_write_json(self.env.state_dir / QUEUE_FILE, data)
@@ -370,6 +371,7 @@ class QueueManager:
                 checksums={a: v for a, v in checks.items()
                            if a not in ("sha256", "md5")},
                 limit=int(item.get("limit", 0) or 0),
+                merkle=str(item.get("merkle") or ""),
             )
             job = DownloadJob(self.env, self.cfg, spec, job_id=item.get("id"))
             job.kind = item.get("kind", "http")
