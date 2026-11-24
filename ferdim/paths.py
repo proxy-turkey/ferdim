@@ -39,6 +39,8 @@ DEFAULTS = {
     "watch_interval": 3,           # tarama araligi (sn)
     # --- kuyruk gecmisi (1.5) ---
     "history_days": 365,           # 0 = gecmisi sonsuza kadar sakla
+    # --- ogrenilen ana makine profilleri (1.6) ---
+    "learn_hosts": True,           # biten isin baglanti tavani/RTT'sini hatirla
 }
 
 
