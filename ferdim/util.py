@@ -307,15 +307,14 @@ def window_open(start, stop, now=None) -> bool:
 
 
 def zip_preview(path, limit: int = 500):
-    """ZIP icindekiler listesi: [(isim, boyut, sikistirmis)]. Hata olursa
-    (None, mesaj) dondurur."""
+    """Uyumluluk sarmali: [(isim, boyut, sikistirmis)] listesi. Arsiv
+    mantigi ferdim/archive.py'de; eski istemciler icin imza korunur.
+    Hata olursa (None, mesaj) dondurur."""
     try:
-        import zipfile
-        with zipfile.ZipFile(path) as zf:
-            infos = zf.infolist()
-            entries = [(i.filename, i.file_size, i.compress_size)
-                       for i in infos[:limit] if not i.is_dir()]
-            more = f"+{len(infos) - limit}…" if len(infos) > limit else ""
-            return entries, more
+        from . import archive
+        info = archive.describe(path, nested=False, limit=limit)
+        entries = [(e["name"], e["size"], e["compressed"] or 0)
+                   for e in info["entries"]]
+        return entries, info["note"]
     except Exception as e:
         return None, str(e)
