@@ -129,6 +129,25 @@ ve yalnızca eksik bayt aralıklarını HTTP Range ile indirir. Sonuç parça pa
 doğrulanır ve ancak ondan sonra hedefin yerine taşınır (\fB\-o\fR başka bir
 hedef seçer).
 .TP
+.BI publish " DİZİN " \-\-base\-url " URL"
+İndirme sitesinin yayıncı tarafını üretir: \fIDİZİN\fR içindeki her normal
+dosya için \fIDOSYA.ferdim-merkle\fR (içerik tanımlı parçalar ve Merkle
+kökü, bkz. yukarıdaki \fBmerkle\fR), \fIDOSYA.sha256\fR (coreutils biçimi)
+ve \fIDOSYA.meta4\fR yazılır; bu RFC 5854 belgesi adı, boyutu, SHA\-256'yı,
+merkle metaurl değerini (\fIapplication/x-ferdim-merkle\fR) ve merkle
+kökünü, ayrıca indirme adreslerini taşır: \fIURL\fR ile dosya adının
+birleşimi öncelik 1'dir, her \fB\-\-mirror\fR öncelik 2 ve sonrasıyla
+eklenir. Dizinin tamamı için tek \fIindex.meta4\fR yazılır; böylece bu
+belgelerden birine \fBferdim add-file\fR uygulamak dosyaları aynaları ve
+özetleriyle kuyruğa ekler. Çıktı bayt\-kararlıdır: dosyalar ad sırasıyla
+işlenir, tek zaman damgası dosyanın mtime değerinden gelen
+\fB<published>\fR alanıdır (RFC 3339, UTC) ve değişmeyen dosyalar yeniden
+yazılmaz, dolayısıyla tekrar çalıştırma fark üretmez. Güncel bildirim
+(aynı boyut, dosyadan yaşlı değil) yeniden kullanılır; \fB\-\-force\fR yine
+de yeniden üretir, \fB\-\-no-merkle\fR parça bildirimini atlar ve metaurl
+değerini düşürür, \fB\-\-glob\fR kümeyi eşleşen dosya adlarıyla sınırlar.
+Adreslerde adlar yüzde\-kodlanır, alt dizinlere inilmez.
+.TP
 .BI config " [\-\-set JSON]"
 Ayarları gösterir ya da değiştirir: parçalar, eşzamanlılık, zamanlayıcı
 penceresi ve kategori başına pencereler (\fIschedule.categories\fR), dil,
