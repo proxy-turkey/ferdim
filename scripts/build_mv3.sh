@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# FerDim eklentisi icin MV3 "spike" derlemesi.
+# FerDim eklentisinin MV3 derlemesi: kaynagi denetler ve paketler.
 #
-# extension/ dizinini gecici bir cikti dizinine kopyalar, manifest.json'u
-# python3 stdlib ile MV3'e cevirir (kalici kaynak degismez) ve sonucu
-# web-ext ile denetler. Amac onceden uyumlulugu olcmek; yayin MV2'den
-# yapilmaya devam eder (docs/mv3-spike.md).
+# 1.7 ile eklenti kaynagi artik dogrudan manifest_version 3'tur
+# (docs/mv3-spike.md). Bu betik eskiden MV2 kaynagindan bir MV3 "varyanti"
+# uretiyordu; simdi yayinlanan kaynagi denetleyip dagitilabilir zip uretir:
+#   1. manifest_version 3 kontrolu (MV2'ye sessiz donus olmasin)
+#   2. web-ext lint --warnings-as-errors (0 hata / 0 uyari zorunlu)
+#   3. python3 stdlib zipfile ile dist/ferdim-<surum>.zip
 #
 # Kullanim:
-#   bash scripts/build_mv3.sh            # gecici dizin
-#   bash scripts/build_mv3.sh /tmp/mv3   # belirli dizin (uzerine kopyalanir)
+#   bash scripts/build_mv3.sh               # denetle + paketle
+#   bash scripts/build_mv3.sh --lint-only   # yalnizca denetle
+#   bash scripts/build_mv3.sh /tmp/mv3.zip  # belirli cikti yolu
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -17,71 +20,52 @@ if [ ! -f "$src/manifest.json" ]; then
   echo "hata: $src/manifest.json yok" >&2
   exit 1
 fi
-out="${1:-$(mktemp -d "${TMPDIR:-/tmp}/ferdim-mv3-XXXXXX")}"
 
-mkdir -p "$out"
-cp -a "$src/." "$out/"
-
-SRC="$src" OUT="$out" python3 - <<'PY'
+python3 - "$src/manifest.json" <<'PY'
 import json
-import os
-import pathlib
 import sys
 
-src = pathlib.Path(os.environ["SRC"])
-out = pathlib.Path(os.environ["OUT"])
-orig = json.loads((src / "manifest.json").read_text(encoding="utf-8"))
-m = json.loads(json.dumps(orig))          # derin kopya
-
-changes = []
-
-m["manifest_version"] = 3
-changes.append("manifest_version 2 -> 3")
-
-perms = [p for p in m.get("permissions", []) if "<" not in p and "://" not in p]
-hosts = list(m.get("host_permissions") or [])
-for p in orig.get("permissions", []):
-    if "<" in p or "://" in p:
-        if p not in hosts:
-            hosts.append(p)
-m["permissions"] = perms
-if hosts:
-    m["host_permissions"] = hosts
-    changes.append("host_permissions <- " + ", ".join(hosts))
-
-action = m.pop("browser_action", None)
-if action is not None:
-    m["action"] = action
-    changes.append("browser_action -> action")
-
-# Firefox MV3 page_action anahtarini/API'sini korur (action'a birlestirmez),
-# bu yuzden anahtar yerinde kalir; Chromium icin ayri bir donusum gerekir.
-if "page_action" in m:
-    changes.append("page_action korundu (Firefox MV3)")
-
-bg = m.get("background")
-if isinstance(bg, dict):
-    if bg.pop("persistent", None) is not None:
-        changes.append("background.persistent kaldirildi (MV3 hatasi olurdu)")
-    else:
-        # event page: Firefox MV3'te scripts destekli, service_worker yok
-        changes.append("background.scripts korundu (event page)")
-    m["background"] = bg
-
-(out / "manifest.json").write_text(
-    json.dumps(m, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-print("MV3 varyanti :", out)
-for line in changes:
-    print("  -", line)
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+if m.get("manifest_version") != 3:
+    sys.exit("hata: manifest_version 3 bekleniyordu "
+             "(kaynak MV2'ye donduyse docs/mv3-spike.md)")
+for key in ("host_permissions", "action", "background"):
+    if key not in m:
+        sys.exit(f"hata: manifest.json icinde {key} yok")
+if "scripting" not in m.get("permissions", []):
+    sys.exit("hata: 'scripting' izni yok (baglanti tarama icin gerekli)")
+print("kaynak : manifest_version 3, MV3 anahtarlari tamam")
 PY
 
 web_ext="${WEB_EXT:-web-ext@10.8.0}"
-# MV3 icin --warnings-as-errors kullanilmaz: bilinen ve belgelenmis
-# uyari(lar) var (tabs.executeScript -> scripting API). Hata varsa komut
-# yine sifirdan farkli kodla doner.
-echo "lint         : npx -y $web_ext lint --source-dir $out"
-npx -y "$web_ext" lint --source-dir "$out"
-echo
-echo "not: MV3'te 'tabs.executeScript' yok; grab ozelligi scripting API'sine"
-echo "     tasinmali (docs/mv3-spike.md, 'Migration plan')."
+echo "lint   : npx -y $web_ext lint --source-dir $src --warnings-as-errors"
+npx -y "$web_ext" lint --source-dir "$src" --warnings-as-errors
+
+if [ "${1:-}" = "--lint-only" ]; then
+  echo "bitti   : yalnizca denetim istendi, paket uretilmedi"
+  exit 0
+fi
+
+version=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["version"])' \
+  "$src/manifest.json")
+out="${1:-$repo/dist/ferdim-$version.zip}"
+
+OUT="$out" SRC="$src" python3 - <<'PY'
+import os
+import pathlib
+import zipfile
+
+src = pathlib.Path(os.environ["SRC"])
+out = pathlib.Path(os.environ["OUT"])
+out.parent.mkdir(parents=True, exist_ok=True)
+if out.exists():
+    out.unlink()
+
+# Manifest kokte olmali; yol ayirici her zaman "/" (zip standardi).
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    for p in sorted(src.rglob("*")):
+        if p.is_file():
+            z.write(p, p.relative_to(src).as_posix())
+
+print(f"paket  : {out} ({out.stat().st_size} bayt)")
+PY
