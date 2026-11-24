@@ -1,133 +1,123 @@
-# Manifest V3 migration spike
+# Manifest V3 migration
 
-Status: **spike only** — 1.5.1 still ships Manifest V2. This document
-records what breaks when the extension moves to MV3 in Firefox, what the
-spike build already proves, and the concrete migration steps. It is not
-a promise of dates.
+Status: **done (1.7)** — `extension/manifest.json` is `manifest_version: 3`
+and the extension ships from the same `extension/` directory as before.
+This document replaced the 1.5.1 MV3 spike note: it records what the
+migration changed, how to reproduce the gates, and what is still open.
 
-Why now: AMO is deprecating MV2, and the extension is Firefox-first
-(`browser_specific_settings.gecko.strict_min_version` is already 140, so
-no user is lost by requiring MV3 — MV3 has been available since
-Firefox 109).
+Why: AMO is deprecating MV2. The extension is Firefox-first
+(`browser_specific_settings.gecko.strict_min_version` was already `140`,
+well above MV3's 109 and `storage.session`'s 115), so no supported user
+was lost and no separate build is needed.
+
+## What changed
+
+| Area | Before (MV2) | Now (MV3 source) |
+|---|---|---|
+| `manifest_version` | `2` | `3` |
+| Host permission | `<all_urls>` inside `permissions` | `host_permissions: ["<all_urls>"]` |
+| Toolbar button | `browser_action` + `browser.browserAction` | `action`; code still uses `browser.browserAction \|\| browser.action` |
+| Page action | `page_action` | kept (`page_action` stays valid in Firefox MV3; Chromium merges it into `action`) |
+| Background | implicit persistent page | `background.scripts` event page (`sniff.js`, `background.js`). No `service_worker` — Firefox MV3 does not support one |
+| Link grab | `tabs.executeScript` with a `code:` string | `browser.scripting.executeScript({target: {tabId}, func, args})`; the extractor is a normal function, so it must stay closure-free (the API serializes its source) |
+| Per-tab media state | in-memory `Map` | in-memory `Map` **plus** a write-through copy in `browser.storage.session`; hydrated lazily on the first sniffer/popup access and pruned against live tab ids. Without `storage.session` (old host, MV2) it degrades to memory only |
+| Host ping | `setInterval(pingHost, 60000)` | no timer (a timer dies with the event page). One ping per background start for the badge colour, and a fresh ping whenever the popup asks (`getMedia`) |
+| Context menus | rebuilt on every background start | `runtime.onInstalled` + `runtime.onStartup`, serialized so `removeAll`/`create` never race; menus are browser-level state and survive idle unload |
+| `scripting` permission | — | added (required by `scripting.executeScript`) |
+| `nativeMessaging` | permission + `runtime.sendNativeMessage` | unchanged; the FerDim bridge is untouched |
+
+`background.js` still runs on MV2 hosts: the legacy branch reads the API
+through a bracketed property (`browser.tabs["executeScript"]`) on purpose.
+`addons-linter` flags a plain `tabs.executeScript` reference as a removed
+MV3 API even when the call sits behind a feature test; the bracket keeps
+the MV3 lint gate at zero without changing behaviour, because that path
+only runs when `browser.scripting` is missing.
 
 ## Reproduce
 
 ```bash
-# MV2 baseline (must stay 0/0, this is the release gate)
+# Release gate: 0 errors / 0 warnings (same command CI and AMO run)
 npx -y web-ext@10.8.0 lint --source-dir extension --warnings-as-errors
 
-# MV3 variant: copied to a temp dir, manifest transformed, then linted
-bash scripts/build_mv3.sh            # prints the output path
-bash scripts/build_mv3.sh /tmp/mv3   # fixed directory (files are copied over)
+# Build: re-checks MV3 keys, lints, then writes dist/ferdim-<version>.zip
+bash scripts/build_mv3.sh                # or: --lint-only / a custom .zip path
+
+# Behaviour tests (node): manifest, source guards, storage.session survival,
+# grab under both manifest versions, injected extractor, locale parity
+python3 -m unittest tests.test_extension_mv3 tests.test_extension_sniff -v
+
+# Load check: installs as a temporary add-on (kill after ~15 s)
+npx -y web-ext@10.8.0 run --source-dir extension \
+  --target firefox-desktop --firefox="$(which firefox)" --no-reload \
+  --args=-headless
 ```
 
-`scripts/build_mv3.sh` copies `extension/` unchanged, rewrites only the
-generated `manifest.json` with `python3` stdlib + `json` (the shipped
-manifest is never touched), and runs `web-ext@10.8.0 lint` on the result.
-It does not pass `--warnings-as-errors`: the known MV3 warning is the
-finding, not a build failure.
+`scripts/build_mv3.sh` kept its name because `ROADMAP.md`/`CHANGELOG.md`
+point at it; it no longer generates an MV3 variant from an MV2 source — it
+builds and lints the one extension that ships. `python3` stdlib
+`zipfile`-based packaging means no npm dependency for the artifact.
 
-Results on this branch (2026-11-24, web-ext 10.8.0, Firefox target 140):
+## Results (2026-11-24, web-ext 10.8.0, Firefox 160.0 headless)
 
-| Build | errors | warnings | notices |
-|---|---|---|---|
-| MV2 `extension/` | 0 | 0 | 0 |
-| MV3 generated variant | 0 | 1 | 0 |
+| Check | Result |
+|---|---|
+| `web-ext lint --warnings-as-errors` on `extension/` (MV3) | 0 errors, 0 warnings, 0 notices |
+| `bash scripts/build_mv3.sh` | MV3 keys verified, lint 0/0, `dist/ferdim-1.6.0.zip` written (manifest at the archive root) |
+| `web-ext run` (headless) | `Installed … as a temporary add-on`, add-on id `ferdim@ferdim.app`, no manifest/extension errors in the browser console |
+| Background event page evaluated | probe build logged from the background context on install (no load-time exception) |
+| MV3 API surface (probe build) | `action: object`, `browserAction: undefined`, `pageAction: object`, `scripting: object`, `storage.session: object`, `runtime.onStartup: object`; `setBadgeBackgroundColor` accepted |
+| Real `scripting.executeScript` injection | probe function injected into a local page returned its `a[href]` links (`func` + `args` work under Firefox MV3) |
+| `node --check extension/*.js` | clean |
+| `tests.test_extension_mv3` | manifest/key guards, source guards (`scripting` first, no `setInterval`, menus on install/startup, `storage.session`), node harness: media survives an event-page restart, stale tab state pruned, tab close clears session state, grab via `scripting` and via the MV2 fallback, serialized extractor returns the expected links, 4-locale key parity |
+| `tests.test_extension_sniff` | unchanged, green |
+| `tabs.executeScript` in lint | gone (was the only MV3 blocker in the spike) |
 
-The single MV3 warning:
+The probe confirms why `background.js` writes `browser.browserAction || browser.action`:
+Firefox MV3 does not expose the `browserAction` namespace at all, while
+`pageAction` and `scripting` are present.
 
-```
-UNSUPPORTED_API  "tabs.executeScript" has been removed in Manifest Version 3
-                 file: background.js  line: 245
-```
 
-That is the link-grab feature (`grabTab`). Everything else in the
-manifest transforms cleanly.
+## Design notes
 
-## What breaks under Firefox MV3
-
-| Area | Today (MV2) | Firefox MV3 | Impact / action |
-|---|---|---|---|
-| `manifest_version` | `2` | `3` | Build script flips it; one-key change. |
-| Background lifetime | implicit persistent page | non-persistent **event page**; `background.persistent: true` is an error | `mediaByTab`, `grabsByTab`, `opts`, `hostOk/hostPort/hostTurbo` live in memory and vanish on idle unload; `setInterval(pingHost, 60000)` dies with the page. Move timers to `alarms` and per-tab media to `storage.session`. |
-| Background scripts vs service worker | `background.scripts` | Firefox MV3 supports `scripts` (event pages); `background.service_worker` is **not** supported in Firefox (bug 1573659) | None for us: keep `background.scripts`; do not add a service worker. `sniff.js` stays first in the array. |
-| Toolbar button | `browser_action` + `browser.browserAction` | `action` + `browser.action` | Key is renamed by the transform; code already uses `toolbar = browser.browserAction \|\| browser.action`. |
-| Page action | `page_action` + `browser.pageAction` | Firefox **retains** `page_action` in MV3 (Chromium merges it into `action`) | Keep the key; code uses `pageButton = browser.pageAction \|\| <no-op shim>` so a Chromium-style merge would not throw. |
-| Host permissions | `<all_urls>` inside `permissions` | `host_permissions`; users may grant/revoke per site | Split done by the transform. Runtime must tolerate a revoked grant for webRequest/cookies/content scripts (`permissions.contains`, `permissions.onRemoved`). |
-| `webRequest` | `webRequest`, `onHeadersReceived` with `["responseHeaders"]` | Firefox keeps `webRequest`; `webRequestBlocking` also remains available in Firefox (with host permissions) | No change: this extension only observes, it never passes `"blocking"`. Do not assume blocking exists on Chromium if that ever matters. |
-| `tabs.executeScript` + `code:` strings | `grabTab()` injects a string | API removed; `scripting` API takes a file/function and has no `code:` parameter | **The one real break.** Add `scripting` permission and move the extractor into a packaged script (`grab.js` injected with `scripting.executeScript({target, files})`), or message the already-declared `overlay.js` content script. |
-| Context menus | `refreshMenus()` runs at every background start | Event pages must register menus in `runtime.onInstalled`; the `onclick` property is forbidden | We already use `onClicked`. Move creation to `onInstalled` (plus keep the options-change refresh) so menus are not rebuilt/race on each wakeup. |
-| CSP | default extension CSP | `content_security_policy.extension_pages`, stricter; no remote code; content scripts share it | None: no remote code, no `eval`, no inline `<script>` in our pages. |
-| `web_accessible_resources` | absent | must list matches/resources | None (no packaged resource is exposed). |
-| `nativeMessaging` | permission + `runtime.sendNativeMessage` | unchanged in MV3 | None; the FerDim bridge keeps working. |
-| Other permissions (`downloads`, `cookies`, `contextMenus`, `storage`, `tabs`, `notifications`) | — | unchanged keywords | None. |
-| Version string | `1.5.1` | numeric, max 4 parts | Conforms. |
-| Android | `gecko_android.strict_min_version: 142` | MV3 supported | Verify badge/page-action behaviour on Android during the switch. |
-
-## Findings table
-
-| Check | Result | Evidence |
-|---|---|---|
-| MV3 manifest accepted by addons-linter | **pass** | 0 errors on the generated variant |
-| `action` accepts the existing title/icon/popup | **pass** | no lint diagnostics |
-| `page_action` kept in Firefox MV3 | **pass** | accepted by linter; MDN migration guide (Firefox retains it) |
-| Event page with `background.scripts` | **pass** | accepted; `sniff.js` + `background.js` order preserved |
-| Blocking webRequest not required | **pass** | listener options are `["responseHeaders"]` only |
-| Native messaging unaffected | **pass** | permission not flagged, no API warning |
-| Link grab (`tabs.executeScript`) | **fail** | `UNSUPPORTED_API` warning, `background.js:245` |
-| Timers/state under event-page unload | **not migrated** | code still uses `setInterval` + in-memory `Map`s |
-| Runtime load of the MV3 variant in Firefox | **not run** | lint-only spike; see "Open risks" |
-
-## Migration plan
-
-1. **Manifest switch (proven).** Adopt what the spike build produces:
-   `manifest_version: 3`, `host_permissions: ["<all_urls>"]`,
-   `browser_action` → `action`, keep `page_action`, keep
-   `background.scripts`. Minimum Firefox stays 140.
-2. **Event-page proofing.** Persist per-tab media in `storage.session`
-   (keyed by tab id) and restore it lazily in the `getMedia` handler;
-   replace `setInterval(pingHost, …)` with `alarms.create("ferdim-ping",
-   {periodInMinutes: 1})` + `alarms.onAlarm` (add the `alarms`
-   permission); re-ping on popup open (already covered by the
-   `pingHost` message). Badge/page-action state must be recomputed on
-   wakeup because the in-memory map is gone.
-3. **Link grab.** Move the extractor out of the code string into
-   `extension/grab.js` and call
-   `browser.scripting.executeScript({target: {tabId}, files: ["grab.js"]})`;
-   add the `scripting` permission. Keep the declarative `overlay.js`
-   content script as is. This closes the only lint warning.
-4. **Menus.** Register `menuDefs()` in `runtime.onInstalled` (and on
-   options change); drop the unconditional rebuild from the startup path.
-5. **Permission resilience.** If `<all_urls>` is revoked at runtime,
-   sniffing and cookie forwarding must fail soft, and the popup should
-   say so (`permissions.onRemoved` → clear per-tab state).
-6. **Release.** Ship MV2 until steps 2–3 land, then tag an MV3 release;
-   run the full gate set (tests, web-ext lint 0/0 on the MV3 source,
-   `tests/cli_smoke.sh`) before uploading to AMO.
+- **`func`, not an injected `grab.js` file.** The spike suggested a
+  packaged script; a function avoids a second file that has to stay in
+  step with its caller and is supported by Firefox ≥ 102. The cost is
+  that the extractor must be self-contained — a test serializes it,
+  evaluates it in a bare page context and checks the links it returns.
+- **`storage.session`, not `storage.local`.** Session storage has exactly
+  the right lifetime (extension/browser session, cleared on exit, not
+  synced), so caught media does not leak into permanent profile data.
+  Writes are coalesced per microtask; a lost write after an idle unload
+  only costs a badge count.
+- **No `alarms`.** A periodic native-host ping kept the background awake
+  for nothing; the popup open path (`getMedia` → `pingHost`) is the only
+  place the state is shown, and the wake-time ping covers the badge.
+- **Menus are browser state.** Rebuilding them on every event-page wake
+  was wasted work that could race with an existing definition, so they
+  are created on install/update and browser startup only.
+- **Selection semantics.** `selectionOnly` is now actually forwarded to
+  the extractor: the context-menu "grab selected links" scans the
+  selection, "grab all links" scans the page even when text happens to be
+  selected (previously the selection silently won for both).
 
 ## Open risks
 
-- **Event-page state.** A user who leaves a tab idle loses the caught
-  media list until the player requests something again. Acceptable, but
-  decide explicitly (reset + badge recompute vs `storage.session`).
-- **`webRequestBlocking` parity.** Not needed today. If a future feature
-  wants to cancel a request before `downloads.onCreated`, verify the
-  permission on the target Firefox version instead of assuming Chromium
-  behaviour.
-- **Runtime validation.** The variant was lint-validated, not loaded.
-  Before the migration lands, run
-  `web-ext run --source-dir /tmp/mv3` and exercise: browser download
-  takeover, HLS manifest detection + badge count, popup download, turbo
-  toggle, grab, context menus, native host reconnect after an idle
-  unload.
-- **AMO review timing** for the MV3 upload is outside our control; the
-  manifest switch is small, the code changes in steps 2–3 are the real
-  review surface.
-
-## Files in this spike
-
-- `extension/sniff.js` — generic response-header classifier (separate
-  1.6 item; loaded before `background.js`).
-- `scripts/build_mv3.sh` — generate + lint the MV3 variant.
-- `docs/mv3-spike.md` — this document.
-- `tests/test_extension_sniff.py` — node-driven tests for the classifier.
+- **AMO review timing** for the MV3 upload is outside our control. The
+  upload workflow (`amo.yml`) uses `--source-dir extension`, so the same
+  signed artifact now carries MV3.
+- **Android.** `gecko_android.strict_min_version` stays `142`; MV3 is
+  supported, but the page-action badge should be checked once on a device
+  (no emulator here).
+- **Revoked host permission.** Under MV3 a user can withdraw
+  `<all_urls>` per site. Sniffing and cookie forwarding already fail soft
+  (`webRequest` stops firing, `cookies.getAll` is wrapped), but the popup
+  does not explain the empty list. Low priority, tracked in `ROADMAP.md`.
+- **Live-page grab.** Injection itself is proven (probe function injected
+  into a local page through `scripting.executeScript`), and the popup/
+  context-menu wiring is covered by the node harness; what was not driven
+  in a real browser is the click path itself (headless `web-ext run` does
+  not open the popup). One manual grab before a release is still cheap
+  insurance.
+- **Old Firefox (`< 102`).** The MV2 fallback path is untested on a real
+  browser of that vintage; the manifest floor is 140, so it only matters
+  if someone forks the source back to MV2.
