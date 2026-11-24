@@ -562,6 +562,8 @@ class DownloadJob:
 
     def _prepare(self):
         opt = self.spec.options(self.cfg)
+        # yoklama/yedege gecme dongusu de yapilandirilan deneme sayisini kullanir
+        self._retries = max(0, int(opt.retries))
         self.target_dir.mkdir(parents=True, exist_ok=True)
         self._close_fd()             # onceki kosudan acik kalan fd kapatilir
         # HLS / DASH manifest mi? (FTP semasi once gelir: ftp://...m3u8
