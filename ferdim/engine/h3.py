@@ -21,7 +21,12 @@ kullanir (aktarim ortasinda dusen araligi job.py yeniden ister).
 Asenkron aioquic istemcisi baglanti basina ayri bir arka plan is
 parcaciginda/olay dongusunde kosar; veri asyncio kuyrugundan bloklayan
 okumaya karsi sinirli bir tamponla koprulenir, her okuma stall
-zaman asimina tabidir.
+zaman asimina tabidir. Alt-Svc duyurulan host:port'a baglanilir ama
+`:authority` ve TLS SNI kaynagin kendi adresidir.
+
+Baglanti yeniden kullanimi (oturum bileti / origin basina havuz)
+bilincli olarak yok: her Range kendi QUIC el sikismasini yapar; kazanc
+olculmedi, karmasiklik ve kaynak sizintisi riski yuksek.
 """
 from __future__ import annotations
 
@@ -39,6 +44,8 @@ BROKEN_SECS = 600.0             # h3 hatasi sonrasi TCP'de kalma suresi
 ALT_SVC_DEFAULT_MAX_AGE = 86400.0
 DATA_QUEUE = 8                  # olay dongusunden okura tampon (parca)
 JOIN_SECS = 3.0
+CONNECT_SECS = 5.0              # el sikismasi ust siniri (stall'dan bagimsiz)
+DRAIN_SECS = 60.0               # akis bitti: okur kuyrugu bosaltmak icin sure
 
 # h3'te baglantiya ozgu (yasak) basliklar gonderilemez
 _HOP = frozenset({"connection", "keep-alive", "proxy-connection", "host",
@@ -46,8 +53,10 @@ _HOP = frozenset({"connection", "keep-alive", "proxy-connection", "host",
 _REDIRECT = frozenset({301, 302, 303, 307, 308})
 
 _API = None                     # aioquic sembolleri (tembel)
+_AVAILABLE: bool | None = None  # available() sonucu (negatif dahil) onbellek
 _PROTO = None                   # QuicConnectionProtocol alt sinifi (tembel)
-_ALT_SVC: dict[str, tuple[int, float]] = {}   # origin -> (port, bitis)
+# origin -> (host, port, bitis); host "" = kaynagin kendi adresi
+_ALT_SVC: dict[str, tuple[str, int, float]] = {}
 _BROKEN: dict[str, float] = {}                # origin -> bitis zamani
 _LOCK = threading.Lock()
 
@@ -92,12 +101,16 @@ def _load():
 
 
 def available() -> bool:
-    """aioquic kurulu mu? (modul importunu asla gerektirmez)"""
-    try:
-        _load()
-    except Exception:
-        return False
-    return True
+    """aioquic kurulu mu? Sonuc (yoksa da) onbelleklenir."""
+    global _AVAILABLE
+    if _AVAILABLE is None:
+        try:
+            _load()
+        except Exception:
+            _AVAILABLE = False    # her cagrida yeniden import denenmesin
+        else:
+            _AVAILABLE = True
+    return _AVAILABLE
 
 
 # ------------------------------------------------------- Alt-Svc onbellegi
@@ -108,12 +121,12 @@ def origin(url: str) -> str:
     return f"{p.scheme}://{(p.hostname or '').lower()}:{port}"
 
 
-def parse_alt_svc(value: str | None,
-                  host: str = "") -> tuple[int, float] | None:
-    """`Alt-Svc` basligindan (port, max-age) cikarir; h3 yoksa None.
+def parse_alt_svc(value: str | None) -> tuple[str, int, float] | None:
+    """`Alt-Svc` basligindan (host, port, max-age) cikarir; h3 yoksa None.
 
-    Baska ana makineye isaret eden girdi yok sayilir (kaynak kendi
-    portunu duyurur); birden fazla h3 girdisinde en uzun omurlu secilir.
+    host bos ise hizmet kaynagin kendi ana makinesindedir; dolu ise
+    baglanti o ana makineye kurulur (yetki/SNI yine kaynagin adidir).
+    Birden fazla h3 girdisinde en uzun omurlu secilir.
     """
     best = None
     for item in (value or "").split(","):
@@ -138,39 +151,39 @@ def parse_alt_svc(value: str | None,
         if not port.isdigit():
             continue
         alt_host = alt_host.strip("[]").lower()
-        if alt_host and host and alt_host != host.lower():
-            continue
-        if best is None or max_age > best[1]:
-            best = (int(port), max_age)
+        if best is None or max_age > best[2]:
+            best = (alt_host, int(port), max_age)
     return best
 
 
 def remember_alt_svc(url: str, value: str | None) -> bool:
     """TCP yanitindaki Alt-Svc basligini onbellege yazar (ma=0 siler)."""
-    parsed = parse_alt_svc(value, urlsplit(url).hostname or "")
+    parsed = parse_alt_svc(value)
     if parsed is None:
         return False
-    port, max_age = parsed
+    alt_host, port, max_age = parsed
     key = origin(url)
     with _LOCK:
         if max_age <= 0:
             _ALT_SVC.pop(key, None)
             return False
-        _ALT_SVC[key] = (port, _now() + max_age)
+        _ALT_SVC[key] = (alt_host, port, _now() + max_age)
     return True
 
 
-def alt_svc_port(url: str) -> int | None:
-    """Onbellekteki (suresi dolmamis) h3 portu; yoksa None."""
+def alt_svc_target(url: str) -> tuple[str, int] | None:
+    """Onbellekteki h3 hedefi (host, port); yoksa/suresi dolduysa None.
+
+    host bos ise kaynagin kendi ana makinesine baglanilir."""
     key = origin(url)
     with _LOCK:
         item = _ALT_SVC.get(key)
         if item is None:
             return None
-        if item[1] <= _now():
+        if item[2] <= _now():
             _ALT_SVC.pop(key, None)
             return None
-        return item[0]
+        return item[0], item[1]
 
 
 def mark_broken(url: str) -> None:
@@ -227,7 +240,7 @@ def use_h3(url: str, opt) -> bool:
         return False
     if mode == "force":
         return True
-    return not broken(url) and alt_svc_port(url) is not None
+    return not broken(url) and alt_svc_target(url) is not None
 
 
 # --------------------------------------------------------- istek/yanit
@@ -305,14 +318,23 @@ def _protocol_class():
 
 
 class _Session:
-    """Tek h3 istegi: arka planda olay dongusu, bloklayan okuma koprusu."""
+    """Tek h3 istegi: arka planda olay dongusu, bloklayan okuma koprusu.
+
+    target: (host, port) - Alt-Svc duyurusu; None ise URL'in kendi
+    adresi. Baglanti bu hedefe kurulur, istek yine kaynak adina gider.
+    """
 
     def __init__(self, url: str, opt, headers: dict | None,
-                 timeout: float):
+                 timeout: float, target: tuple[str, int] | None = None):
         self.url = url
         self.opt = opt
         self.headers = headers or {}
         self._timeout = float(timeout or 30)
+        # el sikismasi, stall suresinden bagimsiz olarak sinirlidir: auto
+        # modda basarisiz h3 denemesi TCP'ye hizli dussun
+        self._connect_timeout = min(self._timeout, CONNECT_SECS)
+        self._target = target
+        self._drain: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task = None
         self._thread: threading.Thread | None = None
@@ -334,7 +356,7 @@ class _Session:
             target=self._run, name="ferdim-h3", daemon=True)
         self._thread.start()
         try:
-            self._ready.result(self._timeout)
+            self._ready.result(self._connect_timeout)
         except concurrent.futures.TimeoutError:
             self.close()
             mark_broken(self.url)
@@ -401,8 +423,17 @@ class _Session:
             raise item
         if item is None:
             self._eof = True
+            self._signal_drained()    # olay dongusu artik kapanabilir
         else:
             self._buf += item
+
+    def _signal_drained(self) -> None:
+        loop, drain = self._loop, self._drain
+        if loop is not None and drain is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(drain.set)
+            except RuntimeError:
+                pass
 
     # --- arka plan ----------------------------------------------------
     def _run(self) -> None:
@@ -413,7 +444,7 @@ class _Session:
         asyncio.set_event_loop(loop)
         try:
             self._task = loop.create_task(self._request())
-            if self._closed:                  # close() yarisi: istek baslamasin
+            if self._closed:              # close() yarisi: istek baslamasin
                 self._task.cancel()
             loop.run_until_complete(self._task)
         except asyncio.CancelledError:
@@ -453,12 +484,18 @@ class _Session:
     async def _request(self) -> None:
         api = _load()
         self._queue = asyncio.Queue(maxsize=DATA_QUEUE)
+        self._drain = asyncio.Event()
         parts = urlsplit(self.url)
         host = parts.hostname or ""
         port = parts.port or 443
+        if self._target is not None:      # Alt-Svc: duyurulan host:port
+            host = self._target[0] or host
+            port = self._target[1]
         conf = api["QuicConfiguration"](
             is_client=True,
             alpn_protocols=list(api["H3_ALPN"]),
+            # SNI/ana makine dogrulamasi her zaman KAYNAGIN adiyla
+            server_name=parts.hostname or host,
             verify_mode=ssl.CERT_NONE if getattr(self.opt, "insecure", False)
             else ssl.CERT_REQUIRED,
         )
@@ -481,7 +518,7 @@ class _Session:
                             self._ready.set_result(True)
                     if event.stream_ended:
                         await self._queue.put(None)
-                        return
+                        break
                 elif isinstance(event, api["DataReceived"]):
                     if event.stream_id != stream_id:
                         continue
@@ -489,10 +526,17 @@ class _Session:
                         await self._queue.put(event.data)
                     if event.stream_ended:
                         await self._queue.put(None)
-                        return
+                        break
                 elif isinstance(event, api["ConnectionTerminated"]):
                     raise ConnectionError(
                         f"h3: baglanti kapandi (kod {event.error_code})")
+            # Akis bitti ama kuyrukta/tamponda veri olabilir: dongu, okur
+            # sentinel'i gorene kadar YASAMALI. Erken kapatma kuyruktaki
+            # kuyrugu kaybettirip sahte stall/H3Error uretiyordu.
+            try:
+                await asyncio.wait_for(self._drain.wait(), DRAIN_SECS)
+            except asyncio.TimeoutError:
+                pass
 
 
 def _offer(queue: asyncio.Queue, item) -> None:
@@ -544,7 +588,8 @@ def request(url: str, opt, headers: dict | None = None,
     yonlendirme desteklenmez: kaynak bozuk isaretlenip H3Error verilir ki
     auto modda TCP (yonlendirmeyi izleyen yol) kullanilsin.
     """
-    session = _Session(url, opt, headers, float(timeout or 30))
+    session = _Session(url, opt, headers, float(timeout or 30),
+                       target=alt_svc_target(url))
     try:
         status, msg = session.start()
         if status <= 0:
