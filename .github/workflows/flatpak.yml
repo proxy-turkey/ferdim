@@ -1,0 +1,103 @@
+name: Flatpak
+
+# Tag push: build the Flathub manifest, lint it, install the bundle and run
+# the CLI version smoke test. The .flatpak bundle is kept as a workflow
+# artifact. Publishing to Flathub is intentionally NOT automated: it needs a
+# human pull request to flathub/flathub (see docs/flatpak.md).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v1.6.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  flatpak:
+    runs-on: ubuntu-latest
+    env:
+      APP_ID: io.github.proxy_turkey.FerDim
+      MANIFEST: packaging/flatpak/io.github.proxy_turkey.FerDim.yml
+      METAINFO: packaging/flatpak/io.github.proxy_turkey.FerDim.metainfo.xml
+      DESKTOP: packaging/flatpak/io.github.proxy_turkey.FerDim.desktop
+      RUNTIME_VERSION: "51"
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            flatpak flatpak-builder desktop-file-utils appstream python3
+
+      - name: Flathub remote and runtime
+        run: |
+          set -euo pipefail
+          flatpak remote-add --user --if-not-exists flathub \
+            https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub \
+            "org.gnome.Platform//${RUNTIME_VERSION}" \
+            "org.gnome.Sdk//${RUNTIME_VERSION}"
+
+      - name: Version check
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          test "$ver" = "$(python3 -c 'import ferdim;print(ferdim.__version__)')"
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+
+      - name: Metadata and linter
+        run: |
+          set -euo pipefail
+          appstreamcli validate --no-net "$METAINFO"
+          desktop-file-validate "$DESKTOP"
+          flatpak install --user -y --noninteractive flathub org.flatpak.Builder
+          flatpak run --user --command=flatpak-builder-lint \
+            org.flatpak.Builder manifest "$MANIFEST"
+          flatpak run --user --command=flatpak-builder-lint \
+            org.flatpak.Builder manifest packaging/flatpak/dev/io.github.proxy_turkey.FerDim.yml
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          flatpak-builder --user --force-clean \
+            --install-deps-from=flathub \
+            --state-dir="$PWD/.flatpak-builder-state" \
+            --repo="$PWD/flatpak-repo" flatpak-build "$MANIFEST"
+
+      - name: Bundle and smoke test
+        run: |
+          set -euo pipefail
+          bundle="FerDim-${VERSION}.flatpak"
+          flatpak build-bundle flatpak-repo "$bundle" "$APP_ID"
+          flatpak install --user -y --noninteractive "$bundle"
+          env -u DISPLAY -u WAYLAND_DISPLAY \
+            flatpak run --user --command=ferdim "$APP_ID" --version \
+            | tee version.txt
+          grep -q "FerDim ${VERSION}" version.txt
+
+      - name: Summary
+        run: |
+          {
+            echo "### Flatpak"
+            echo ""
+            echo "- app id: \`$APP_ID\`"
+            echo "- runtime: \`org.gnome.Platform//$RUNTIME_VERSION\`"
+            echo "- manifest: \`$MANIFEST\`"
+            echo "- CLI smoke: \`$(cat version.txt)\`"
+            echo "- Flathub: not pushed. Submission is a human PR to"
+            echo "  \`flathub/flathub\` (see \`docs/flatpak.md\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FerDim-${{ env.TAG }}-flatpak
+          path: FerDim-${{ env.VERSION }}.flatpak
+          if-no-files-found: error

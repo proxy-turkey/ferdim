@@ -1,0 +1,68 @@
+# FerDim — Flathub manifest (release archive source).
+#
+# App id: io.github.proxy_turkey.FerDim. Flathub is fine with github.io
+# reverse-DNS ids, but D-Bus does not allow '-' in names, so the GitHub
+# user "proxy-turkey" becomes "proxy_turkey". The id must match
+# io.github.proxy_turkey.FerDim.metainfo.xml, the desktop file name and
+# the installed icon name exactly.
+#
+# Update checklist: bump the archive URL + sha256 (curl + sha256sum), the
+# <release> entry in the metainfo and the local dev manifest.
+app-id: io.github.proxy_turkey.FerDim
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+command: ferdim-gui
+
+finish-args:
+  - --share=network
+  # GTK under the fallback X11 socket uses shared memory
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # downloads folder only; the queue/state stay inside the sandbox
+  - --filesystem=xdg-download
+  - --talk-name=org.freedesktop.Notifications
+  # ferdim-dbus can export org.ferdim.Daemon1 for host consumers
+  # (GNOME Shell extension) while the GUI runs in the sandbox.
+  - --own-name=org.ferdim.Daemon
+  # TEMPORARY: ferdim/gui/app.py registers Gtk.Application under
+  # "app.ferdim.gui"; the sandbox bus only lets the app own its Flatpak app
+  # id. Drop this line once the GApplication id equals the app id.
+  - --own-name=app.ferdim.gui
+
+modules:
+  - name: ferdim
+    buildsystem: simple
+    sources:
+      - type: archive
+        url: https://github.com/proxy-turkey/ferdim/archive/refs/tags/v1.6.0.tar.gz
+        sha256: f37d710e7604cf71136ebfea2f64687ea464a07b4bd179b2b996e185d9d9f482
+        strip-components: 1
+      - type: file
+        path: io.github.proxy_turkey.FerDim.desktop
+      - type: file
+        path: io.github.proxy_turkey.FerDim.metainfo.xml
+      - type: file
+        path: io.github.proxy_turkey.FerDim.svg
+    build-commands:
+      - install -d /app/share/ferdim
+      - cp -a ferdim web /app/share/ferdim/
+      - find /app/share/ferdim -name '__pycache__' -type d -prune -exec rm -rf '{}' +
+      - install -Dm755 bin/ferdim /app/bin/ferdim
+      - install -Dm755 bin/ferdim-nm /app/bin/ferdim-nm
+      - install -Dm755 bin/ferdim-gui /app/bin/ferdim-gui
+      - install -Dm755 bin/ferdim-dbus /app/bin/ferdim-dbus
+      - install -Dm644 data/org.ferdim.Daemon1.xml /app/share/dbus-1/interfaces/org.ferdim.Daemon1.xml
+      - install -d /app/share/dbus-1/services
+      - sed 's|@BIN@|/app/bin/ferdim-dbus|' data/org.ferdim.Daemon.service > /app/share/dbus-1/services/org.ferdim.Daemon.service
+      - install -Dm644 io.github.proxy_turkey.FerDim.desktop /app/share/applications/io.github.proxy_turkey.FerDim.desktop
+      - install -Dm644 io.github.proxy_turkey.FerDim.svg /app/share/icons/hicolor/scalable/apps/io.github.proxy_turkey.FerDim.svg
+      - install -Dm644 io.github.proxy_turkey.FerDim.metainfo.xml /app/share/metainfo/io.github.proxy_turkey.FerDim.metainfo.xml
+      - install -Dm644 LICENSE /app/share/licenses/io.github.proxy_turkey.FerDim/LICENSE
+      - |
+        for m in ferdim ferdim-nm ferdim-gui ferdim-dbus; do
+          install -Dm644 "docs/$m.1" "/app/share/man/man1/$m.1"
+          install -Dm644 "docs/tr/$m.1" "/app/share/man/tr/man1/$m.1"
+        done
