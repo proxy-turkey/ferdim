@@ -460,6 +460,8 @@ class DownloadJob:
                 "adaptive": self.extra.get("adaptive"),
                 "checksum": self.extra.get("checksum", ""),
                 "merkle": self.extra.get("merkle", ""),
+                "checksum_note": self.extra.get("checksum_note", ""),
+                "merkle_note": self.extra.get("merkle_note", ""),
                 "verified": list(self.extra.get("verified", [])),
                 "mirrors": len(self.spec.mirrors or []),
                 "mirror_health": [
