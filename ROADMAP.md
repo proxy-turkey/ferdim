@@ -222,31 +222,31 @@ integrity come first. File references point at the code as of 1.7.0.
 
 ## 1.7.x — security hotfixes
 
-Fixed in point releases, before any new feature work.
+Shipped in **1.7.1**.
 
-- [ ] Stop handing the API token to anyone who asks: `GET /` serves
+- [x] Stop handing the API token to anyone who asks: `GET /` serves
       `index.html` with the token inlined and no check
       (`server/web.py:103`), so every local account on the machine gets
       full control. Bootstrap the page with a one-time loopback nonce or
       verify the peer's uid before serving it; change
       `test_web_security.test_02` to match.
-- [ ] Confine `add --dir` and `archive-extract` / `archive-repair` `dest`
+- [x] Confine `add --dir` and `archive-extract` / `archive-repair` `dest`
       to the downloads root or an explicit allow-list
       (`api.py:69`, `api.py:410`): today any absolute path plus a
       server-chosen file name is an arbitrary-file-write primitive.
-- [ ] Drop `Authorization`, `Cookie` and custom headers when a redirect
+- [x] Drop `Authorization`, `Cookie` and custom headers when a redirect
       or a mirror leaves the configured origin; urllib copies them to the
       new host (`httpcli.py:155`).
-- [ ] Extension: hand the download off first and cancel the browser's
+- [x] Extension: hand the download off first and cancel the browser's
       copy only after the daemon accepts it (`background.js:253`); today
       a stopped daemon loses the user's download.
-- [ ] Extension: read cookies from the download's own store
+- [x] Extension: read cookies from the download's own store
       (`cookieStoreId`) so container tabs keep their sessions apart, and
       never persist private-window cookies to disk.
-- [ ] Cap HTTP request bodies (1 MiB) and require `application/json`;
+- [x] Cap HTTP request bodies (1 MiB) and require `application/json`;
       cap socket RPC lines; send `Connection: close` on every early
       reject so an unread body can't be parsed as the next request.
-- [ ] Always re-apply mode 0600 to the token, `config.json`,
+- [x] Always re-apply mode 0600 to the token, `config.json`,
       `queue.json`, `hosts.json` and the log; add `ferdim token rotate`.
 
 ## 1.11 — data integrity and crash safety

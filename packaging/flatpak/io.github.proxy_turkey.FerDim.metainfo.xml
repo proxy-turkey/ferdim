@@ -46,6 +46,15 @@
   </screenshots>
 
   <releases>
+    <release version="1.7.1" date="2026-11-24">
+      <description>
+        <p>
+          Security fixes: the web page no longer carries the API token,
+          HTTP download folders are confined and credentials stay on
+          their origin.
+        </p>
+      </description>
+    </release>
     <release version="1.7.0" date="2026-11-24">
       <description>
         <p>

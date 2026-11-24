@@ -1,4 +1,4 @@
-.TH FERDIM 1 "2026-11-24" "ferdim 1.7.0" "User Commands"
+.TH FERDIM 1 "2026-11-24" "ferdim 1.7.1" "User Commands"
 .SH NAME
 ferdim \- dynamic, self-tuning download manager
 .SH SYNOPSIS
@@ -195,6 +195,8 @@ directories are not descended into.
 Show or change settings: segments, concurrency, scheduler window and
 per-category windows (\fIschedule.categories\fR), language, watched
 folders (\fIwatch_dirs\fR, \fIwatch_done\fR = delete | rename | keep),
+extra folders the web API may download or extract into
+(\fIallowed_dirs\fR; the downloads and watched folders are always allowed),
 automatic sidecar verification (\fIchecksum_sidecar\fR), desktop
 notifications (\fInotify\fR, default true; \fInotify_errors_only\fR
 reports failures only), retries and

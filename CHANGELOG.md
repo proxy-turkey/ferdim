@@ -4,6 +4,32 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [1.7.1] — 2026-11-24
+
+### Security
+- The web UI page no longer contains the API token, which any local
+  account could read. Launchers (`ferdim web`, GTK app, GNOME extension,
+  browser popup) ask the daemon for a one-time link instead; the page
+  exchanges it once for the token. New `ferdim token rotate`.
+- Folders requested over the HTTP API (`add --dir`, archive extraction
+  targets) must lie inside the downloads folder, a watched folder or the
+  new `allowed_dirs` setting; the browser bridge can no longer choose a
+  folder at all.
+- Basic-auth credentials, cookies and custom headers are dropped when a
+  redirect or a mirror leaves the original origin, or downgrades to http.
+- The extension cancels the browser's download only after the daemon
+  accepted it, reads cookies from the download's own container, and
+  marks private-window downloads so their cookies are never written to
+  the queue or history.
+- HTTP request bodies are capped at 1 MiB and must be JSON; early
+  rejects close the connection; errors no longer echo exception text.
+  Socket RPC lines are capped at 1 MiB and the socket is created 0600.
+- Token, configuration and log files are always owner-only (0600), the
+  state and config folders 0700.
+
+### Added
+- D-Bus `WebUrl()` method; native-messaging `web-url` message.
+
 ## [1.7.0] — 2026-11-24
 
 ### Added

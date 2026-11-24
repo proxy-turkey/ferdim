@@ -1,5 +1,5 @@
 .\" -*- coding: UTF-8 -*-
-.TH FERDIM 1 "2026-11-24" "ferdim 1.7.0" "Kullanıcı Komutları"
+.TH FERDIM 1 "2026-11-24" "ferdim 1.7.1" "Kullanıcı Komutları"
 .SH AD
 ferdim \- dinamik, kendini ayarlayan indirme yöneticisi
 .SH ÖZET
@@ -191,7 +191,9 @@ Adreslerde adlar yüzde\-kodlanır, alt dizinlere inilmez.
 Ayarları gösterir ya da değiştirir: parçalar, eşzamanlılık, zamanlayıcı
 penceresi ve kategori başına pencereler (\fIschedule.categories\fR), dil,
 izlenen klasörler (\fIwatch_dirs\fR, \fIwatch_done\fR = delete | rename |
-keep), otomatik yan dosya doğrulaması (\fIchecksum_sidecar\fR), masaüstü
+keep), web API'nin indirebileceği ya da açabileceği ek klasörler
+(\fIallowed_dirs\fR; indirme ve izlenen klasörler her zaman izinlidir),
+otomatik yan dosya doğrulaması (\fIchecksum_sidecar\fR), masaüstü
 bildirimleri (\fInotify\fR, varsayılan açık; \fInotify_errors_only\fR
 yalnızca hataları bildirir), yeniden
 denemeler ve zaman aşımları (\fItimeout\fR, \fIstall_timeout\fR), birlikte

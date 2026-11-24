@@ -221,6 +221,15 @@ reachable ceiling. Use `ferdim turbo off` or `ferdim limit` to share the line.
 - The HTTP API binds to `127.0.0.1` only and requires a per-install token
   (`X-FerDim-Token`, constant-time compare). Cross-origin sites cannot call
   it: responses require the header, and no CORS headers are ever emitted.
+- The web page never contains the token. `ferdim web`, the GTK app, the
+  GNOME extension and the browser popup ask the daemon (over the `0600`
+  socket) for a one-time link; the page trades it for the token once.
+  `ferdim token rotate` replaces the token.
+- Folders requested over HTTP must lie inside the downloads folder, a
+  watched folder or `allowed_dirs`.
+- Credentials (Basic auth, cookies, custom headers) never follow a
+  redirect or a mirror to another origin. Private-window downloads keep
+  their cookies in memory only.
 - The native-messaging host is registered only for FerDim's own extension ID.
 
 ## Internationalization
