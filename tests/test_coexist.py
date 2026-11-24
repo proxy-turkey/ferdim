@@ -226,6 +226,152 @@ class QueueCapTests(unittest.TestCase):
         self.assertEqual(job._ext_cap, 1)
         self.assertEqual(job._allowed, 1, "en az bir baglanti kalir")
 
+    def test_05_paused_job_gets_cap_too(self):
+        """Tavan tum kosabilecek islere uygulanir; duraklatilan is de dahil."""
+        env, cfg, qm = make_queue(self)
+        mon, ft, box = make_monitor(self)
+        qm.coexist = mon
+        job = fake_job(qm, segments=8, speed=5 * MB)
+        job.state = JobState.PAUSED          # basinc baslamadan duraklatildi
+        cfg["coexist"] = True
+        mon.sample(0.0)
+        for _ in range(4):
+            ft.t += 1.0
+            box["v"] += 10 * MB
+            qm._coexist_tick()
+        self.assertEqual(job._ext_cap, 4, "duraklatilmis is de tavanlanmali")
+
+    def test_06_pause_under_pressure_off_then_resume(self):
+        """Regresyon: basinc altinda duraklat, modu kapat, sonra devam et.
+
+        Eski hata: kapanma gecisi duraklatilmis isi atliyordu; is devam
+        edince dis tavan sonsuza kadar uzerinde kaliyordu.
+        """
+        env, cfg, qm = make_queue(self)
+        mon, ft, box = make_monitor(self)
+        qm.coexist = mon
+        job = fake_job(qm, segments=8, speed=5 * MB)
+        cfg["coexist"] = True
+        mon.sample(0.0)
+        for _ in range(4):
+            ft.t += 1.0
+            box["v"] += 10 * MB
+            qm._coexist_tick()
+        self.assertEqual(job._ext_cap, 4)
+        job.state = JobState.PAUSED          # kullanici duraklatti
+        cfg["coexist"] = False               # ... ve modu kapatti
+        qm._coexist_tick()
+        self.assertIsNone(job._ext_cap,
+                          "mod kapaninca duraklatilmis isin tavani da kalkmali")
+        job.state = JobState.DOWNLOADING     # devam
+        for _ in range(4):
+            qm._tick()
+        self.assertIsNone(job._ext_cap, "devam eden is tavansiz kosmali")
+        self.assertNotEqual(job.extra.get("adaptive_reason"), "coexist")
+        self.assertFalse(qm.coexist_status()["enabled"])
+
+    def test_07_pressure_ends_while_paused_releases(self):
+        env, cfg, qm = make_queue(self)
+        mon, ft, box = make_monitor(self)
+        qm.coexist = mon
+        job = fake_job(qm, segments=8, speed=5 * MB)
+        cfg["coexist"] = True
+        mon.sample(0.0)
+        for _ in range(4):
+            ft.t += 1.0
+            box["v"] += 10 * MB
+            qm._coexist_tick()
+        self.assertEqual(job._ext_cap, 4)
+        job.state = JobState.PAUSED
+        for _ in range(12):                  # hat susar (mod acik kalir)
+            ft.t += 1.0
+            qm._coexist_tick()
+        self.assertIsNone(job._ext_cap, "duraklatilmis isin tavani birakilmali")
+
+    def test_08_finished_job_never_keeps_cap(self):
+        env, cfg, qm = make_queue(self)
+        mon, ft, box = make_monitor(self)
+        qm.coexist = mon
+        job = fake_job(qm, segments=8, speed=5 * MB)
+        cfg["coexist"] = True
+        mon.sample(0.0)
+        for _ in range(4):
+            ft.t += 1.0
+            box["v"] += 10 * MB
+            qm._coexist_tick()
+        self.assertEqual(job._ext_cap, 4)
+        job.state = JobState.DONE
+        for _ in range(12):                  # hat susar
+            ft.t += 1.0
+            qm._coexist_tick()
+        self.assertIsNone(job._ext_cap, "biten is tavan tasimamali")
+        # biten is yeniden kuyruga alinip mod kapaliyken kosarsa da tavansiz
+        job.state = JobState.QUEUED
+        cfg["coexist"] = False
+        qm._tick()
+        self.assertIsNone(job._ext_cap)
+
+
+class ReadFailureTests(unittest.TestCase):
+    """/proc/net/dev okunamazsa tavan tutulmaz (fail-open).
+
+    Eski hata: _sample_locked hata durumunda 'active' degerini donduruyordu;
+    hat bilgisi kaybolunca is kalici olarak yarim baglantiyla kaliyordu.
+    """
+
+    def _monitor(self):
+        ft = FakeTime()
+        box = {"v": 0, "ok": True}
+        mon = LineMonitor(
+            read=lambda: box["v"] if box["ok"] else -1,
+            clock=ft.monotonic)
+        self.addCleanup(mon.reset)
+        return mon, ft, box
+
+    def test_01_read_failure_releases_pressure(self):
+        mon, ft, box = self._monitor()
+        mon.sample(0.0)
+        for _ in range(4):
+            ft.t += 1.0
+            box["v"] += 10 * MB
+            mon.sample(5 * MB)
+        self.assertTrue(mon.active)
+        box["ok"] = False                    # sayac okunamaz oldu
+        ft.t += 1.0
+        self.assertFalse(mon.sample(5 * MB), "okunamayan sayac = azami guc")
+        self.assertEqual(mon.pressure, 0.0)
+        # sayac geri gelince taban yeniden kurulur, eski basinc donmez
+        box["ok"] = True
+        ft.t += 1.0
+        self.assertFalse(mon.sample(5 * MB))
+        for _ in range(4):                   # yeni basinc yine algilanir
+            ft.t += 1.0
+            box["v"] += 10 * MB
+            mon.sample(5 * MB)
+        self.assertTrue(mon.active, "sayac duzelince izleme yeniden calisir")
+
+    def test_02_queue_releases_cap_when_read_fails(self):
+        env, cfg, qm = make_queue(self)
+        ft = FakeTime()
+        box = {"v": 0, "ok": True}
+        qm.coexist = LineMonitor(
+            read=lambda: box["v"] if box["ok"] else -1,
+            clock=ft.monotonic)
+        job = fake_job(qm, segments=8, speed=5 * MB)
+        cfg["coexist"] = True
+        qm.coexist.sample(0.0)
+        for _ in range(4):
+            ft.t += 1.0
+            box["v"] += 10 * MB
+            qm._coexist_tick()
+        self.assertEqual(job._ext_cap, 4)
+        box["ok"] = False
+        ft.t += 1.0
+        qm._coexist_tick()
+        self.assertIsNone(job._ext_cap,
+                          "okunamayan /proc/net/dev tavani birakmali")
+        self.assertFalse(qm.coexist_status()["active"])
+
 
 class GovernedCapTests(unittest.TestCase):
     """Governor dis tavani asla yoklamaz; tavan kalkinca yeniden tirmanir."""

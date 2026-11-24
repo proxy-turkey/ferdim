@@ -105,7 +105,8 @@ class LineMonitor:
     def _sample_locked(self, own_speed: float) -> bool:
         now = self.clock()
         total = self._read()
-        if total < 0:             # /proc yok: fail-open (azami guc)
+        if total < 0:             # /proc yok/okunamaz: fail-open (azami guc)
+            self._fail_open()
             return self.active
         if self._last is None:
             self._last, self._last_t = total, now
@@ -124,6 +125,22 @@ class LineMonitor:
             and self.foreign > self.threshold * self.capacity
         self._update_active(now, hot)
         return self.active
+
+    def _fail_open(self) -> None:
+        """Sayac okunamazsa basinc BILINMIYOR demektir: tavan tutulmaz.
+
+        Eski davranis 'active' degerini sonsuza kadar donduruyordu; hat
+        bilgisi kaybolunca tavan da dusmeli, yoksa is kalici olarak
+        yarim baglantiyla kalirdi. Sayac geri gelince taban yeniden
+        kurulur (eski basinc tasinmaz).
+        """
+        self.active = False
+        self.pressure = 0.0
+        self.foreign = 0.0
+        self._last = None
+        self._last_t = None
+        self._hot_since = None
+        self._quiet_since = None
 
     def _update_active(self, now: float, hot: bool) -> None:
         if hot:

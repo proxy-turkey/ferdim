@@ -220,10 +220,13 @@ class QueueManager:
         sessizlesince tavani birakir. Kapaliyken hat hic okunmaz; varsayilan
         azami guc davranisi aynen surer."""
         if not bool(self.cfg.get("coexist")):
-            if self._coexist_on:            # kapanma gecisi: tavani birak
+            if self._coexist_on:            # kapanma gecisi: basinci unut
                 self._coexist_on = False
                 self.coexist.reset()
-                self._apply_coexist_cap(False)
+            # Mod kapaliyken degismez: HICBIR iste dis tavan kalmaz. Her
+            # tick dogrulanir (is duraklatilmisken kapatilip sonra devam
+            # ettirilirse ya da yeniden baslatilirsa tavan tasinmaz).
+            self._apply_coexist_cap(False)
             return
         try:
             self.coexist.threshold = max(
@@ -241,14 +244,24 @@ class QueueManager:
         self._apply_coexist_cap(self.coexist.active)
 
     def _apply_coexist_cap(self, active: bool) -> None:
-        """Basinc aktifken her is baglantilarinin yarisini birakir (en az 1
-        kalir); basinc gecince tavan kalkar, governor yukari yoklar."""
+        """Basinc aktifken her isin tavanini yarilar (en az 1 kalir);
+        birakirken TUM islerden tavan silinir.
+
+        Birakma durumu is durumuna BAKMAZ: duraklatilmis, bitmis ya da
+        iptal edilmis bir is sonradan devam/restart edilirse tavan
+        tasimamali. Uygulama ise yalniz kosabilecek islere yapilir (bitmis
+        isin gorunumu degismesin); yeniden baslatilan is bir sonraki tick'te
+        zaten tavanini alir.
+        """
         with self._lock:
             jobs = list(self.jobs)
         for j in jobs:
-            if j.state not in STATES_RUNNING and j.state != JobState.QUEUED:
+            if not active:
+                j.set_external_cap(None)
                 continue
-            j.set_external_cap(max(1, j._seg_max // 2) if active else None)
+            if j.state in HISTORY_STATES:   # done/error/canceled: kosmaz
+                continue
+            j.set_external_cap(max(1, j._seg_max // 2))
 
     def coexist_status(self) -> dict:
         """stats/CLI icin: mod acik mi, basinc ne, tavan uygulaniyor mu."""
