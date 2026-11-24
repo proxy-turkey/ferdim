@@ -2,8 +2,13 @@
 
 Kapsam: Alt-Svc ayristirma/onbellek/son kullanma, mod secimi (off/auto/
 force, proxy, bozuk kaynak), h3 hatasinda TCP'ye dusme, cekirdek
-importunun aioquic'i yuklememesi ve (aioquic + openssl varsa) 127.0.0.1
-uzerinde gercek bir h3 sunucusuna karsi Range indirmesi.
+importunun aioquic'i yuklememesi, (aioquic + openssl varsa) 127.0.0.1
+uzerinde gercek bir h3 sunucusuna karsi Range indirmesi ve origin basina
+baglanti havuzu: es zamanli araliklar TEK QUIC baglantisinda ayri akislar,
+sirali isteklerde yeniden kullanim, bos baglanti kapatma, baglanti
+hatasinda havuz kaydinin dusmesi + TCP'ye dusme, yan dosyanin (fetch_small)
+ve hls/dash/segment yolunun h3'ten gecmesi, close_all sonrasi is parcacigi
+sizmamasi.
 """
 from __future__ import annotations
 
@@ -412,7 +417,12 @@ class PackagingTest(unittest.TestCase):
 
 
 class _QuicTestServer:
-    """127.0.0.1 uzerinde tek is parcacikli aioquic HTTP/3 sunucusu."""
+    """127.0.0.1 uzerinde tek is parcacikli aioquic HTTP/3 sunucusu.
+
+    Sunucu tarafi QUIC baglantisi ve istek sayisini tutar: istemcinin
+    baglanti yeniden kullanimi (coklama) boylece dogrulanir."""
+
+    TEXT = b"h3 yan dosya\n"
 
     def __init__(self, cert: Path, key: Path):
         self._cert, self._key = cert, key
@@ -420,7 +430,12 @@ class _QuicTestServer:
         self._stop = None
         self._loop = None
         self._thread = None
+        self._lock = threading.Lock()
+        self._protos: list = []
         self.port = 0
+        # istatistik: kabul edilen QUIC baglantisi / istek akisi
+        self.connections = 0
+        self.requests = 0
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True,
@@ -436,16 +451,34 @@ class _QuicTestServer:
         if self._thread is not None:
             self._thread.join(5)
 
+    def kill_connections(self) -> None:
+        """Sunucu tarafi tum QUIC baglantilarini kapatir (hata benzetimi)."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        def kill():
+            with self._lock:
+                protos = list(self._protos)
+                self._protos.clear()
+            for proto in protos:
+                proto.close()
+        loop.call_soon_threadsafe(kill)
+
     def _run(self) -> None:
         from aioquic.asyncio import QuicConnectionProtocol, serve
         from aioquic.h3.connection import H3_ALPN, H3Connection
         from aioquic.h3.events import HeadersReceived
         from aioquic.quic.configuration import QuicConfiguration
 
+        server = self
+
         class Proto(QuicConnectionProtocol):
             def __init__(self, *a, **kw):
                 super().__init__(*a, **kw)
                 self.h3c = H3Connection(self._quic)
+                with server._lock:
+                    server.connections += 1
+                    server._protos.append(self)
 
             def quic_event_received(self, event):
                 for ev in self.h3c.handle_event(event):
@@ -454,6 +487,24 @@ class _QuicTestServer:
 
             def _answer(self, ev):
                 headers = dict(ev.headers)
+                path = headers.get(b":path", b"/")
+                with server._lock:
+                    server.requests += 1
+                if path.startswith(b"/hata"):
+                    # yanit vermeden baglantiyi kapat: istemci akisi H3Error
+                    # almali, havuz kaydi dusmeli
+                    self.close()
+                    self.transmit()
+                    return
+                if path.startswith(b"/metin"):
+                    body = server.TEXT
+                    out = [(b":status", b"200"),
+                           (b"content-type", b"text/plain"),
+                           (b"content-length", str(len(body)).encode())]
+                    self.h3c.send_headers(ev.stream_id, out)
+                    self.h3c.send_data(ev.stream_id, body, end_stream=True)
+                    self.transmit()
+                    return
                 rng = headers.get(b"range", b"")
                 start, end = 0, len(PAYLOAD) - 1
                 m = re.match(rb"bytes=(\d+)-(\d*)", rng or b"")
@@ -484,12 +535,12 @@ class _QuicTestServer:
             conf = QuicConfiguration(is_client=False,
                                      alpn_protocols=list(H3_ALPN))
             conf.load_cert_chain(str(self._cert), str(self._key))
-            server = await serve("127.0.0.1", 0, configuration=conf,
-                                 create_protocol=Proto)
-            self.port = server._transport.get_extra_info("sockname")[1]
+            srv = await serve("127.0.0.1", 0, configuration=conf,
+                              create_protocol=Proto)
+            self.port = srv._transport.get_extra_info("sockname")[1]
             self._ready.set()
             await stop.wait()
-            server.close()
+            srv.close()
 
         try:
             loop.run_until_complete(main())
@@ -517,6 +568,7 @@ class EndToEndTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        h3.close_all()
         cls.server.close()
 
     def setUp(self):
@@ -585,8 +637,8 @@ class EndToEndTest(unittest.TestCase):
     def test_slow_reader_gets_whole_body(self):
         """Akis bittikten sonra kuyrukta kalan parcalar kaybolmamali.
 
-        Yavas okur + 4 MiB tek aralik: dongu erken kapanirsa kuyruk
-        (DATA_QUEUE) tasmasi sahte stall/H3Error uretiyordu."""
+        Yavas okur + 4 MiB tek aralik: okur kuyrugu bosalmadan akis
+        biterse son parcalar kaybolmamali."""
         opt = httpcli.DlOptions(http3="force", insecure=True, timeout=10)
         end = len(PAYLOAD) - 1
         got = bytearray()
@@ -616,6 +668,236 @@ class EndToEndTest(unittest.TestCase):
                 with httpcli.open_range(self.url, opt, 0, 9, timeout=8) as res:
                     res.read(16)
         self.assertTrue(h3.broken(self.url))
+
+
+@unittest.skipUnless(HAVE_AIOQUIC, "aioquic kurulu degil")
+@unittest.skipUnless(OPENSSL, "openssl komutu yok")
+class PoolTest(unittest.TestCase):
+    """Origin basina baglanti havuzu: coklama, yeniden kullanim, kapanis."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = helpers.tmp_root(cls, "ferdim-h3-pool-")
+        cls.cert = cls.root / "cert.pem"
+        cls.key = cls.root / "key.pem"
+        subprocess.run(
+            [OPENSSL, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", str(cls.key), "-out", str(cls.cert), "-days", "1",
+             "-subj", "/CN=localhost",
+             "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"],
+            check=True, capture_output=True)
+        cls.server = _QuicTestServer(cls.cert, cls.key)
+        cls.server.start()
+        base = f"https://127.0.0.1:{cls.server.port}"
+        cls.url = base + "/dosya.bin"
+        cls.text_url = base + "/metin.txt"
+
+    @classmethod
+    def tearDownClass(cls):
+        h3.close_all()
+        cls.server.close()
+
+    def setUp(self):
+        h3.close_all()                # her test temiz havuzla baslasin
+        h3.reset_cache()
+        self.base_conns = self.server.connections
+
+    def tearDown(self):
+        h3.close_all()
+
+    def opt(self, mode: str = "force", timeout: float = 10) -> httpcli.DlOptions:
+        return httpcli.DlOptions(http3=mode, insecure=True, timeout=timeout)
+
+    def _read_all(self, res) -> bytes:
+        buf = bytearray()
+        while True:
+            chunk = res.read(65536)
+            if not chunk:
+                return bytes(buf)
+            buf += chunk
+
+    def _wait(self, pred, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if pred():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _burst(self, n: int, fn) -> list[BaseException]:
+        """n is parcacigi ayni anda: fn(i) baglanti/akis acar, bariyerde
+        bekler (hepsi kayitli olsun), sonra devam eder."""
+        gate = threading.Barrier(n, timeout=20)
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def work(i):
+            try:
+                fn(i, gate)
+            except BaseException as ex:      # noqa: BLE001 - testte raporlanir
+                with lock:
+                    errors.append(ex)
+                try:
+                    gate.abort()
+                except Exception:
+                    pass
+
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        return errors
+
+    def test_concurrent_ranges_use_one_connection(self):
+        """Es zamanli N aralik TEK QUIC baglantisinda ayri akislar olmali."""
+        n = 8
+        span = len(PAYLOAD) // n
+        got: dict[int, bytes] = {}
+
+        def work(i, gate):
+            start = i * span
+            with httpcli.open_range(self.url, self.opt(), start,
+                                    start + span - 1, timeout=15) as res:
+                gate.wait()
+                got[i] = self._read_all(res)
+
+        errors = self._burst(n, work)
+        self.assertEqual(errors, [])
+        self.assertEqual(self.server.connections - self.base_conns, 1,
+                         "es zamanli araliklar tek QUIC baglantisi kullanmali")
+        for i in range(n):
+            self.assertEqual(got.get(i), PAYLOAD[i * span:(i + 1) * span],
+                             f"aralik {i} bozuk")
+        self.assertEqual(h3.pool_stats()["connections"], 1,
+                         "baglanti sonraki istekler icin havuzda kalmali")
+
+    def test_sequential_requests_reuse_connection(self):
+        for _ in range(3):
+            with httpcli.open_range(self.url, self.opt(), 0, 99,
+                                    timeout=10) as res:
+                self.assertEqual(res.read(100), PAYLOAD[:100])
+        self.assertEqual(self.server.connections - self.base_conns, 1,
+                         "sirali istekler ayni baglantiyi kullanmali")
+
+    def test_stream_cap_opens_second_connection(self):
+        """MAX_STREAMS asilinca ayni hedef icin ikinci baglanti acilir."""
+        n = 4
+        got: dict[int, bytes] = {}
+
+        def work(i, gate):
+            with httpcli.open_range(self.url, self.opt(), 0, 99,
+                                    timeout=15) as res:
+                gate.wait()
+                got[i] = res.read(100)
+
+        with mock.patch.object(h3, "MAX_STREAMS", 2):
+            errors = self._burst(n, work)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(got), n)
+        self.assertEqual(self.server.connections - self.base_conns, 2,
+                         "akis siniri asilinca ikinci baglanti acilmali")
+
+    def test_idle_connection_closes(self):
+        with httpcli.open_range(self.url, self.opt(), 0, 99,
+                                timeout=10) as res:
+            res.read(100)
+        self.assertEqual(h3.pool_stats()["connections"], 1)
+        with mock.patch.object(h3, "POOL_IDLE_SECS", 0.2), \
+                mock.patch.object(h3, "POOL_SWEEP_SECS", 0.05):
+            self.assertTrue(
+                self._wait(lambda: h3.pool_stats()["connections"] == 0),
+                "bos baglanti bosta kapatilmali")
+        self.assertFalse(h3.broken(self.url),
+                         "bosta kapanma kaynagi bozmamali")
+        with httpcli.open_range(self.url, self.opt(), 0, 9, timeout=10) as res:
+            self.assertEqual(res.read(10), PAYLOAD[:10])
+        self.assertEqual(self.server.connections - self.base_conns, 2,
+                         "kapanan baglanti yerine yenisi kurulmali")
+
+    def test_server_close_does_not_break_origin(self):
+        """Sunucu bos baglantiyi temiz kapatirsa kaynak bozulmamali."""
+        with httpcli.open_range(self.url, self.opt(), 0, 9,
+                                timeout=10) as res:
+            self.assertEqual(res.read(10), PAYLOAD[:10])
+        self.server.kill_connections()
+        self.assertTrue(
+            self._wait(lambda: h3.pool_stats()["connections"] == 0),
+            "kapanan baglanti havuzdan dusmeli")
+        self.assertFalse(h3.broken(self.url),
+                         "akis yokken kapanma kaynagi bozmamali")
+        with httpcli.open_range(self.url, self.opt(), 0, 9, timeout=10) as res:
+            self.assertEqual(res.read(10), PAYLOAD[:10])
+
+    def test_connection_loss_evicts_and_fails_stream(self):
+        """Baglanti kopunca havuz kaydi duser, akis H3Error alir."""
+        with httpcli.open_range(self.url, self.opt(), 0, 9,
+                                timeout=10) as res:
+            self.assertEqual(res.read(10), PAYLOAD[:10])
+        self.assertEqual(h3.pool_stats()["connections"], 1)
+        bad = self.url.rsplit("/", 1)[0] + "/hata.bin"
+        with self.assertRaises(h3.H3Error):
+            with httpcli.open_range(bad, self.opt(), 0, 9, timeout=10) as res:
+                res.read(10)
+        self.assertEqual(h3.pool_stats()["connections"], 0,
+                         "kopan baglanti havuzdan dusmeli")
+        self.assertTrue(h3.broken(bad), "kopan kaynak bozuk isaretlenmeli")
+
+    def test_auto_falls_back_to_tcp_after_h3_loss(self):
+        with httpcli.open_range(self.url, self.opt(), 0, 9,
+                                timeout=10) as res:
+            res.read(10)
+        bad = self.url.rsplit("/", 1)[0] + "/hata.bin"
+        with self.assertRaises(h3.H3Error):
+            with httpcli.open_range(bad, self.opt(), 0, 9, timeout=10) as res:
+                res.read(10)
+        h3.remember_alt_svc(bad, f'h3=":{self.server.port}"; ma=60')
+        fake = _FakeResponse(total=1234)
+        with mock.patch.object(httpcli, "_open_tcp",
+                               return_value=fake) as tcp:
+            probe = httpcli.probe(bad, self.opt("auto", 5))
+        self.assertEqual(probe.total, 1234)
+        self.assertEqual(tcp.call_count, 1,
+                         "bozuk kaynakta auto mod TCP'ye dusmeli")
+
+    def test_fetch_small_over_http3(self):
+        """Yan dosya (saglama/manifest) ayni havuzdan h3 ile cekilmeli."""
+        before = self.server.requests
+        text = httpcli.fetch_small(self.text_url, self.opt())
+        self.assertEqual(text, _QuicTestServer.TEXT.decode())
+        self.assertEqual(self.server.requests - before, 1)
+        self.assertEqual(h3.pool_stats()["connections"], 1)
+        self.assertFalse(h3.broken(self.text_url))
+
+    def test_opener_path_uses_h3(self):
+        """hls.fetch_text / dash.fetch_mpd / segments.fetch_all ayni
+        `_make_opener(opt).open(request_of(...))` imzasini kullanir; h3
+        acikken istek h3'ten gecmeli."""
+        opt = self.opt()
+        opener = httpcli._make_opener(opt)
+        with opener.open(httpcli.request_of(self.text_url, opt),
+                         timeout=10) as res:
+            self.assertIsInstance(res, h3.Response)
+            self.assertEqual(res.status, 200)
+            self.assertEqual(res.read(), _QuicTestServer.TEXT)
+        self.assertFalse(h3.broken(self.text_url))
+
+    def test_close_all_releases_thread(self):
+        with httpcli.open_range(self.url, self.opt(), 0, 9,
+                                timeout=10) as res:
+            self.assertEqual(res.read(10), PAYLOAD[:10])
+        self.assertIn("ferdim-h3-loop",
+                      [t.name for t in threading.enumerate()])
+        h3.close_all()
+        self.assertNotIn("ferdim-h3-loop",
+                         [t.name for t in threading.enumerate()],
+                         "close_all sonrasi is parcacigi kalmamali")
+        self.assertEqual(h3.pool_stats(), {"connections": 0, "streams": 0})
+        with httpcli.open_range(self.url, self.opt(), 0, 9,
+                                timeout=10) as res:      # yeniden kurulabilir
+            self.assertEqual(res.read(10), PAYLOAD[:10])
+        self.assertIn("ferdim-h3-loop",
+                      [t.name for t in threading.enumerate()])
 
 
 if __name__ == "__main__":

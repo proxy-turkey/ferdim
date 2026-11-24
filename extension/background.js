@@ -4,6 +4,10 @@
  *  - medya/indirme adaylarini webRequest ile dinle (siniflandirma
  *    sniff.js icinde, saf fonksiyon), sayfa basliginda rozet
  *  - sag tik menusu, "tum baglantilari tara" (grab) kutuphanesi
+ *
+ * MV2 ve MV3 ayni kaynaktan calisir (docs/mv3-spike.md). MV3'te arka plan
+ * bir olay sayfasidir: sekme durumu storage.session'da tutulur, betik
+ * enjeksiyonu scripting API'siyle yapilir, periyodik zamanlayici yoktur.
  */
 /* global FerDimSniff */
 "use strict";
@@ -39,17 +43,13 @@ const pageButton = browser.pageAction || {
   hide: () => Promise.resolve(),
 };
 
-/* mediaByTab: tabId -> Map(url -> sniff.js verdict'i) */
-const mediaByTab = new Map();
-const grabsByTab = new Map(); // tabId -> [link]
-
 /* ---------------------------------------------------------------- options */
 async function loadOpts() {
   const st = await browser.storage.local.get("opts");
   opts = { ...DEFAULT_OPTS, ...(st.opts || {}) };
 }
 browser.storage.onChanged.addListener((ch, area) => {
-  if (area === "local" && ch.opts) loadOpts().then(refreshMenus);
+  if (area === "local" && ch.opts) loadOpts();
 });
 
 /* ------------------------------------------------------------ native host */
@@ -69,6 +69,63 @@ async function pingHost() {
   toolbar.setBadgeBackgroundColor(
     { color: hostOk ? "#22c55e" : "#ef4444" });
   return hostOk;
+}
+
+/* ------------------------------------------------------------ sekme durumu */
+/* mediaByTab: tabId -> Map(url -> sniff.js verdict'i). Bellekte onbellek,
+ * storage.session'da kalici kopya: olay sayfasi uykuya dalinca harita
+ * kaybolur, ilk erisimde geri yuklenir. storage.session yoksa (eski
+ * tarayici) yalnizca bellek kullanilir. */
+const sessionArea = (browser.storage && browser.storage.session) || null;
+const MEDIA_KEY = "mediaByTab";
+const mediaByTab = new Map();
+let mediaReadyPromise = null;
+
+function mediaSnapshot() {
+  const out = {};
+  for (const [tabId, map] of mediaByTab) out[tabId] = [...map.values()];
+  return out;
+}
+
+let persistQueued = false;
+function persistMedia() {
+  if (!sessionArea || persistQueued) return;
+  persistQueued = true;
+  Promise.resolve().then(async () => {
+    persistQueued = false;
+    try {
+      await sessionArea.set({ [MEDIA_KEY]: mediaSnapshot() });
+    } catch (e) { /* kota/izin yok: bellek yeter */ }
+  });
+}
+
+async function hydrateMedia() {
+  if (sessionArea) {
+    const st = await sessionArea.get(MEDIA_KEY);
+    for (const [key, hits] of Object.entries((st && st[MEDIA_KEY]) || {})) {
+      const tabId = Number(key);
+      if (!Number.isInteger(tabId) || !Array.isArray(hits)) continue;
+      const map = new Map();
+      for (const h of hits) if (h && h.url) map.set(h.url, h);
+      if (map.size) mediaByTab.set(tabId, map);
+    }
+  }
+  // Kapanmis sekmelerin kaydi kalmasin (sekme kimligi yeniden kullanilir).
+  const tabs = await browser.tabs.query({});
+  const live = new Set(tabs.map((t) => t.id));
+  let dropped = false;
+  for (const tabId of [...mediaByTab.keys()]) {
+    if (!live.has(tabId)) { mediaByTab.delete(tabId); dropped = true; }
+  }
+  if (dropped) persistMedia();
+}
+
+/* Ilk erisimde bir kez yukle; es zamanli cagrilar ayni promise'i bekler. */
+function mediaReady() {
+  if (!mediaReadyPromise) {
+    mediaReadyPromise = hydrateMedia().catch(() => {});
+  }
+  return mediaReadyPromise;
 }
 
 /* ------------------------------------------------------------------ utils */
@@ -91,6 +148,7 @@ function looksMedia(u, mime) {
 
 /* ------------------------------------------------------- indirme yakalama */
 async function onDownloadCreated(item) {
+  await ready;
   if (item.state !== "in_progress") return;
   const url = item.url || "";
   if (!/^(https?|ftp):/i.test(url)) return; // blob:/data: yakalanamaz
@@ -164,26 +222,34 @@ function notify(title, message) {
  * parca isteklerini ele, rozette medya sayisi tut, overlay'e haber ver. */
 function onHeaders(details) {
   if (details.tabId < 0) return;
-  const hit = FerDimSniff.classify(
-    { url: details.url, status: details.statusCode,
-      headers: details.responseHeaders },
-    { minBytes: Math.round((opts.minMediaMB || 0) * 1048576) });
-  if (!hit) return;
-  if (hit.kind === "audio" && !opts.includeAudio) return;
-  // HLS/DASH parcasi: indirilecek oge manifesttir, parca degil
-  if (hit.role === "segment") return;
+  // Olay sayfasi uyanirken opts ve sekme durumu henuz yuklenmemis olabilir.
+  mediaReady().then(async () => {
+    await optsReady;
+    const hit = FerDimSniff.classify(
+      { url: details.url, status: details.statusCode,
+        headers: details.responseHeaders },
+      { minBytes: Math.round((opts.minMediaMB || 0) * 1048576) });
+    if (!hit) return;
+    if (hit.kind === "audio" && !opts.includeAudio) return;
+    // HLS/DASH parcasi: indirilecek oge manifesttir, parca degil
+    if (hit.role === "segment") return;
+    recordHit(details.tabId, hit);
+  }).catch(() => {});
+}
 
-  let map = mediaByTab.get(details.tabId);
+function recordHit(tabId, hit) {
+  let map = mediaByTab.get(tabId);
+  if (map && map.has(hit.url)) return;
   const manifestSeen = map ? hasManifest(map) : false;
   if (hit.segmentish && manifestSeen) return;
-  if (map && map.has(hit.url)) return;
-  if (!map) { map = new Map(); mediaByTab.set(details.tabId, map); }
+  if (!map) { map = new Map(); mediaByTab.set(tabId, map); }
   map.set(hit.url, hit);
   if (hit.role === "manifest") dropSegments(map);
   if (map.size > 60) map.delete(map.keys().next().value);
-  updateBadge(details.tabId);
+  persistMedia();
+  updateBadge(tabId);
   if (opts.overlayButton) {
-    browser.tabs.sendMessage(details.tabId, {
+    browser.tabs.sendMessage(tabId, {
       ferdimMedia: true, count: map.size,
     }).catch(() => {});
   }
@@ -210,8 +276,7 @@ function updateBadge(tabId) {
 }
 
 browser.tabs.onRemoved.addListener((tabId) => {
-  mediaByTab.delete(tabId);
-  grabsByTab.delete(tabId);
+  if (mediaByTab.delete(tabId)) persistMedia();
 });
 
 /* ------------------------------------------------------------ sag tik menu */
@@ -223,9 +288,24 @@ function menuDefs() {
     { id: "fd-selection", title: _("menuGrabSel"), contexts: ["selection"] },
   ];
 }
-async function refreshMenus() {
-  try { await browser.contextMenus.removeAll(); } catch (e) {}
-  for (const d of menuDefs()) browser.contextMenus.create({ ...d });
+/* Menu tanimlari tarayicida kalicidir ama olay sayfasi her uyanista yeniden
+ * kurmamali: yalnizca kurulum/guncelleme ve tarayici acilisi. Cagrilar
+ * sirayla islenir, boylece removeAll/create yarismaz. */
+let menuQueue = Promise.resolve();
+function refreshMenus() {
+  const run = async () => {
+    try { await browser.contextMenus.removeAll(); } catch (e) { /* yok */ }
+    for (const d of menuDefs()) {
+      try { browser.contextMenus.create({ ...d }); }
+      catch (e) { /* ayni kimlik: onceki tur kurmus */ }
+    }
+  };
+  menuQueue = menuQueue.then(run, run);
+  return menuQueue;
+}
+browser.runtime.onInstalled.addListener(() => { refreshMenus(); });
+if (browser.runtime.onStartup) {
+  browser.runtime.onStartup.addListener(() => { refreshMenus(); });
 }
 browser.contextMenus.onClicked.addListener(async (info, tab) => {
   const referer = tab && tab.url || "";
@@ -241,39 +321,66 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
 });
 
 /* --------------------------------------------------- sayfa baglanti tarama */
+/* Enjekte edilen toplayici kapanis degiskeni kullanmaz: scripting API
+ * islevi kaynagindan serilestirip sayfaya tasir. */
+function collectLinks(selectionOnly) {
+  const roots = [];
+  if (selectionOnly) {
+    const s = document.getSelection();
+    if (s && !s.isCollapsed && s.rangeCount) {
+      for (let i = 0; i < s.rangeCount; i++) {
+        const d = document.createElement("div");
+        d.appendChild(s.getRangeAt(i).cloneContents());
+        roots.push(d);
+      }
+    }
+  }
+  const out = [];
+  for (const r of (roots.length ? roots : [document])) {
+    for (const a of r.querySelectorAll("a[href]")) {
+      let u = "";
+      try { u = new URL(a.href, location.href).href; } catch (e) { continue; }
+      if (!/^https?:/.test(u)) continue;
+      out.push({ url: u, text: (a.textContent || "").trim().slice(0, 80) });
+    }
+  }
+  const seen = new Set();
+  return out.filter((x) => !seen.has(x.url) && seen.add(x.url)).slice(0, 800);
+}
+
 async function grabTab(tabId, selectionOnly) {
-  const results = await browser.tabs.executeScript(tabId, {
-    code: `(() => {
-      const roots = [];
-      const s = document.getSelection();
-      if (s && !s.isCollapsed && s.rangeCount) {
-        for (let i = 0; i < s.rangeCount; i++) {
-          const d = document.createElement('div');
-          d.appendChild(s.getRangeAt(i).cloneContents());
-          roots.push(d);
-        }
-      }
-      const out = [];
-      for (const r of (roots.length ? roots : [document])) {
-        for (const a of r.querySelectorAll('a[href]')) {
-          let u = '';
-          try { u = new URL(a.href, location.href).href; } catch (e) { continue; }
-          if (!/^https?:/.test(u)) continue;
-          out.push({ url: u, text: (a.textContent || '').trim().slice(0, 80) });
-        }
-      }
-      const seen = new Set();
-      return out.filter(x => !seen.has(x.url) && seen.add(x.url)).slice(0, 800);
-    })()`,
-  });
-  grabsByTab.set(tabId, results[0] || []);
-  return results[0] || [];
+  try {
+    // MV3: scripting API. Koseli parantez bilinclidir: web-ext linter'i
+    // MV3'te bu API'yi "kaldirilmis" sayar, oysa cagri yalnizca scripting
+    // API'si olmayan (MV2, Firefox < 102) tarayicida calisir.
+    const legacy = browser.tabs && browser.tabs["executeScript"];
+    if (browser.scripting && browser.scripting.executeScript) {
+      const res = await browser.scripting.executeScript({
+        target: { tabId },
+        func: collectLinks,
+        args: [!!selectionOnly],
+      });
+      const first = res && res[0];
+      if (first && first.error) return [];
+      return (first && first.result) || [];
+    }
+    if (!legacy) return [];
+    const res = await legacy.call(browser.tabs, tabId, {
+      code: `(${collectLinks.toString()})(${JSON.stringify(!!selectionOnly)})`,
+    });
+    return (res && res[0]) || [];
+  } catch (e) {
+    return []; // about: sayfalari, iptal edilmis izin vb.
+  }
 }
 
 /* -------------------------------------------------------- mesajlasma (UI) */
 browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
+    await ready;
     if (msg.getMedia) {
+      await mediaReady();
+      await pingHost();   // popup acildi: ana makine durumunu tazele
       const map = mediaByTab.get(msg.tabId);
       return sendResponse({
         ok: true, hostOk, port: hostPort, turbo: hostTurbo,
@@ -317,6 +424,12 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 /* ------------------------------------------------------------------ kurulum */
+/* Olay sayfasi her uyanista burayi calistirir: ayarlari yukle, ana makineyi
+ * bir kez yokla. Periyodik zamanlayici yok (uykuda olurse zaten calismaz);
+ * durum popup acilisinda tazelenir. */
+const optsReady = loadOpts().catch(() => {});
+const ready = optsReady.then(pingHost).catch(() => {});
+
 browser.downloads.onCreated.addListener(onDownloadCreated);
 browser.webRequest.onHeadersReceived.addListener(
   onHeaders,
@@ -324,9 +437,3 @@ browser.webRequest.onHeadersReceived.addListener(
     types: ["main_frame", "sub_frame", "media", "xmlhttprequest", "other",
             "object"] },
   ["responseHeaders"]);
-
-loadOpts().then(async () => {
-  await refreshMenus();
-  await pingHost();
-  setInterval(pingHost, 60000);
-});

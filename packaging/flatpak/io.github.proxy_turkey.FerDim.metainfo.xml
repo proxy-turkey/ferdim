@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.proxy_turkey.FerDim</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>FerDim</name>
+  <summary>Dynamic, self-tuning segmented download manager</summary>
+
+  <developer id="io.github.proxy_turkey">
+    <name>Enes Aksu</name>
+  </developer>
+
+  <description>
+    <p>
+      FerDim is a download manager for Linux with a segmented, multi-connection
+      engine that tunes itself to the line or the server, whichever ceiling is
+      reachable first.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Up to 32 parallel connections per job with work stealing and crash-safe resume</li>
+      <li>A throughput governor that adapts to HTTP 429/503 limits and stalled servers</li>
+      <li>Speed limits, a night scheduler and a smart queue</li>
+      <li>FTP/FTPS, HLS and DASH downloads, checksum and Merkle verification</li>
+      <li>Archive browsing and extraction, metalink support, watched folders</li>
+      <li>A GTK 4 app, a CLI, a local web UI and a Firefox extension</li>
+    </ul>
+    <p>Available in English, Turkish, Spanish and Russian.</p>
+  </description>
+
+  <launchable type="desktop-id">io.github.proxy_turkey.FerDim.desktop</launchable>
+  <url type="homepage">https://github.com/proxy-turkey/ferdim</url>
+  <url type="bugtracker">https://github.com/proxy-turkey/ferdim/issues</url>
+  <url type="vcs-browser">https://github.com/proxy-turkey/ferdim</url>
+  <url type="help">https://github.com/proxy-turkey/ferdim#readme</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <image type="source">https://raw.githubusercontent.com/proxy-turkey/ferdim/v1.6.0/docs/screenshots/gtk-gui.png</image>
+      <caption>The GTK 4 window with live per-job speeds and controls</caption>
+    </screenshot>
+    <screenshot>
+      <image type="source">https://raw.githubusercontent.com/proxy-turkey/ferdim/v1.6.0/docs/screenshots/web-ui.png</image>
+      <caption>The dependency-free web UI served by the daemon</caption>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="1.6.0" date="2026-11-24">
+      <description>
+        <p>
+          Learned per-host connection profiles, archive browsing and
+          extraction, desktop notifications, a D-Bus bridge and a GNOME Shell
+          extension.
+        </p>
+      </description>
+    </release>
+  </releases>
+
+  <content_rating type="oars-1.1"/>
+
+  <categories>
+    <category>Network</category>
+    <category>FileTransfer</category>
+  </categories>
+
+  <keywords>
+    <keyword>download</keyword>
+    <keyword>manager</keyword>
+    <keyword>segmented</keyword>
+    <keyword>firefox</keyword>
+    <keyword>http</keyword>
+    <keyword>ftp</keyword>
+  </keywords>
+
+  <provides>
+    <binary>ferdim-gui</binary>
+    <binary>ferdim</binary>
+  </provides>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+</component>

@@ -71,6 +71,9 @@ async function loadLang(lang) {
   // dugme adlari ve notlar kurulumda cevrildi: satirlar yeni dille kurulur
   for (const r of rows.values()) r.root.remove();
   rows.clear();
+  for (const r of hostRows.values()) r.root.remove();   // profil satirlari
+  hostRows.clear();
+  if (hostsDlg.open) loadHosts();
 }
 
 /* ------------------------------------------------------------- yardimcilar */
@@ -240,6 +243,32 @@ function errText(code, fallback) {
   return k && T[k] !== undefined ? T[k] : (fallback || "");
 }
 
+/* dogrulama rozetleri: yan dosya saglamasi ve Merkle bildirimi (ok / warn /
+ * mismatch). Sunucu notu (checksum_note / merkle_note) varsa ipucu olarak
+ * tasinir; cozunurluk yoksa cevrilmis genel metin gosterilir. */
+function integrityNotes(j) {
+  const out = [];
+  const algos = (j.verified || []).filter((a) => a !== "merkle").join(", ");
+  const note = j.checksum_note || (j.extra && j.extra.checksum_note) || "";
+  const mnote = j.merkle_note || (j.extra && j.extra.merkle_note) || "";
+  if (j.checksum === "ok")
+    out.push(["ok chk", "✓ " + (algos ? trf("chk_ok", { a: algos })
+                                      : tr("notify_chk_ok")), note || undefined]);
+  else if (j.checksum === "warn")
+    out.push(["warn chk", "⚠ " + tr("chk_warn"),
+              note || tr("err_checksum_mismatch")]);
+  else if (j.checksum === "mismatch")
+    out.push(["bad chk", "✗ " + tr("notify_chk_mismatch"),
+              note || tr("err_checksum_mismatch")]);
+  if (j.merkle === "ok" || j.merkle === "repaired")
+    out.push(["ok chk", "✓ " + tr("merkle_ok"), mnote || undefined]);
+  else if (j.merkle === "warn" || j.merkle === "mismatch")
+    out.push([(j.merkle === "warn" ? "warn" : "bad") + " chk",
+              (j.merkle === "warn" ? "⚠ " : "✗ ") + tr("merkle_manifest"),
+              mnote || tr("err_merkle_mismatch")]);
+  return out;
+}
+
 function notesFor(j) {
   const out = [];
   if (j.adaptive && j.adaptive < j.segments_cfg)
@@ -250,10 +279,7 @@ function notesFor(j) {
     out.push(["info", "⏱ " + trf("sched_wait", { w: j.window })]);
   if (j.sources_dead > 0)
     out.push(["warn", "⛔ " + trf("mirrors_dead", { n: j.sources_dead })]);
-  if (j.state === "done" && j.checksum === "warn")
-    out.push(["warn", "⚠ " + tr("chk_warn")]);
-  if (j.state === "done" && j.verified && j.verified.length)
-    out.push(["ok", "✓ " + trf("chk_ok", { a: j.verified.join(", ") })]);
+  out.push(...integrityNotes(j));
   return out;
 }
 
@@ -305,8 +331,8 @@ function updateRow(r, j) {
   const sig = JSON.stringify(notes);
   if (sig !== r.sig) {          // notlar yalniz degisince yeniden kurulur
     r.sig = sig;
-    r.notes.replaceChildren(...notes.map(([cls, text]) =>
-      dom("span", { class: "note " + cls, text })));
+    r.notes.replaceChildren(...notes.map(([cls, text, title]) =>
+      dom("span", { class: "note " + cls, text, title })));
     r.notes.hidden = notes.length === 0;
   }
 
@@ -441,6 +467,8 @@ async function poll() {
   polling = false;
   if (fresh) sampleHistory();
   render(); renderStatus(); announce(); updateGraphs();
+  // profil paneli acikken ~2 sn'de bir tazelenir (her taramada degil)
+  if (hostsDlg.open && ++hostTicks % 4 === 0) loadHosts();
 }
 
 /* --------------------------------------------------------------- arsiv */
@@ -542,6 +570,110 @@ async function act(kind, id) {
 $("#zipClose").onclick = () => { zipTask = 0; $("#zipDlg").close(); };
 $("#zipExtract").onclick = zipExtract;
 $("#zipRepair").onclick = zipRepair;
+
+/* ------------------------------------------------- ana makine profilleri */
+/* Ogrenilmis profiller ('hosts' komutu: liste / {forget} / {clear}). Satirlar
+ * ana makineye gore anahtarlanir ve yerinde guncellenir; her metin
+ * textContent ile yazilir. Panel yalniz acikken tazelenir (~2 sn). */
+const hostsDlg = $("#hostsDlg");
+const hostRows = new Map();      // ana makine -> {root, text, forget, sig}
+let hostsGen = 0;                // eski yanit yeni listeyi ezmesin
+let hostTicks = 0;
+
+function buildHostRow(host) {
+  const text = dom("span", { class: "hrow-text" });
+  const forget = dom("button", { class: "act", type: "button",
+                                 "data-host": host, text: "✕" });
+  forget.onclick = () => forgetHost(forget.dataset.host || "");
+  return { text, forget, sig: "",
+           root: dom("div", { class: "hostrow", role: "listitem" },
+                     text, forget) };
+}
+
+function updateHostRow(r, h) {
+  const band = h.rtt_band ? tr("rtt_" + h.rtt_band) : "?";
+  const seen = h.last_seen
+    ? new Date(h.last_seen * 1000).toLocaleString() : "—";
+  const text = trf("hosts_row", {
+    host: h.host, links: h.links || 0, rtt: band,
+    speed: human(h.per_link_bps || 0), samples: h.samples || 0, seen });
+  if (text !== r.sig) {          // satir yalniz degisince yeniden yazilir
+    r.sig = text;
+    r.text.textContent = text;
+    r.text.title = text;
+  }
+  const label = tr("act_remove") + ": " + h.host;
+  if (r.forget.getAttribute("aria-label") !== label) {
+    r.forget.setAttribute("aria-label", label);
+    r.forget.title = label;
+  }
+  r.forget.dataset.host = h.host;
+}
+
+function renderHosts(list) {
+  const box = $("#hostsList");
+  const keep = new Set();
+  let cursor = box.firstChild;
+  for (const h of list) {
+    keep.add(h.host);
+    let r = hostRows.get(h.host);
+    if (!r) { r = buildHostRow(h.host); hostRows.set(h.host, r); }
+    updateHostRow(r, h);
+    if (r.root === cursor) {
+      cursor = cursor.nextSibling;
+    } else {
+      box.insertBefore(r.root, cursor);
+      if (cursor) cursor = cursor.nextSibling;
+    }
+  }
+  for (const [host, r] of hostRows) {
+    if (!keep.has(host)) { r.root.remove(); hostRows.delete(host); }
+  }
+  $("#hostsEmpty").hidden = list.length > 0;
+  $("#hostsForgetAll").hidden = list.length === 0;
+}
+
+async function loadHosts() {
+  const gen = ++hostsGen;
+  let r = {};
+  try { r = await api("/api/hosts", {}); } catch { r = {}; }
+  if (gen !== hostsGen) return;          // daha yeni istek yolda
+  const st = $("#hostsStatus");
+  if (!r || !r.ok) {                     // komut yok / daemon hatasi
+    $("#hostsList").replaceChildren();
+    hostRows.clear();
+    $("#hostsEmpty").hidden = true;
+    $("#hostsForgetAll").hidden = true;
+    st.textContent = tr("cli_error") + ": " + ((r && r.error) || tr("daemon_lost"));
+    st.hidden = false;
+    return;
+  }
+  st.textContent = "";
+  st.hidden = true;
+  renderHosts(r.hosts || []);
+}
+
+async function forgetHost(host) {
+  let r = {};
+  try { r = await api("/api/hosts", { forget: host }); } catch { r = {}; }
+  notice(r && r.ok ? trf("hosts_forgotten", { host })
+                   : trf("hosts_unknown", { host }));
+  loadHosts();
+}
+
+$("#hostsBtn").onclick = () => { hostsDlg.showModal(); loadHosts(); };
+$("#hostsClose").onclick = () => hostsDlg.close();
+$("#hostsForgetAll").onclick = async () => {
+  const n = hostRows.size;
+  if (!n) return;
+  // onay metni dugmenin kendi etiketinden turetilir (yeni anahtar gerekmez)
+  if (!confirm($("#hostsForgetAll").textContent.trim() + "? (" + n + ")")) return;
+  let r = {};
+  try { r = await api("/api/hosts", { clear: true }); } catch { r = {}; }
+  notice(r && r.ok ? trf("hosts_cleared", { n: r.removed || 0 })
+                   : tr("daemon_lost"));
+  loadHosts();
+};
 
 /* --------------------------------------------------------------- gecmis */
 /* Sunucudaki SQLite gecmisi: arama, istatistik ve yeniden indirme. Satirlar

@@ -409,6 +409,12 @@ S = {
         "tr": "{host}  {links} bağlantı  rtt {rtt}  bağlantı başına {speed}/sn  ({samples} örnek, {seen})",
         "es": "{host}  {links} enlaces  rtt {rtt}  {speed}/s por enlace  ({samples} muestras, {seen})",
         "ru": "{host}  {links} соединений  rtt {rtt}  {speed}/с на соединение  ({samples} замеров, {seen})"},
+    "hosts_title": {
+        "en": "Hosts", "tr": "Ana makineler",
+        "es": "Servidores", "ru": "Серверы"},
+    "hosts_forget_all": {
+        "en": "Forget all", "tr": "Tümünü unut",
+        "es": "Olvidar todo", "ru": "Забыть всё"},
     "hosts_empty": {
         "en": "No learned host profiles yet.",
         "tr": "Henüz öğrenilmiş ana makine profili yok.",

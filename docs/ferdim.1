@@ -131,6 +131,25 @@ insertions) and fetching only the missing byte ranges with HTTP Range. The
 result is verified chunk by chunk and only then moved over the target
 (\fB\-o\fR picks another target).
 .TP
+.BI publish " DIR " \-\-base\-url " URL"
+Emit the publisher side of a download site: for every regular file in
+\fIDIR\fR write \fIFILE.ferdim-merkle\fR (content defined chunks and the
+Merkle root, see \fBmerkle\fR above), \fIFILE.sha256\fR (coreutils format)
+and \fIFILE.meta4\fR, an RFC 5854 document carrying name, size, SHA\-256,
+the merkle metaurl (\fIapplication/x-ferdim-merkle\fR) and merkle root plus
+the download addresses: \fIURL\fR joined with the file name has priority
+1, every \fB\-\-mirror\fR follows with priority 2 and up. One
+\fIindex.meta4\fR covers the whole directory, so \fBferdim add-file\fR on
+either document queues the artefacts with their mirrors and digests. The
+output is byte stable: files are processed in name order, the only
+timestamp is \fB<published>\fR taken from the artefact mtime (RFC 3339,
+UTC) and unchanged files are not rewritten, so re\-running produces no
+diff. A manifest that is already current (same size, not older than the
+file) is reused; \fB\-\-force\fR regenerates it anyway, \fB\-\-no-merkle\fR
+skips the chunk manifest and drops its metaurl, and \fB\-\-glob\fR limits
+the set to matching file names. Names are percent\-encoded in URLs, sub
+directories are not descended into.
+.TP
 .BI config " [\-\-set JSON]"
 Show or change settings: segments, concurrency, scheduler window and
 per-category windows (\fIschedule.categories\fR), language, watched

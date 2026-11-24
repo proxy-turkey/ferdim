@@ -22,10 +22,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .. import cdc, util
+from ..coexist import LatencySignal
 from ..paths import AppEnv
 from ..profiles import host_key, open_profiles
 from ..ratelimit import TokenBucket
-from . import dash, ftp, hls, httpcli, socks
+from . import dash, ftp, hls, httpcli, segments, socks
 
 CHUNK = 1 << 16            # 64 KB okuma blogu
 MIN_SPLIT = 1 << 20        # 1 MB'dan kucuk aralik bolunmez
@@ -352,6 +353,8 @@ class DownloadJob:
         self._reported_done = 0    # ayni baytlar iki kez bildirilmez
         self._throttle_seen = False
         self._safe_links = 0       # 429/503 sonrasi sunucunun kabul ettigi sayi
+        # gecikme sinyali (birlikte yasam): aralik isteklerinin TTFB'si
+        self._lat = LatencySignal()
         self._reset_sources()
 
     # ----------------------------------------------------------------- durum
@@ -460,6 +463,8 @@ class DownloadJob:
                 "adaptive": self.extra.get("adaptive"),
                 "checksum": self.extra.get("checksum", ""),
                 "merkle": self.extra.get("merkle", ""),
+                "checksum_note": self.extra.get("checksum_note", ""),
+                "merkle_note": self.extra.get("merkle_note", ""),
                 "verified": list(self.extra.get("verified", [])),
                 "mirrors": len(self.spec.mirrors or []),
                 "mirror_health": [
@@ -556,6 +561,7 @@ class DownloadJob:
         if self.kind == "ftp" or ftp.is_ftp(self.url) or \
            resume_meta.get("kind") == "ftp":
             self.kind = "ftp"
+            self._host = host_key(self.url)   # profil: RTT + hiz bildirir
             self._merkle_http_only()
             if not self.final_filename:
                 self.final_filename = util.filename_from_url(self.url)
@@ -565,6 +571,7 @@ class DownloadJob:
         if self.kind == "hls" or httpcli.is_hls(self.url, "") or \
            resume_meta.get("kind") == "hls":
             self.kind = "hls"
+            self._host = host_key(self.url)
             self._merkle_http_only()
             if not self.final_filename:
                 self.final_filename = util.filename_from_url(self.url) + ".ts"
@@ -575,6 +582,7 @@ class DownloadJob:
         if self.kind == "dash" or dash.is_dash(self.url, "") or \
            resume_meta.get("kind") == "dash":
             self.kind = "dash"
+            self._host = host_key(self.url)
             self._merkle_http_only()
             if not self.final_filename:
                 base = util.filename_from_url(self.url)
@@ -610,6 +618,8 @@ class DownloadJob:
                 self._vsrc = src.url
                 # profil anahtari: veriyi gercekten sunan ana makine
                 self._host = host_key(p.final_url or src.url)
+                # gecikme sinyali: yoklama TTFB'si tabanin ilk ornegidir
+                self._lat.add(self._host, self._probe_rtt)
             except urllib.error.HTTPError as e:
                 last_err = e
                 if e.code in (429, 503):
@@ -1198,6 +1208,19 @@ class DownloadJob:
             self._cond.notify_all()
 
     # ------------------------------------------- ogrenilen ana makine profili
+    def _profile_store(self):
+        """Profil deposu; ogrenme kapaliysa None (hicbir olcum yazilmaz)."""
+        if not self.cfg.get("learn_hosts", True):
+            return None
+        return open_profiles(self.env)
+
+    def latency_inflation(self) -> float:
+        """Kendi baglantilarimizin TTFB sismesi (1.0 = normal).
+
+        Kuyruk bunu birlikte yasam modunun gecikme sinyali olarak okur:
+        kaynak bazinda guncel EMA'nin tabana (en iyi TTFB) orani."""
+        return self._lat.inflation()
+
     def _seed_profile(self) -> None:
         """Isin baslangic noktasini ogrenilmis profilden kurar.
 
@@ -1264,6 +1287,20 @@ class DownloadJob:
         open_profiles(self.env).record(
             self._host, links=links, throttled=throttled,
             rtt=self._probe_rtt, per_link_bps=per_link)
+
+    def _report_ftp_profile(self, started: float, first_byte: float,
+                            moved: int, seconds: float) -> None:
+        """FTP tek akis: yalniz RTT bandi ve baglanti basi hiz ogrenilir.
+
+        `links`/`seg_workers` bilerek yazilmaz (FTP tek baglanti kurar,
+        aralik islerinin tohumunu yanlis yere cekmemeli). Yeterli bayt
+        tasinmadiysa ya da ogrenme kapaliysa hicbir sey yazilmaz."""
+        store = self._profile_store()
+        if store is None or not self._host or moved < PROFILE_MIN_BYTES:
+            return
+        rtt = max(0.0, first_byte - started) if first_byte else 0.0
+        bps = moved / seconds if seconds > 0 else 0.0
+        store.record(self._host, rtt=rtt, per_link_bps=bps)
 
     def _crowded(self) -> bool:
         with self._lock:
@@ -1382,7 +1419,14 @@ class DownloadJob:
                     self._fail(self._dead_reason(), "no_sources")
                 return (0.0, True)
             try:
+                t_open = time.monotonic()
                 resp = self._open(src, opt, cursor, e)
+                # TTFB: baglanti + basliklara kadar gecen sure. Ek istek
+                # acilmaz; taban/EMA karsilastirmasi birlikte yasam
+                # modunun gecikme sinyalini besler (eski kusak yazmaz).
+                if gen == self._gen:
+                    self._lat.add(host_key(src.url),
+                                  time.monotonic() - t_open)
             except SourceInvalid as ex:
                 # ayna baska dosya veriyor / Range desteklemiyor: isi bastan
                 # baslatmak YANLIS olur (sonsuz restart dongusu); ayna elenir,
@@ -1758,7 +1802,9 @@ class DownloadJob:
 
             hls.download_hls(self.url, opt, self._fd, meta, self._stop,
                              self._bucket, prog, self.extra,
-                             meta_path=self.meta_path)
+                             meta_path=self.meta_path,
+                             store=self._profile_store(),
+                             cap=self._seg_cap())
             # duraklatma/iptal sonrasi 'tail' yarim dosyanin sonudur: toplami
             # ona esitlemek isi 'eksik veri' ya da erken 'done' yapardi
             if not self._stop.is_set():
@@ -1766,6 +1812,13 @@ class DownloadJob:
                 util.atomic_write_json(self.meta_path, meta)
         except Exception as ex:
             self._fail(str(ex), _code_for(ex))
+
+    def _seg_cap(self) -> int:
+        """Segment havuzu tavani: sabit 8 ile isin baglanti tavani
+        (birlikte yasam / sunucu) kucuk olani. Tohum ayni siniri asmaz."""
+        with self._lock:
+            ceiling = self._ceiling_locked()
+        return max(1, min(segments.SEG_MAX, ceiling))
 
     def _run_dash(self):
         opt = self.spec.options(self.cfg)
@@ -1777,12 +1830,16 @@ class DownloadJob:
                 with self._lock:
                     self.done += n
 
+            t0 = time.monotonic()
             text = dash.fetch_mpd(self.url, opt)
+            rtt = time.monotonic() - t0    # MPD yanit suresi (RTT bandi)
             init_url, seg_urls = dash.build_segment_list(text, self.url)
             self.extra["segments_listed"] = len(seg_urls)
             hls.segments.assemble(opt, self._fd, meta, self._stop,
                                   self._bucket, prog, self.meta_path,
-                                  init_url, seg_urls)
+                                  init_url, seg_urls,
+                                  store=self._profile_store(),
+                                  cap=self._seg_cap(), rtt=rtt)
             if not self._stop.is_set():
                 self.total = self.done = int(meta.get("tail", 0))
                 util.atomic_write_json(self.meta_path, meta)
@@ -1800,11 +1857,18 @@ class DownloadJob:
         attempt = 0
         mark = self.done          # ilerleme isareti: basarili bayt -> butce sifir
         verify = False            # son aktarim son yanitla dogrulanmadi
+        # profil olcumu: tek akis oldugu icin yalniz RTT bandi + hiz ogrenilir
+        t0 = time.monotonic()
+        first = [0.0]             # ilk baytin geldigi an (TTFB)
+        moved = [0]               # bu kosuda yazilan bayt (denemeler dahil)
 
         def run(offset: int):
             def prog(n):
                 with self._lock:
                     self.done += n
+                if n and not first[0]:
+                    first[0] = time.monotonic()
+                moved[0] += n
                 self._maybe_checkpoint()
 
             return ftp.download(
@@ -1815,55 +1879,60 @@ class DownloadJob:
                 user=self.spec.user, password=self.spec.password,
                 proxy=opt.proxy)
 
-        while True:
-            try:
-                if verify or not (self.total >= 0
-                                  and self.done >= self.total):
-                    try:
-                        run(self.done)
-                    except ftp.RestUnsupported:
-                        if self._stop.is_set() or gen != self._gen:
-                            return
-                        # sunucu REST bilmiyor: tek care bastan indirmek
+        try:
+            while True:
+                try:
+                    if verify or not (self.total >= 0
+                                      and self.done >= self.total):
+                        try:
+                            run(self.done)
+                        except ftp.RestUnsupported:
+                            if self._stop.is_set() or gen != self._gen:
+                                return
+                            # sunucu REST bilmiyor: tek care bastan indirmek
+                            with self._lock:
+                                os.ftruncate(self._fd, 0)
+                                self.done = 0
+                            mark = 0
+                            verify = False
+                            run(0)
+                    if gen != self._gen:
+                        return
+                    if self._stop.is_set():
+                        return      # monitor noktayi yazar ve durumu paused yapar
+                    if self.total < 0:
                         with self._lock:
-                            os.ftruncate(self._fd, 0)
-                            self.done = 0
-                        mark = 0
-                        verify = False
-                        run(0)
-                if gen != self._gen:
+                            self.total = self.done
+                    self._checkpoint(force=True)
+                    if self.total >= 0 and self.done != self.total:
+                        raise ftp.FtpError(
+                            "eksik veri" if self.done < self.total
+                            else "boyut uyusmuyor", "size_mismatch")
                     return
-                if self._stop.is_set():
-                    return          # monitor noktayi yazar ve durumu paused yapar
-                if self.total < 0:
-                    with self._lock:
-                        self.total = self.done
-                self._checkpoint(force=True)
-                if self.total >= 0 and self.done != self.total:
-                    raise ftp.FtpError(
-                        "eksik veri" if self.done < self.total
-                        else "boyut uyusmuyor", "size_mismatch")
-                return
-            except ftp.FtpError as ex:
-                if gen != self._gen or self._stop.is_set():
+                except ftp.FtpError as ex:
+                    if gen != self._gen or self._stop.is_set():
+                        return
+                    if self.done > mark:
+                        mark = self.done
+                        attempt = 0  # onceki deneme ilerledi: butce tazelenir
+                    if not ex.transient or attempt >= retries:
+                        self._fail(str(ex), ex.code)
+                        return
+                    if self.total >= 0 and self.done >= self.total:
+                        # baytlar tamam ama son yanit gelmedi: bos REST ile dogrula
+                        verify = True
+                    attempt += 1
+                    self._checkpoint(force=True)
+                    if self._stop.wait(backoff_delay(attempt, rng=self._rand)):
+                        return
+                except Exception as ex:
+                    if gen == self._gen:
+                        self._fail(_describe_error(ex), _code_for(ex))
                     return
-                if self.done > mark:
-                    mark = self.done
-                    attempt = 0      # onceki deneme ilerledi: butce tazelenir
-                if not ex.transient or attempt >= retries:
-                    self._fail(str(ex), ex.code)
-                    return
-                if self.total >= 0 and self.done >= self.total:
-                    # baytlar tamam ama son yanit gelmedi: bos REST ile dogrula
-                    verify = True
-                attempt += 1
-                self._checkpoint(force=True)
-                if self._stop.wait(backoff_delay(attempt, rng=self._rand)):
-                    return
-            except Exception as ex:
-                if gen == self._gen:
-                    self._fail(_describe_error(ex), _code_for(ex))
-                return
+        finally:
+            # duraklatma/bitis/hata: kosunun kendi olcumu profile yazilir
+            self._report_ftp_profile(t0, first[0], moved[0],
+                                     time.monotonic() - t0)
 
     def _after_run(self):
         if self.state == JobState.ERROR:
@@ -1901,6 +1970,7 @@ class DownloadJob:
     def _do_restart(self):
         self._fold_threads()
         self._restarts += 1
+        self._lat.reset()      # kaynak degisti: eski TTFB tabani anlamsiz
         with self._lock:
             self._restart_needed = False
             self._threads = []

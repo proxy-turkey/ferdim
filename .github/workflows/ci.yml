@@ -21,6 +21,19 @@ jobs:
       - name: Unit & integration tests
         run: python3 -m unittest discover -s tests -v
 
+  # ROADMAP 1.8: untrusted-input parser fuzz campaign. Deterministic seed;
+  # bilinen siniflar tests/fuzz/known.json'da. Yeni bir sinif (or. yeni bir
+  # IndexError/RecursionError/asilma) isi kirmizi yapar.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Parser fuzz campaign (60 s, seed 1)
+        run: python3 -m tests.fuzz --seconds 60 --seed 1 --timeout 2
+
   lint-js:
     runs-on: ubuntu-latest
     steps:

@@ -2,6 +2,12 @@
 
 Turbo modu icin baglantilara buyuk SO_RCVBUF uygulanir: cekirdek her
 baglanti icin daha derin bir alma kuyrugu tutar, hat daha hizli dolar.
+
+HTTP/3 acikken (DlOptions.http3) istekler h3 uzerinden gider: `_open_any`
+hem Range akisini hem de kucuk metin cekimini (yan dosya, m3u8/MPD,
+HLS-DASH segmenti) ayni secimden gecirir. `_make_opener` urllib opener'ini
+saran h3 farkinda bir nesne doner (proxy/TLS yolu korunur), boylece
+hls.py/dash.py/segments.py imza degistirmeden h3'ten gecer.
 """
 from __future__ import annotations
 
@@ -103,6 +109,29 @@ class FastHTTPSHandler(urllib.request.HTTPSHandler):
                             context=self._context)
 
 
+class _Opener:
+    """h3 farkinda opener: urllib opener'i gibi `.open` sunar.
+
+    h3 seciliyse istek h3 uzerinden gider; degilse urllib opener'i aynen
+    calisir. Metin/segment cekimi (hls.py, dash.py, segments.py) bu imzayi
+    kullandigi icin yan dosyalar ve HLS/DASH segmentleri de h3'ten gecer.
+    `.handlers` urllib opener'indan gelir."""
+
+    def __init__(self, opener: urllib.request.OpenerDirector, opt: DlOptions):
+        self._opener = opener
+        self._opt = opt
+
+    @property
+    def handlers(self):
+        return self._opener.handlers
+
+    def open(self, req, timeout: float | None = None, **kw):
+        to = timeout or self._opt.timeout
+        if h3.use_h3(req.full_url, self._opt):
+            return _open_any(req.full_url, self._opt, dict(req.headers), to)
+        return self._opener.open(req, timeout=to, **kw)
+
+
 class RangeInvalid(Exception):
     """Sunucu kaynagi degistirdi (If-Range 200 dondu) -> bastan indirilmeli."""
 
@@ -160,7 +189,11 @@ def _tls_context(insecure: bool) -> ssl.SSLContext:
     return ctx
 
 
-def _make_opener(opt: DlOptions):
+def _make_opener(opt: DlOptions, direct: bool = False):
+    """Opener kurar; h3 seciliyse `open` istekleri h3'e devreder.
+
+    direct=True: h3 yonlendirmesi kapali (h3'un TCP'ye dusus yolu, sonsuz
+    donguye girmesin) ve dogrudan urllib opener'i doner."""
     handlers: list[urllib.request.BaseHandler] = []
     if opt.proxy and socks.is_socks(opt.proxy):
         # SOCKS5: gecit HTTP degil, tunel acar; ProxyHandler kullanilmaz.
@@ -178,12 +211,13 @@ def _make_opener(opt: DlOptions):
         # baglam uretmez (3.13+ uretir), iki yol ayni davranmali
         handlers.append(FastHTTPSHandler(context=_tls_context(opt.insecure)))
         handlers.append(FastHTTPHandler())
-    return urllib.request.build_opener(*handlers)
+    opener = urllib.request.build_opener(*handlers)
+    return opener if direct else _Opener(opener, opt)
 
 
 def _open_tcp(url: str, opt: DlOptions, headers: dict, timeout: float):
     """stdlib (TCP/TLS) yolu: tek istek, urllib yaniti."""
-    opener = _make_opener(opt)
+    opener = _make_opener(opt, direct=True)
     return opener.open(urllib.request.Request(url, headers=headers),
                        timeout=timeout)
 
@@ -286,16 +320,23 @@ def fetch_small(url: str, opt: DlOptions, timeout: float = 8.0,
                 limit: int = 65536, allow_html: bool = False) -> str:
     """Kucuk bir metin kaynagi ceker (saglama yan dosyasi vb.). HTML sayfa
     (yumusak 404) ya da limitin uzerinde govde reddedilir; allow_html yalniz
-    yanlis Content-Type ile servis edilen belgeler icin."""
-    opener = _make_opener(opt)
-    with opener.open(request_of(url, opt), timeout=timeout) as r:
+    yanlis Content-Type ile servis edilen belgeler icin.
+
+    h3 acikken ayni `_open_any` seciminden gecer (yan dosyalar/manifestler
+    boylece Range akisiyla ayni baglantiyi paylasir)."""
+    res = _open_any(url, opt, opt.base_headers(), timeout)
+    try:
         if not allow_html and \
-                "html" in (r.headers.get("Content-Type") or "").lower():
+                "html" in (res.headers.get("Content-Type") or "").lower():
             raise ValueError("html yanit")
-        data = r.read(limit + 1)
-        if len(data) > limit:
-            raise ValueError("govde cok buyuk")
-        return data.decode("utf-8", "replace")
+        data = res.read(limit + 1)
+        if res.headers.get("Alt-Svc"):
+            h3.remember_alt_svc(url, res.headers.get("Alt-Svc"))
+    finally:
+        res.close()
+    if len(data) > limit:
+        raise ValueError("govde cok buyuk")
+    return data.decode("utf-8", "replace")
 
 
 def is_hls(url: str, content_type: str) -> bool:
