@@ -2863,13 +2863,18 @@ class DownloadJob:
         if self.kind in ("hls", "dash") or self._fd is None:
             return
         with self._lock:
-            fd, run = self._fd, self._run
+            if self._fd is None:
+                return
+            run = self._run
             # Sayac ilerlediyse yeni baytlar yazildi: nokta onlari 'bitti'
             # sayabilir, bu yuzden once fsync gerekir. Ilerleme yoksa (ayni
             # noktanin tekrari) fsync bosuna surmez.
             need = self._wrote != self._durable_wrote
             wrote = self._wrote
             meta = self._checkpoint_meta_locked()
+            # kopya fd: izleyici asil fd'yi bu arada kapatabilir (HATA yolu);
+            # kopya ayni dosyayi gosterir, numara geri donusumu olmaz
+            fd = os.dup(self._fd) if need else None
         if need:
             try:
                 # KILIT DISINDA: fsync yavas diskte saniyeler surer; kilit
@@ -2879,16 +2884,18 @@ class DownloadJob:
             except OSError:
                 # yazilamiyor: eski (daha geri) nokta kalir - guvenli yon
                 return
+            finally:
+                os.close(fd)
             with self._lock:
-                if self._fd is not fd or self._run != run:
-                    return      # kapanmis/yeni kosu: karar yazilmaz
+                if self._run != run:
+                    return      # yeni kosu: eski karar yazilmaz
                 # nokta fsync ONCESI goruntuden yazilir: fsync sirasinda
                 # yazilan bayt bir sonraki turda fsync edilir (sayac ilerler)
                 self._durable_wrote = wrote
         else:
             with self._lock:
-                if self._fd is not fd or self._run != run:
-                    return      # bu arada kapandi/iptal: nokta yazilmaz
+                if self._run != run:
+                    return      # yeni kosu: eski karar yazilmaz
         util.atomic_write_json(self.meta_path, meta)
 
     def _checkpoint_meta_locked(self) -> dict:

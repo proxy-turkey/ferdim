@@ -851,11 +851,12 @@ class CheckpointSyncTests(_Base):
     def test_no_fsync_when_nothing_new_was_written(self):
         j = self._job_with_fd()
         calls = []
+        part_ino = os.fstat(j._fd).st_ino
         with mock.patch.object(job_mod.os, "fsync",
-                               lambda fd: calls.append(fd)):
+                               lambda fd: calls.append(os.fstat(fd).st_ino)):
             j._checkpoint(force=True)      # ilerleme var -> fsync
             j._checkpoint(force=True)      # yeni bayt yok -> fsync yok
-        self.assertEqual(calls.count(j._fd), 1, calls)
+        self.assertEqual(calls.count(part_ino), 1, calls)
         self.assertEqual(len(util.read_json(j.meta_path)["ranges"]), 2)
 
     def test_fsync_error_keeps_the_previous_checkpoint(self):
@@ -866,9 +867,10 @@ class CheckpointSyncTests(_Base):
         j._wrote = 32               # yeni baytlar: fsync gerekir (ve patlar)
         j._pending = [(0, 31)]
         real_fsync = os.fsync
+        part_ino = os.fstat(j._fd).st_ino
 
         def fsync(fd):
-            if fd == j._fd:
+            if os.fstat(fd).st_ino == part_ino:
                 raise OSError(errno.EIO, "yok")
             return real_fsync(fd)
 
@@ -876,6 +878,21 @@ class CheckpointSyncTests(_Base):
             j._checkpoint(force=True)
         self.assertEqual(j.meta_path.read_text("utf-8"), before,
                          "fsync hatasinda nokta yazilmamali")
+
+    def test_fd_closed_during_fsync_still_writes_checkpoint(self):
+        """HATA yolu: izleyici .part fd'sini fsync sirasinda kapatsa da
+        nokta yazilir (eskiden dusuyordu; ERROR isi devam noktasiz kaliyordu)."""
+        j = self._job_with_fd()
+        real_fsync = os.fsync
+
+        def fsync(fd):
+            j._close_fd()
+            return real_fsync(fd)
+
+        with mock.patch.object(job_mod.os, "fsync", fsync):
+            j._checkpoint(force=True)
+        self.assertTrue(j.meta_path.exists(), "devam noktasi yazilmadi")
+        self.assertEqual(util.read_json(j.meta_path)["done"], 16)
 
 
 class EncodingTokenTests(_Base):
