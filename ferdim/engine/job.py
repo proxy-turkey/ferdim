@@ -40,6 +40,7 @@ MERKLE_REPAIR_MAX = 2      # bozuk parca onarim turu (sonra merkle_mismatch)
 TCP_SAMPLE_BYTES = 4 << 20  # TCP_INFO ornekleme araligi (link basina)
 CONGESTION_UP_BACKOFF = 30.0  # sn: tikaniklik tavaninda yukari kesif arasi
 CONGESTION_GAIN = 1.05     # "+1 link" kazanci esigi (altinda kazanc yok)
+PEER_PREFILL_BUDGET = 3.5  # sn: esbaz taramasi (pause 8 sn bekler)
 
 
 def backoff_delay(attempt: int, cap: float = 15.0,
@@ -285,6 +286,10 @@ class DownloadJob:
         # donerlerdi.
         self._start_done = threading.Event()
         self._start_done.set()
+        # kosu kimligi: her start()/cancel() artirir. Baslatma icinde
+        # (esbaz onbellegi gibi) uzun suren bir is, sonucu uygulamadan once
+        # kimligi dogrular: eski kosunun baytlari yeni kosuya karismaz.
+        self._run = 0
         # isci havuzu sunucunun izin verdigi kadarina adaptive
         # kuculur; limit asimlari isi HATA ile bitirmez.
         self._allowed = max(1, min(int(spec.segments or 8), 32))
@@ -501,6 +506,7 @@ class DownloadJob:
                 return
             if queued_only and self.state != JobState.QUEUED:
                 return
+            self._run += 1             # yeni kosu: onceki hazirligin sonucu gecersiz
             self._start_done.clear()
             self._stop.clear()
             self.error = ""
@@ -552,8 +558,11 @@ class DownloadJob:
 
     def _close_fd(self) -> None:
         """Acik .part taniticiyi kapatir. Her hazirlik ONCE kapatir: duraklat
-        /devam dongusunde her turda bir fd acikta kaliyordu (sizinti)."""
-        fd, self._fd = self._fd, None
+        /devam dongusunde her turda bir fd acikta kaliyordu (sizinti).
+        Kilit altinda: esbaz onbelleginin yazma denetimi fd'yi AYNI anda
+        gormeli (kapanmis numara yeni kosuda yeniden kullanilabilir)."""
+        with self._lock:
+            fd, self._fd = self._fd, None
         if fd is not None:
             try:
                 os.close(fd)
@@ -1039,14 +1048,22 @@ class DownloadJob:
         s.dead = True
         s.cooldown = float("inf")
         s.cur = 0.0
+        # olumlu kaynak gecikme sinyalinden hemen dusurulur: yoksa terk
+        # edilmis yavas bir ayna tavan sinyalini kalici sisirirdi
+        self._lat.drop(host_key(s.url))
         self.extra["sources_dead"] = sum(1 for x in self._srcs if x.dead)
 
     def _bump(self, kind: str, s: "_Src | None" = None) -> None:
-        """Prometheus sayaci: tur basina ana makine (kilit cagiranda)."""
-        host = host_key(s.url) if s is not None else self._host
-        d = self.stats_counters.setdefault(kind, {})
-        key = host or "?"
-        d[key] = d.get(key, 0) + 1
+        """Prometheus sayaci: tur basina ana makine.
+
+        Metrik anlik goruntusu `_lock` altinda alinir; sayac da ayni kilit
+        altinda guncellenir (kilit zaten tutuluyorsa RLock yeniden girer).
+        """
+        with self._lock:
+            host = host_key(s.url) if s is not None else self._host
+            d = self.stats_counters.setdefault(kind, {})
+            key = host or "?"
+            d[key] = d.get(key, 0) + 1
 
     def _src_fail(self, s: _Src, kind: str, cooldown: bool = True,
                   code: str = "") -> None:
@@ -1762,39 +1779,61 @@ class DownloadJob:
     def _peer_prefill(self, opt) -> None:
         """Merkle parcalarini once LAN esbazlarindan doldurur (istege bagli).
 
+        YALNIZCA ACIKCA verilen bildirimle calisir: kendiliginden bulunan
+        `.ferdim-merkle` yan dosyasi (bayat olabilir, kimse imzalamadi) esbaz
+        baytlarini indirmeye sokmaz - eski surum bir dosya "tamam" gorunurdu.
         Yalnizca TAMAMEN bekleyen bir araliga dusen parcalar denenir; her
-        parca SHA-256 ile dogrulanmadan .part'a yazilmaz (esbazlar
-        guvenilmez). Esbaz yoksa, bildirim yoksa ya da hata olursa indirme
-        normal kaynak araliklariyla aynen surer.
+        parca SHA-256 ile dogrulanmadan .part'a yazilmaz. Yazma ve
+        `_pending`/`done` guncellemesi kosu kimligi (`_run`) ve `_stop` ile
+        AYNI kilit altinda dogrulanir: duraklatma/iptal/restart sirasinda
+        eski taramanin baytlari yeni kosuya karismaz. Butce kisa tutulur
+        (PEER_PREFILL_BUDGET): pause() 8 sn bekler, hazirlik bunun altinda
+        biter ve is PAUSED'a katlanir.
         """
         if self.kind != "http" or not bool(self.cfg.get("peer_cache")) \
                 or self._stop.is_set() or self.total <= 0 \
                 or self.extra.get("no_ranges"):
             return
-        if self._merkle is None:
-            # yan dosya bildirimi normalde arka planda aranir; esbaz
-            # yolundan once kisa bir senkron deneme yapilir (yalnizca bu
-            # ozellik acikken; kapaliyken zamanlama degismez)
-            try:
-                self._merkle_sidecar(opt)
-            except Exception:
-                pass
         man = self._merkle
-        if man is None or man.size != self.total:
+        if man is None or self._merkle_auto or man.size != self.total \
+                or not str(self.spec.merkle or "").strip():
             return
+        fd = self._fd
+        if fd is None:
+            return
+        run = self._run
+
+        def halted() -> bool:
+            return self._stop.is_set() or run != self._run
+
+        def write(off: int, data: bytes) -> bool:
+            with self._lock:
+                if halted() or self._fd is None:
+                    return False
+                try:
+                    os.pwrite(self._fd, data, off)
+                except OSError:
+                    return False
+            return True
+
         try:
             from .. import peer
             filled = peer.open_peer(self.env).fetch_chunks(
-                man, list(self._pending), self._fd, stop=self._stop.is_set)
+                man, list(self._pending), fd, stop=halted, write=write,
+                budget=PEER_PREFILL_BUDGET)
         except Exception:
             return
         if not filled:
             return
         with self._lock:
+            if halted() or self.state == JobState.CANCELED:
+                return
             holes = [(off, off + ln - 1) for off, ln in filled]
             self._pending = peer.subtract_ranges(self._pending, holes)
             nbytes = sum(ln for _, ln in filled)
             self.done += nbytes
+            # esbaz baytlari agdan gelmedi: hiz ornegi sicramasin
+            self._speed_done_mark = self.done
             self._gov["done"] = self.done
             self.extra["peer_chunks"] = int(
                 self.extra.get("peer_chunks", 0)) + len(filled)
@@ -2429,6 +2468,7 @@ class DownloadJob:
     def cancel(self, delete_files: bool = False):
         with self._cond:
             self._stop.set()
+            self._run += 1          # eski hazirlik sonucu artik uygulanmaz
             self._cond.notify_all()
         # fd ancak start() penceresi ve monitor kapandiktan sonra kapatilir:
         # yoksa baslatma ortasindaki isciler kapali fd'ye yazardi.

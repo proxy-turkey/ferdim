@@ -133,6 +133,25 @@ class AssembleLearnTests(unittest.TestCase):
         self._run(store=None)
         self.assertFalse((self.env.state_dir / "hosts.json").exists())
 
+    def test_fetch_all_honours_stop_under_speed_limit(self):
+        """Hiz kovasinda bekleyen segment okumasi durunca hemen doner ve
+        YARIM veri dondurmez (HLS/DASH duraklamasi senkron kalsin)."""
+        stop = threading.Event()
+        bucket = TokenBucket(1024)          # 1 KB/s: ilk blok ~1 dk bekler
+        out: dict = {}
+
+        def run():
+            out["data"] = segments.fetch_all(
+                f"{self.base}/file.bin", self.opt, bucket, stop)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        time.sleep(0.2)
+        stop.set()
+        t.join(3.0)
+        self.assertFalse(t.is_alive(), "hiz kovasindaki okuma durmadi")
+        self.assertIsNone(out.get("data"), "duran okuma yarim veri dondurdu")
+
     def test_all_throttled_run_learns_nothing(self):
         """Hic segment inemediyse (hepsi 503) ogrenecek olcum yok."""
         store = open_profiles(self.env)

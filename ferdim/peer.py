@@ -666,12 +666,21 @@ class PeerClient:
                 uniq.append(ep)
         return uniq[:MAX_PEERS]
 
-    def fetch_chunk(self, host: str, port: int, hx: str, ln: int):
-        """Tek parcayi ister ve dogrular; basarisizsa None (istisna yok)."""
+    def fetch_chunk(self, host: str, port: int, hx: str, ln: int,
+                    timeout: float | None = None):
+        """Tek parcayi ister ve dogrular; basarisizsa None (istisna yok).
+
+        `timeout`: cagiranin kalan butcesi; toplam soz verilen sureyi
+        asmamak icin tek istek de bu sinirla kesilir."""
+        if timeout is None:
+            timeout = self.timeout
+        try:
+            timeout = max(0.2, min(self.timeout, float(timeout)))
+        except (TypeError, ValueError):
+            timeout = self.timeout
         conn = None
         try:
-            conn = http.client.HTTPConnection(host, port,
-                                              timeout=self.timeout)
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
             conn.request("GET", f"/chunk/{hx}", headers={
                 "User-Agent": "ferdim-peer", "Accept": "application/octet-stream",
                 "Connection": "close"})
@@ -696,41 +705,62 @@ class PeerClient:
             return None                 # esbaz guvenilmez: parca atilir
         return data
 
-    def fetch_chunks(self, man, pending, fd, stop=None):
+    def fetch_chunks(self, man, pending, fd, stop=None, *, budget=None,
+                     write=None):
         """Eksik parcalari esbazlardan doldurur; [(offset, uzunluk)] doner.
 
         Yalnizca TAMAMEN `pending` araliklarinin icinde kalan parcalar
         denenir; yazma once SHA-256 dogrulamasindan gecer. Sure butcesi
         asilirsa kalan parcalar normal kaynak araliklarina birakilir.
+
+        `stop`: her parca ve her yazma oncesi sorulur (duraklat/iptal).
+        `budget`: toplam sure siniri (sn; varsayilan istemci butcesi).
+        `write(off, data) -> bool`: verilirse yazma cagirana devredilir;
+        False donerse doldurma durur (kosu kimligi degisti gibi). Boylece
+        cagiran, yazma ile `_pending`/`done` guncellemesini AYNI kilit
+        altinda dogrulayabilir; eski kosunun baytlari yeni kosuya karismaz.
         """
         if man is None or not pending:
             return []
         peers = self.candidates(man.root)
         if not peers:
             return []
-        deadline = self._now() + self.budget
+        try:
+            limit = self.budget if budget is None else max(0.0, float(budget))
+        except (TypeError, ValueError):
+            limit = self.budget
+        deadline = self._now() + limit
         filled = []
         for off, ln, hx in man.chunks:
             if stop is not None and stop():
                 break
-            if self._now() >= deadline:
+            remaining = deadline - self._now()
+            if remaining <= 0:
                 break
             last = off + ln - 1
             if not any(s <= off and last <= e for s, e in pending):
                 continue
             data = None
             for host, port in peers:
-                if self._now() >= deadline:
+                remaining = deadline - self._now()
+                if remaining <= 0:
                     break
-                data = self.fetch_chunk(host, port, hx, ln)
+                data = self.fetch_chunk(host, port, hx, ln,
+                                        timeout=remaining)
                 if data is not None:
                     break
             if data is None:
                 continue
-            try:
-                os.pwrite(fd, data, off)
-            except OSError:
+            if stop is not None and stop():
                 break
+            if write is not None:
+                if not write(off, data):
+                    break
+            else:
+                try:
+                    os.pwrite(fd, data, off)
+                except OSError:
+                    break
             filled.append((off, ln))
         return filled
 
@@ -793,12 +823,10 @@ class PeerNode:
     def add_verified(self, man, path) -> bool:
         return self.index.add(man, path)
 
-    def fetch_chunks(self, man, pending, fd, stop=None):
-        try:
-            self.index.refresh()
-        except Exception:
-            pass
-        return self.client.fetch_chunks(man, pending, fd, stop=stop)
+    def fetch_chunks(self, man, pending, fd, stop=None, **kw):
+        # dizin taramasi YAPILMAZ: bu yol yalniz istek atar, yerel indeks
+        # yalniz sunucu icin gerekir (prefill butcesi disi is eklenmesin)
+        return self.client.fetch_chunks(man, pending, fd, stop=stop, **kw)
 
 
 _OPEN_LOCK = threading.Lock()

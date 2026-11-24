@@ -42,15 +42,22 @@ def pool_size(n_segments: int, seed: int = 0, cap: int = SEG_MAX) -> int:
     return max(1, min(want or max(1, n // 2), cap, n))
 
 
-def fetch_all(url: str, opt: httpcli.DlOptions, bucket: TokenBucket) -> bytes:
+def fetch_all(url: str, opt: httpcli.DlOptions, bucket: TokenBucket,
+              stop: threading.Event | None = None) -> bytes | None:
+    """Tek akisla tum govdeyi ceker. `stop` verilirse hiz kovasinda bekleme
+    ve her okuma blogu durdurmayi gorur: durunca None doner (cagiran yarim
+    veriyi YAZMAZ; boylece duraklatma hiz limiti altinda da senkron olur)."""
     opener = httpcli._make_opener(opt)
     buf = bytearray()
     with opener.open(httpcli.request_of(url, opt), timeout=opt.timeout) as r:
         while True:
+            if stop is not None and stop.is_set():
+                return None
             chunk = r.read(65536)
             if not chunk:
                 break
-            bucket.take(len(chunk))
+            if not bucket.take(len(chunk), stop):
+                return None
             buf += chunk
     return bytes(buf)
 
@@ -123,7 +130,7 @@ def assemble(opt: httpcli.DlOptions, fd: int, meta: dict,
         f = seg_file(idx)
         if not f.exists():
             try:
-                data = fetch_all(seg_urls[idx], opt, bucket)
+                data = fetch_all(seg_urls[idx], opt, bucket, stop_event)
             except Exception as e:
                 # 429/503: sunucu eszamanli baglantiyi kisitliyor olabilir
                 if isinstance(e, urllib.error.HTTPError) \
@@ -132,6 +139,10 @@ def assemble(opt: httpcli.DlOptions, fd: int, meta: dict,
                         throttled[0] = True
                 with lock:
                     errors.append(f"segment {idx}: {e}")
+                return
+            if data is None:          # duraklat/iptal: yarim parca yazilmaz
+                return
+            if stop_event.is_set():
                 return
             tmp = f.with_suffix(".part")
             tmp.write_bytes(data)
@@ -154,12 +165,18 @@ def assemble(opt: httpcli.DlOptions, fd: int, meta: dict,
 
     cursor = int(meta.get("cursor", 0))
     if init_url is not None and not meta.get("init_done"):
-        data = fetch_all(init_url, opt, bucket)
+        data = fetch_all(init_url, opt, bucket, stop_event)
+        if data is None:              # duraklat/iptal
+            persist(force=True)
+            return
         os.pwrite(fd, data, 0)
         cursor = len(data)
         meta["init_done"] = True
         meta["cursor"] = cursor
     for idx in range(len(seg_urls)):
+        if stop_event.is_set():
+            persist(force=True)
+            return
         if idx in done:
             continue
         data = seg_file(idx).read_bytes()
