@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 
@@ -14,6 +15,7 @@ from .job import DownloadJob, JobSpec, JobState
 
 QUEUE_FILE = "queue.json"
 QUEUE_PREV = "queue.json.prev"     # son iyi kopya (bozuk ana dosyanin yedegi)
+QUEUE_BAD_KEEP = 3                 # tutulan en yeni karantina kopyasi sayisi
 QUEUE_ITEM_VERSION = 1             # kayit sema surumu (dosya duz liste kalir)
 STATES_RUNNING = (JobState.CONNECTING, JobState.DOWNLOADING)
 
@@ -25,7 +27,7 @@ _QUEUE_FIELDS = frozenset({
     "v", "id", "url", "filename", "dir", "segments", "headers", "cookies",
     "user", "password", "proxy", "insecure", "http3", "referer", "ua",
     "kind", "state", "created", "active", "mirrors", "checksums", "merkle",
-    "limit", "ephemeral",
+    "limit", "ephemeral", "error", "error_code",
 })
 
 
@@ -74,6 +76,15 @@ def _text(value) -> str:
     return value if isinstance(value, str) else ""
 
 
+# hata metnindeki URL userinfo'su (kullanici:sifre@): ozel pencere diske yazmaz
+_CRED_RE = re.compile(r"://[^/@\s]+:[^/@\s]*@")
+
+
+def _redact_text(text: str) -> str:
+    """Metindeki URL kimlik bilgisini siler ('://kullanici:sifre@' -> '://')."""
+    return _CRED_RE.sub("://", text)
+
+
 def _scrub_ephemeral(rec: dict) -> None:
     """Ozel pencere isinin disk kaydindan kimlik bilgilerini siler.
 
@@ -88,6 +99,8 @@ def _scrub_ephemeral(rec: dict) -> None:
     rec["user"] = ""
     rec["password"] = ""
     rec["url"] = redact_credentials(rec.get("url", ""))
+    # hata metni de URL userinfo'su tasiyabilir: diske kimlik sizmasin
+    rec["error"] = _redact_text(rec.get("error") or "")
 
 
 class QueueManager:
@@ -229,12 +242,7 @@ class QueueManager:
         else:
             # duran/hatali is devam etmeyecek: yarim .part, .segs/ ve
             # denetim noktasi kuyruktan cikinca sahipsiz kalirdi
-            if job.state != JobState.DONE:
-                try:
-                    job.meta_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                job._cleanup_temp()
+            self._drop_job_files(job)
             if delete_files:
                 try:
                     job.final_path.unlink(missing_ok=True)
@@ -249,13 +257,36 @@ class QueueManager:
         self._notify()
         return True
 
+    @staticmethod
+    def _drop_job_files(job) -> None:
+        """Kuyruktan cikan isin yarim dosyalarini siler (DONE haric).
+
+        remove() ve clear_finished() ayni temizligi kullanir: .part, .segs/
+        ve denetim noktasi sahipsiz kalmasin. Bitmis dosyaya dokunulmaz
+        (kullanici indirdigi veriyi kuyruktan temizlerken kaybetmemeli).
+        """
+        if job.state == JobState.DONE:
+            return
+        try:
+            job.meta_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        job._cleanup_temp()
+
     def clear_finished(self):
+        """Biten/hatali/iptal edilmis isleri kuyruktan ve diskten temizler."""
         with self._lock:
-            for j in list(self.jobs):
-                if j.state in (JobState.DONE, JobState.ERROR, JobState.CANCELED):
-                    self.jobs.remove(j)
-                    self._hist_state.pop(j.id, None)
+            dropped = [j for j in self.jobs
+                       if j.state in (JobState.DONE, JobState.ERROR,
+                                      JobState.CANCELED)]
+            for j in dropped:
+                self.jobs.remove(j)
+                self._hist_state.pop(j.id, None)
             self._save()
+        # disk temizligi kuyruk kilidi disinda: yavas dosya sistemi
+        # tick'i ve diger islemleri kilitlemesin
+        for j in dropped:
+            self._drop_job_files(j)
 
     # ------------------------------------------------------------- schedule
     def _schedule_active(self) -> bool:
@@ -618,6 +649,10 @@ class QueueManager:
                 "merkle": j.spec.merkle,
                 "limit": int(j.spec.limit or 0),
                 "ephemeral": bool(j.spec.ephemeral),
+                # hata nedeni kuyrukta gorunur kalsin: yeniden baslatmada
+                # durum 'paused'a duser ama kullanici nedenini gorebilir
+                "error": j.error,
+                "error_code": j.error_code,
             })
             if rec["ephemeral"]:
                 _scrub_ephemeral(rec)
@@ -645,8 +680,10 @@ class QueueManager:
         """Bozuk kuyruk dosyasini zaman damgali adla saklar.
 
         Var olan bir .bad dosyasinin uzerine asla yazilmaz; ayni saniyede
-        ikinci cagri sayacla ayrisir. Dosya tasinamazsa silinir; o da
-        olmazsa .prev donusumu kapatilir (bozuk kopya iyi yedegi ezmesin).
+        ikinci cagri sayacla ayrisir. Yalniz en yeni QUEUE_BAD_KEEP kopya
+        tutulur: her bozuk acilis diski sisirmesin. Dosya tasinamazsa
+        silinir; o da olmazsa .prev donusumu kapatilir (bozuk kopya iyi
+        yedegi ezmesin).
         """
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
         bad = path.with_name(f"{path.name}.bad-{stamp}")
@@ -662,6 +699,21 @@ class QueueManager:
             except OSError:
                 self._rotate_ok = False
             log.warning("bozuk kuyruk karantinaya alinamadi: %s", exc)
+        else:
+            self._prune_bad(path)
+
+    @staticmethod
+    def _prune_bad(path) -> None:
+        """En yeni karantina kopyalari kalir; eskiler silinir."""
+        try:
+            bads = sorted(path.parent.glob(path.name + ".bad-*"))
+        except OSError:
+            return
+        for old in bads[:-QUEUE_BAD_KEEP]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
 
     def _load(self):
         """Kuyrugu diskten yukler; bozuk kayit tum kuyrugu dusurmez.
@@ -765,6 +817,9 @@ class QueueManager:
         job.kind = _text(rec.get("kind")) or "http"
         job.created = _float(rec.get("created"), time.time())
         job._active_secs = max(0.0, _float(rec.get("active"), 0.0))
+        # hata nedeni kalici: durum 'paused'a dusse de snapshot'ta gorunur
+        job.error = _text(rec.get("error"))
+        job.error_code = _text(rec.get("error_code"))
         # bilinmeyen alanlar ve daha yeni surum numarasi korunur
         job._rec_extra = {k: v for k, v in rec.items()
                           if k not in _QUEUE_FIELDS}
@@ -779,6 +834,9 @@ class QueueManager:
             else:
                 job.state = JobState.QUEUED
         elif st in (JobState.PAUSED, JobState.ERROR, JobState.CANCELED):
+            # ERROR mevcut davranista 'paused' olarak geri yuklenir: kuyruk
+            # kendi kendine yeniden denemesin (kalici 403/404 dongusu yok).
+            # Neden `error`/`error_code` ile gorunur kalir.
             job.state = JobState.PAUSED if st != JobState.CANCELED else JobState.CANCELED
         else:
             # bilinmeyen/gelecek durum: guvenli varsayilan kuyrukta bekle
