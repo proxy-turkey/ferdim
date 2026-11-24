@@ -2057,12 +2057,13 @@ class DownloadJob:
                                   if a not in bad_expl and a not in bad_found]
         if bad_expl:
             a = bad_expl[0]
-            self.state = JobState.ERROR
+            # durum en son: ERROR goren her okuyucu hata metnini de gorur
             self.error = ("saglama uyusmazi: beklenen "
                           f"{explicit[a][:12]}..., gelen "
                           f"{(got.get(a) or '')[:12]}... ({a})")
             self.error_code = "checksum_mismatch"
             self.extra["checksum"] = "mismatch"
+            self.state = JobState.ERROR
         elif bad_found:
             self.extra["checksum"] = "warn"
             self.extra["checksum_note"] = bad_found[0]
@@ -2095,7 +2096,6 @@ class DownloadJob:
                 "size" if not size_ok else f"{bad[0][0]}-{bad[0][1]}")
             return True
         self.extra["merkle"] = "mismatch"
-        self.state = JobState.ERROR
         self.error_code = "merkle_mismatch"
         if not size_ok:
             try:
@@ -2108,6 +2108,7 @@ class DownloadJob:
             off, ln = bad[0]
             self.error = (f"merkle uyusmazi: {len(bad)} bozuk parca, "
                           f"ilk {off}-{off + ln - 1}")
+        self.state = JobState.ERROR        # metin ve kod hazir, durum en son
         return True
 
     def _verify_late(self, found: dict) -> None:
@@ -2136,9 +2137,9 @@ class DownloadJob:
         with self._lock:
             if self.state == JobState.CANCELED:
                 return
-            self.state = JobState.ERROR
             self.error = msg
             self.error_code = code
+            self.state = JobState.ERROR
             self.speed = 0
         self._stop.set()  # diger iscalar kalan araliklari katlasin
         with self._cond:

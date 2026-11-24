@@ -184,6 +184,10 @@ Read `job.py` before touching the engine. The invariants that matter:
   `_merkle_repair()` puts only the bad chunk ranges back into `_pending`
   and restarts workers via `_start_workers` (never a second monitor), at
   most `MERKLE_REPAIR_MAX` (2) times, then `merkle_mismatch`.
+  Only an explicit `--merkle` manifest can fail a job; an auto-discovered
+  `<url>.ferdim-merkle` mismatch is a warning (no repair), like a stale
+  `.sha256` sidecar. Repair and verification honour `_stop` (pause stays
+  synchronous, cancel stays canceled).
 - **HTTP/3 is off by default** and `aioquic` must never be imported at core
   import time (a test checks `sys.modules`). `auto` falls back to TCP;
   `force` does not; proxies disable h3.
