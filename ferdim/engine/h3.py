@@ -2,9 +2,7 @@
 
 Cekirdek stdlib'de kalir: aioquic yalnizca bu modul icinde ve yalnizca
 gercekten HTTP/3 kullanilacaksa tembel yuklenir (modul importu aioquic
-gerektirmez). Kapsam bilincli olarak dardir: yalnizca probe ve Range
-akisi h3 uzerinden gider; yan dosyalar (fetch_small) ve HLS/DASH
-segmentleri TCP'de kalir.
+gerektirmez).
 
 Modlar (DlOptions.http3):
   off   - h3 hic denenmez (varsayilan)
@@ -18,15 +16,21 @@ Bir h3 denemesi baglanti/akis duzeyinde basarisiz olursa kaynak 10
 dakika "bozuk" isaretlenir: auto modda sonraki araliklar dogrudan TCP
 kullanir (aktarim ortasinda dusen araligi job.py yeniden ister).
 
-Asenkron aioquic istemcisi baglanti basina ayri bir arka plan is
-parcaciginda/olay dongusunde kosar; veri asyncio kuyrugundan bloklayan
-okumaya karsi sinirli bir tamponla koprulenir, her okuma stall
-zaman asimina tabidir. Alt-Svc duyurulan host:port'a baglanilir ama
-`:authority` ve TLS SNI kaynagin kendi adresidir.
+Baglanti havuzu: butun h3 baglantilari TEK bir arka plan is parcaciginda
+kosan tek bir olay dongusunu paylasir. Hedef basina (host/port, SNI,
+dogrulama modu) bir QUIC baglantisi tutulur ve es zamanli istekler o
+baglanti uzerinde AYRI AKISLAR olarak gider (HTTP/3 coklama): her aralik
+yeni bir el sikismasi yapmaz. Baglanti basina es zamanli akis siniri
+MAX_STREAMS; asilirsa ayni hedef icin ikinci baglanti acilir. Bos
+baglanti POOL_IDLE_SECS sonra kapanir. Baglanti hatasi havuz kaydini
+dusurur ve bekleyen akislari H3Error ile uyandirir (auto modda TCP'ye
+dusulur).
 
-Baglanti yeniden kullanimi (oturum bileti / origin basina havuz)
-bilincli olarak yok: her Range kendi QUIC el sikismasini yapar; kazanc
-olculmedi, karmasiklik ve kaynak sizintisi riski yuksek.
+Veri, olay dongusu tarafindan akis basina bir kuyruga birakilir; bloklayan
+Response okumasi oradan beslenir ve akis bitince kuyrukta kalan son
+parcalar kaybolmaz (okur sentinel'i gorene kadar orada durur). Her okuma
+stall zaman asimina tabidir. Uygulama kapanirken h3.close_all() cagrilir:
+olay dongusu ve UDP soketleri boylece serbest kalir.
 """
 from __future__ import annotations
 
@@ -42,10 +46,13 @@ from urllib.parse import SplitResult, urlsplit
 MODES = ("off", "auto", "force")
 BROKEN_SECS = 600.0             # h3 hatasi sonrasi TCP'de kalma suresi
 ALT_SVC_DEFAULT_MAX_AGE = 86400.0
-DATA_QUEUE = 8                  # olay dongusunden okura tampon (parca)
 JOIN_SECS = 3.0
 CONNECT_SECS = 5.0              # el sikismasi ust siniri (stall'dan bagimsiz)
-DRAIN_SECS = 60.0               # akis bitti: okur kuyrugu bosaltmak icin sure
+POOL_IDLE_SECS = 30.0           # bos baglanti bu sure sonra kapanir
+POOL_SWEEP_SECS = 5.0           # bos baglanti tarama araligi
+MAX_STREAMS = 32                # baglanti basina es zamanli akis (= max link)
+CLOSE_SECS = 5.0                # baglanti kapatma ust siniri
+LOOP_START_SECS = 5.0
 
 # h3'te baglantiya ozgu (yasak) basliklar gonderilemez
 _HOP = frozenset({"connection", "keep-alive", "proxy-connection", "host",
@@ -58,7 +65,10 @@ _PROTO = None                   # QuicConnectionProtocol alt sinifi (tembel)
 # origin -> (host, port, bitis); host "" = kaynagin kendi adresi
 _ALT_SVC: dict[str, tuple[str, int, float]] = {}
 _BROKEN: dict[str, float] = {}                # origin -> bitis zamani
+_POOL: dict[tuple, list[_Conn]] = {}          # hedef -> canli baglantilar
+_OPENING: dict[tuple, asyncio.Future] = {}    # hedef -> kurulmakta olan
 _LOCK = threading.Lock()
+_LOOPS: "_Loop | None" = None                 # paylasilan olay dongusu
 
 
 class H3Unavailable(RuntimeError):
@@ -86,7 +96,7 @@ def _load():
         from aioquic.h3.connection import H3_ALPN, H3Connection
         from aioquic.h3.events import DataReceived, HeadersReceived
         from aioquic.quic.configuration import QuicConfiguration
-        from aioquic.quic.events import ConnectionTerminated
+        from aioquic.quic.events import ConnectionTerminated, StreamReset
         _API = {
             "connect": connect,
             "QuicConnectionProtocol": QuicConnectionProtocol,
@@ -94,8 +104,9 @@ def _load():
             "H3_ALPN": H3_ALPN,
             "DataReceived": DataReceived,
             "HeadersReceived": HeadersReceived,
-            "QuicConfiguration": QuicConfiguration,
             "ConnectionTerminated": ConnectionTerminated,
+            "StreamReset": StreamReset,
+            "QuicConfiguration": QuicConfiguration,
         }
     return _API
 
@@ -293,6 +304,370 @@ def _status_of(headers) -> int:
     return 0
 
 
+# ----------------------------------------------------- paylasilan dongu
+class _Loop:
+    """Butun h3 baglantilarinin paylastigi tek olay dongusu/is parcacigi."""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.ready = threading.Event()
+        self.sweeper: asyncio.Task | None = None
+        self.thread = threading.Thread(target=self._run, name="ferdim-h3-loop",
+                                       daemon=True)
+
+    def start(self) -> asyncio.AbstractEventLoop:
+        self.thread.start()
+        self.ready.wait(LOOP_START_SECS)
+        return self.loop
+
+    def _run(self) -> None:
+        loop = self.loop
+        asyncio.set_event_loop(loop)
+        self.sweeper = loop.create_task(_sweeper())
+        loop.call_soon(self.ready.set)
+        try:
+            loop.run_forever()
+        finally:
+            _drain_tasks(loop)
+            loop.close()
+
+
+def _drain_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    """Dongu kapanmadan bekleyen gorevleri iptal edip toplar."""
+    try:
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True))
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    except Exception:
+        pass
+
+
+def _loop() -> asyncio.AbstractEventLoop:
+    """Paylasilan h3 olay dongusu (ilk istekte tembel baslar)."""
+    global _LOOPS
+    with _LOCK:
+        if _LOOPS is None or _LOOPS.loop.is_closed():
+            _LOOPS = _Loop()
+            _LOOPS.start()
+        return _LOOPS.loop
+
+
+def close_all() -> None:
+    """Butun h3 baglantilarini ve paylasilan olay dongusunu kapatir.
+
+    Uygulama kapanisinda cagrilir (daemon/CLI): is parcacigi, UDP
+    soketleri ve bekleyen akislar serbest kalir. Sonraki istek donguyu
+    yeniden kurar."""
+    global _LOOPS
+    with _LOCK:
+        state, _LOOPS = _LOOPS, None
+    if state is None:
+        return
+    loop = state.loop
+    if not loop.is_closed():
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_shutdown(state), loop)
+            fut.result(CLOSE_SECS + JOIN_SECS)
+        except Exception:
+            pass
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except RuntimeError:
+            pass
+    if state.thread is not threading.current_thread():
+        state.thread.join(JOIN_SECS)
+
+
+async def _shutdown(state: "_Loop") -> None:
+    """Baglantilari kapatir, supurmeyi durdurur (olay dongusunde)."""
+    conns = _pool_all()
+    for conn in conns:
+        _conn_dead(conn, H3Error("h3: kapatildi"), broken=False)
+    for conn in conns:
+        await _conn_close(conn)
+    _OPENING.clear()
+    sweeper = state.sweeper
+    if sweeper is not None and not sweeper.done():
+        sweeper.cancel()
+        try:
+            await sweeper
+        except BaseException:
+            pass
+
+
+async def _sweeper() -> None:
+    """Bos baglantilari POOL_IDLE_SECS sonra kapatir."""
+    while True:
+        await asyncio.sleep(POOL_SWEEP_SECS)
+        now = _now()
+        for conn in _pool_all():
+            if conn.closed or conn.streams:
+                continue
+            if now - conn.last_used < POOL_IDLE_SECS:
+                continue
+            await _conn_close(conn)
+
+
+# ------------------------------------------------------------- havuz
+class _Conn:
+    """Bir hedefe kurulmus kalici QUIC baglantisi (havuz kaydi)."""
+
+    def __init__(self, key: tuple, url: str) -> None:
+        self.key = key
+        self.url = url            # ilk istek: bozulma isareti bu origin'e
+        self.proto = None
+        self.acm = None           # connect() baglam yoneticisi (kapanis icin)
+        self.streams: dict[int, _Stream] = {}
+        self.last_used = _now()
+        self.closed = False
+
+
+class _Stream:
+    """Tek bir HTTP/3 istegi (akis): yanit basliklari + veri kuyrugu."""
+
+    def __init__(self) -> None:
+        self.conn: _Conn | None = None
+        self.stream_id = -1
+        self.queue: asyncio.Queue | None = None
+        self.ready: asyncio.Future | None = None
+        self.status = 0
+        self.headers: email.message.Message | None = None
+        self.got_headers = False
+        self.server_done = False      # sunucu akisi bitirdi (FIN geldi)
+        self.reader_done = False      # okur bitirdi: baglanti yeniden kullanilir
+        self.failed = False
+        self.error: BaseException | None = None
+
+    def on_headers(self, headers) -> None:
+        if self.got_headers:          # izleyen HEADERS = trailer
+            return
+        self.got_headers = True
+        self.status = _status_of(headers)
+        self.headers = _message(headers)
+        self._wake()
+
+    def feed(self, data: bytes) -> None:
+        if self.queue is not None:
+            self.queue.put_nowait(data)
+
+    def end(self) -> None:
+        if self.server_done:
+            return
+        self.server_done = True
+        if self.queue is not None:
+            self.queue.put_nowait(None)
+        self._wake()
+
+    def fail(self, ex: BaseException) -> None:
+        if self.failed:
+            return
+        self.failed = True
+        self.server_done = True
+        self.error = ex
+        if self.queue is not None:
+            self.queue.put_nowait(ex)
+        self._wake()
+
+    def _wake(self) -> None:
+        if self.ready is not None and not self.ready.done():
+            self.ready.set_result(None)
+
+
+def _pool_all() -> list[_Conn]:
+    with _LOCK:
+        return [c for items in list(_POOL.values()) for c in items]
+
+
+def _pool_pick(key: tuple) -> _Conn | None:
+    """Ayni hedefin kapasiteli baglantisi (en az akisli olan)."""
+    with _LOCK:
+        items = [c for c in _POOL.get(key, ()) if not c.closed]
+    live = [c for c in items
+            if c.acm is not None and len(c.streams) < MAX_STREAMS]
+    if not live:
+        return None
+    return min(live, key=lambda c: len(c.streams))
+
+
+def _pool_remove(conn: _Conn) -> None:
+    with _LOCK:
+        items = _POOL.get(conn.key)
+        if not items:
+            return
+        if conn in items:
+            items.remove(conn)
+        if not items:
+            _POOL.pop(conn.key, None)
+
+
+def pool_stats() -> dict:
+    """Testler icin: canli baglanti ve akis sayilari."""
+    conns = _pool_all()
+    return {"connections": len(conns),
+            "streams": sum(len(c.streams) for c in conns)}
+
+
+def _key_of(url: str, opt, target: tuple[str, int] | None) -> tuple:
+    """Havuz anahtari: (hedef host, port, SNI, dogrulama modu)."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    port = parts.port or 443
+    if target is not None:
+        host = (target[0] or host).lower()
+        port = target[1]
+    sni = (parts.hostname or host).lower()
+    return (host, port, sni, bool(getattr(opt, "insecure", False)))
+
+
+def _release_stream(stream: _Stream, reset: bool = False) -> None:
+    """Akis kaydini kapatir (olay dongusunde).
+
+    reset: okur yarida birakti -> sunucuya STOP_SENDING gonderilir. Akis
+    sunucu tarafinda bittiyse yalnizca kayit dusurulur."""
+    if stream.reader_done:
+        return
+    stream.reader_done = True
+    conn = stream.conn
+    if conn is None:
+        return
+    if conn.streams.get(stream.stream_id) is stream:
+        conn.streams.pop(stream.stream_id, None)
+    conn.last_used = _now()
+    if not reset or conn.closed or stream.server_done or stream.stream_id < 0:
+        return
+    proto = conn.proto
+    if proto is None:
+        return
+    try:
+        proto._quic.stop_stream(stream.stream_id, 0)
+        proto.transmit()
+    except Exception:
+        pass
+
+
+def _conn_dead(conn: _Conn, err: BaseException, broken: bool = True) -> None:
+    """Baglanti oldu: havuzdan cikar, bekleyen akislari hatayla uyandir.
+
+    broken: kaynak "bozuk" isaretlenir (auto modda TCP'ye dusulur). Temiz
+    bosta kapanmada ya da uygulama kapanisinda bu yapilmaz."""
+    if conn.closed:
+        return
+    conn.closed = True
+    _pool_remove(conn)
+    streams = list(conn.streams.values())
+    conn.streams.clear()
+    for stream in streams:
+        stream.fail(err)
+    if broken and streams:       # veri kaybeden akis varsa kaynak bozuk
+        mark_broken(conn.url)
+    try:
+        asyncio.get_running_loop().create_task(_conn_close(conn))
+    except RuntimeError:
+        pass
+
+
+def _kill_transport(conn: _Conn) -> None:
+    proto = conn.proto
+    transport = getattr(proto, "_transport", None) if proto is not None else None
+    if transport is not None:
+        try:
+            transport.close()
+        except Exception:
+            pass
+
+
+async def _conn_close(conn: _Conn) -> None:
+    """Baglantiyi kapatir (idempotent) ve havuzdan cikarir."""
+    acm, conn.acm = conn.acm, None
+    conn.closed = True
+    _pool_remove(conn)
+    if acm is None:
+        return
+    try:
+        await asyncio.wait_for(acm.__aexit__(None, None, None), CLOSE_SECS)
+    except Exception:
+        _kill_transport(conn)
+
+
+async def _conn_open(key: tuple, host: str, port: int, sni: str,
+                     insecure: bool, url: str, opt) -> _Conn:
+    """Yeni bir QUIC baglantisi kurar (el sikismasi dahil)."""
+    api = _load()
+    conf = api["QuicConfiguration"](
+        is_client=True,
+        alpn_protocols=list(api["H3_ALPN"]),
+        # SNI/ana makine dogrulamasi her zaman KAYNAGIN adiyla
+        server_name=sni,
+        verify_mode=ssl.CERT_NONE if insecure else ssl.CERT_REQUIRED,
+    )
+    conn = _Conn(key, url)
+    proto_cls = _protocol_class()
+
+    def make(quic, stream_handler=None):
+        proto = proto_cls(quic, stream_handler=stream_handler)
+        conn.proto = proto
+        proto.conn = conn          # el sikismasi olaylari da baglaniyor
+        return proto
+
+    acm = api["connect"](host, port, configuration=conf, create_protocol=make)
+    try:
+        await acm.__aenter__()
+    except BaseException as ex:
+        conn.closed = True
+        if isinstance(ex, asyncio.CancelledError):
+            raise
+        raise H3Error(f"h3: baglanti kurulamadi: {ex}") from ex
+    conn.acm = acm
+    if conn.closed:               # el sikismasi biterken baglanti dustu
+        await _conn_close(conn)
+        raise H3Error("h3: baglanti kurulamadi")
+    with _LOCK:
+        _POOL.setdefault(key, []).append(conn)
+    return conn
+
+
+async def _conn_get(url: str, opt, target: tuple[str, int] | None) -> _Conn:
+    """Havuzdan kapasiteli baglanti; yoksa yenisini kurar.
+
+    Ayni hedef icin es zamanli istekler tek el sikismasi paylasir
+    (_OPENING); MAX_STREAMS asilirsa yeni baglanti acilir."""
+    key = _key_of(url, opt, target)
+    host, port, sni, insecure = key
+    loop = asyncio.get_running_loop()
+    for _ in range(8):
+        conn = _pool_pick(key)
+        if conn is not None:
+            return conn
+        pending = _OPENING.get(key)
+        if pending is None:
+            pending = loop.create_future()
+            _OPENING[key] = pending
+            try:
+                conn = await _conn_open(key, host, port, sni, insecure,
+                                        url, opt)
+            except BaseException:
+                if not pending.done():
+                    pending.set_result(None)
+                raise
+            else:
+                if not pending.done():
+                    pending.set_result(conn)
+                return conn
+            finally:
+                _OPENING.pop(key, None)
+        conn = await asyncio.shield(pending)
+        if conn is None or conn.closed:
+            continue
+        if len(conn.streams) < MAX_STREAMS:
+            return conn
+        # baglanti doldu: dongu ayni hedef icin yeni baglanti acar
+    raise H3Error("h3: baglanti kurulamadi")
+
+
 def _protocol_class():
     """H3Connection'i besleyen protokol sinifi (bir kez uretilir)."""
     global _PROTO
@@ -304,21 +679,44 @@ def _protocol_class():
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
             self.h3 = api["H3Connection"](self._quic)
-            self.events: asyncio.Queue = asyncio.Queue()
+            self.conn: _Conn | None = None
 
         def quic_event_received(self, event):
-            if isinstance(event, api["ConnectionTerminated"]):
-                self.events.put_nowait(event)
+            conn = self.conn
+            if conn is None:
                 return
-            for h3_event in self.h3.handle_event(event):
-                self.events.put_nowait(h3_event)
+            if isinstance(event, api["ConnectionTerminated"]):
+                _conn_dead(conn, H3Error(
+                    f"h3: baglanti kapandi (kod {event.error_code})"))
+                return
+            if isinstance(event, api["StreamReset"]):
+                stream = conn.streams.get(event.stream_id)
+                if stream is not None:
+                    stream.fail(H3Error("h3: akis sifirlandi"))
+                return
+            try:
+                events = self.h3.handle_event(event)
+            except Exception as ex:       # protokol bozulmasi: baglanti oldu
+                _conn_dead(conn, H3Error(f"h3: akis hatasi: {ex}"))
+                return
+            for ev in events:
+                stream = conn.streams.get(ev.stream_id)
+                if stream is None:
+                    continue              # bitmis/terk edilmis akis
+                data = getattr(ev, "data", None)
+                if isinstance(ev, api["HeadersReceived"]):
+                    stream.on_headers(ev.headers)
+                elif data:
+                    stream.feed(data)
+                if getattr(ev, "stream_ended", False):
+                    stream.end()
 
     _PROTO = Proto
     return Proto
 
 
 class _Session:
-    """Tek h3 istegi: arka planda olay dongusu, bloklayan okuma koprusu.
+    """Tek bir h3 istegi: akis kaydi + bloklayan okuma koprusu.
 
     target: (host, port) - Alt-Svc duyurusu; None ise URL'in kendi
     adresi. Baglanti bu hedefe kurulur, istek yine kaynak adina gider.
@@ -334,15 +732,11 @@ class _Session:
         # modda basarisiz h3 denemesi TCP'ye hizli dussun
         self._connect_timeout = min(self._timeout, CONNECT_SECS)
         self._target = target
-        self._drain: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._task = None
-        self._thread: threading.Thread | None = None
+        self._stream: _Stream | None = None
         self._queue: asyncio.Queue | None = None
-        self._ready: concurrent.futures.Future | None = None
         self._status = 0
         self._headers: email.message.Message | None = None
-        self._got_headers = False
         self._error: BaseException | None = None
         self._buf = bytearray()
         self._eof = False
@@ -350,19 +744,27 @@ class _Session:
 
     # --- dis arayuz ---------------------------------------------------
     def start(self) -> tuple[int, email.message.Message]:
-        """Baglantiyi kurar ve yanit basliklarini bekler (zaman asimli)."""
-        self._ready = concurrent.futures.Future()
-        self._thread = threading.Thread(
-            target=self._run, name="ferdim-h3", daemon=True)
-        self._thread.start()
+        """Akisi acar ve yanit basliklarini bekler (zaman asimli)."""
+        self._loop = _loop()
+        stream = _Stream()
+        self._stream = stream
+        fut = asyncio.run_coroutine_threadsafe(self._open(), self._loop)
         try:
-            self._ready.result(self._connect_timeout)
-        except concurrent.futures.TimeoutError:
-            self.close()
+            fut.result(self._connect_timeout)
+        except TimeoutError:
+            fut.cancel()
+            self._release(reset=True)
             mark_broken(self.url)
             raise TimeoutError("h3: yanit basligi gelmedi") from None
-        if self._error is not None:
-            raise self._error
+        except concurrent.futures.CancelledError:
+            self._release(reset=True)
+            raise H3Error("h3: istek iptal edildi") from None
+        except BaseException:
+            err = self._error
+            self._release(reset=True)
+            if err is not None:
+                raise err
+            raise H3Error("h3: istek basarisiz") from None
         return self._status, self._headers or email.message.Message()
 
     def read(self, n: int = -1) -> bytes:
@@ -384,15 +786,7 @@ class _Session:
         if self._closed:
             return
         self._closed = True
-        loop = self._loop
-        if loop is not None and not loop.is_closed():
-            try:
-                loop.call_soon_threadsafe(self._cancel)
-            except RuntimeError:
-                pass
-        thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(JOIN_SECS)
+        self._release(reset=True)
 
     # --- okuma koprusu ------------------------------------------------
     def _fill(self) -> None:
@@ -420,130 +814,71 @@ class _Session:
             return
         if isinstance(item, BaseException):
             self._error = item
+            mark_broken(self.url)
             raise item
         if item is None:
             self._eof = True
-            self._signal_drained()    # olay dongusu artik kapanabilir
+            self._release()       # okur bitti: akis kaydi kapanabilir
         else:
             self._buf += item
 
-    def _signal_drained(self) -> None:
-        loop, drain = self._loop, self._drain
-        if loop is not None and drain is not None and not loop.is_closed():
-            try:
-                loop.call_soon_threadsafe(drain.set)
-            except RuntimeError:
-                pass
-
-    # --- arka plan ----------------------------------------------------
-    def _run(self) -> None:
-        if self._closed:
+    # --- akis yasami ---------------------------------------------------
+    def _release(self, reset: bool = False) -> None:
+        """Akis kaydini birakir (olay dongusunde calisir)."""
+        stream, loop = self._stream, self._loop
+        if stream is None or stream.reader_done:
             return
-        loop = asyncio.new_event_loop()
-        self._loop = loop
-        asyncio.set_event_loop(loop)
+        if loop is None or loop.is_closed():
+            stream.reader_done = True
+            return
         try:
-            self._task = loop.create_task(self._request())
-            if self._closed:              # close() yarisi: istek baslamasin
-                self._task.cancel()
-            loop.run_until_complete(self._task)
-        except asyncio.CancelledError:
-            pass
-        except BaseException as ex:            # noqa: BLE001 - okura iletilir
-            self._fail(ex)
-        finally:
-            try:
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            except Exception:
-                pass
-            loop.close()
-
-    def _cancel(self) -> None:
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
+            loop.call_soon_threadsafe(_release_stream, stream, reset)
+        except RuntimeError:
+            stream.reader_done = True
 
     def _fail(self, ex: BaseException) -> None:
-        """Tasimayi basarisiz sayar: kaynagi bozar, okuru uyandirir."""
+        """Tasimayi basarisiz sayar: kaynagi bozar; okur hatayi kuyruktan
+        (ya da dogrudan start() cagrisindan) alir."""
         if self._error is None:
             self._error = ex
         mark_broken(self.url)
-        ready = self._ready
-        if ready is not None and not ready.done():
-            ready.set_exception(ex)
-        loop, queue = self._loop, self._queue
-        if loop is not None and queue is not None and not loop.is_closed():
-            try:
-                loop.call_soon_threadsafe(_offer, queue, ex)
-            except RuntimeError:
-                pass
 
     def _abort(self, ex: BaseException) -> None:
         self._fail(ex)
         self.close()
 
-    async def _request(self) -> None:
-        api = _load()
-        self._queue = asyncio.Queue(maxsize=DATA_QUEUE)
-        self._drain = asyncio.Event()
-        parts = urlsplit(self.url)
-        host = parts.hostname or ""
-        port = parts.port or 443
-        if self._target is not None:      # Alt-Svc: duyurulan host:port
-            host = self._target[0] or host
-            port = self._target[1]
-        conf = api["QuicConfiguration"](
-            is_client=True,
-            alpn_protocols=list(api["H3_ALPN"]),
-            # SNI/ana makine dogrulamasi her zaman KAYNAGIN adiyla
-            server_name=parts.hostname or host,
-            verify_mode=ssl.CERT_NONE if getattr(self.opt, "insecure", False)
-            else ssl.CERT_REQUIRED,
-        )
-        headers = _request_headers(parts, self.headers)
-        async with api["connect"](host, port, configuration=conf,
-                                  create_protocol=_protocol_class()) as client:
-            stream_id = client._quic.get_next_available_stream_id()
-            client.h3.send_headers(stream_id, headers)
-            client.transmit()
-            while True:
-                event = await client.events.get()
-                if isinstance(event, api["HeadersReceived"]):
-                    if event.stream_id != stream_id:
-                        continue
-                    if not self._got_headers:      # izleyen HEADERS = trailer
-                        self._got_headers = True
-                        self._status = _status_of(event.headers)
-                        self._headers = _message(event.headers)
-                        if self._ready is not None and not self._ready.done():
-                            self._ready.set_result(True)
-                    if event.stream_ended:
-                        await self._queue.put(None)
-                        break
-                elif isinstance(event, api["DataReceived"]):
-                    if event.stream_id != stream_id:
-                        continue
-                    if event.data:
-                        await self._queue.put(event.data)
-                    if event.stream_ended:
-                        await self._queue.put(None)
-                        break
-                elif isinstance(event, api["ConnectionTerminated"]):
-                    raise ConnectionError(
-                        f"h3: baglanti kapandi (kod {event.error_code})")
-            # Akis bitti ama kuyrukta/tamponda veri olabilir: dongu, okur
-            # sentinel'i gorene kadar YASAMALI. Erken kapatma kuyruktaki
-            # kuyrugu kaybettirip sahte stall/H3Error uretiyordu.
-            try:
-                await asyncio.wait_for(self._drain.wait(), DRAIN_SECS)
-            except asyncio.TimeoutError:
-                pass
-
-
-def _offer(queue: asyncio.Queue, item) -> None:
-    try:
-        queue.put_nowait(item)
-    except asyncio.QueueFull:
-        pass
+    async def _open(self) -> None:
+        """Akisi baglantiya kaydeder, basliklari ve veriyi bekler."""
+        stream = self._stream
+        loop = asyncio.get_running_loop()
+        if stream.queue is None:
+            stream.queue = asyncio.Queue()
+            stream.ready = loop.create_future()
+            self._queue = stream.queue
+        try:
+            conn = await _conn_get(self.url, self.opt, self._target)
+            stream.conn = conn
+            stream.stream_id = conn.proto._quic.get_next_available_stream_id()
+            conn.streams[stream.stream_id] = stream
+            conn.last_used = _now()
+            conn.proto.h3.send_headers(
+                stream.stream_id,
+                _request_headers(urlsplit(self.url), self.headers))
+            conn.proto.transmit()
+            await stream.ready
+            if stream.error is not None:
+                raise stream.error
+            if not stream.got_headers:
+                raise H3Error("h3: yanit basligi yok")
+            self._status = stream.status
+            self._headers = stream.headers
+        except asyncio.CancelledError:
+            _release_stream(stream, True)
+            raise
+        except BaseException as ex:
+            _release_stream(stream, True)
+            self._fail(ex)
+            raise
 
 
 class Response:
