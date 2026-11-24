@@ -1,0 +1,520 @@
+"""HTTP/3 (QUIC) tasimasi testleri.
+
+Kapsam: Alt-Svc ayristirma/onbellek/son kullanma, mod secimi (off/auto/
+force, proxy, bozuk kaynak), h3 hatasinda TCP'ye dusme, cekirdek
+importunun aioquic'i yuklememesi ve (aioquic + openssl varsa) 127.0.0.1
+uzerinde gercek bir h3 sunucusuna karsi Range indirmesi.
+"""
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import email.message
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import unittest
+import warnings
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import ferdim
+from ferdim import paths
+from ferdim.engine import h3, httpcli
+from tests import helpers
+
+ROOT = Path(__file__).resolve().parents[1]
+OPENSSL = shutil.which("openssl")
+
+try:                                    # yalnizca testin kendisi import eder
+    import aioquic  # noqa: F401
+    HAVE_AIOQUIC = True
+except Exception:                       # pragma: no cover - ortamda yok
+    HAVE_AIOQUIC = False
+
+PAYLOAD = bytes(range(256)) * 16        # 4096 bayt
+
+
+class _Clock:
+    """h3 onbellek zamanini dondurmak icin sahte saat."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def _message(**headers) -> email.message.Message:
+    msg = email.message.Message()
+    for key, val in headers.items():
+        msg[key.replace("_", "-")] = val
+    return msg
+
+
+class _FakeResponse:
+    """urllib yaniti taklidi (probe/open_range sozlesmesi)."""
+
+    def __init__(self, status=206, total=4096, body=b"x"):
+        self.status = status
+        self.url = "https://ornek.test/x.bin"
+        self.headers = _message(Content_Range=f"bytes 0-0/{total}",
+                                ETag='"v1"', Content_Type="application/x-b")
+        self.closed = False
+        self._body = body
+
+    def geturl(self):
+        return self.url
+
+    def read(self, n=-1):
+        return self._body
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+class AltSvcTest(unittest.TestCase):
+    def setUp(self):
+        h3.reset_cache()
+        self.clock = _Clock()
+        patcher = mock.patch.object(h3, "_now", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_parse_port_and_max_age(self):
+        self.assertEqual(h3.parse_alt_svc('h3=":443"; ma=60'), (443, 60.0))
+        self.assertEqual(h3.parse_alt_svc('h3=":8443"'),
+                         (8443, h3.ALT_SVC_DEFAULT_MAX_AGE))
+
+    def test_parse_picks_longest_and_ignores_other_protocols(self):
+        value = 'h2=":443"; ma=10, h3=":443"; ma=30, h3=":443"; ma=90'
+        self.assertEqual(h3.parse_alt_svc(value), (443, 90.0))
+        self.assertIsNone(h3.parse_alt_svc('h2=":443"; ma=60'))
+        self.assertIsNone(h3.parse_alt_svc(""))
+        self.assertIsNone(h3.parse_alt_svc(None))
+
+    def test_parse_rejects_other_host_and_garbage(self):
+        self.assertIsNone(h3.parse_alt_svc('h3="baska.test:443"; ma=9',
+                                           "ornek.test"))
+        self.assertEqual(h3.parse_alt_svc('h3="ornek.test:443"; ma=9',
+                                          "ornek.test"), (443, 9.0))
+        self.assertIsNone(h3.parse_alt_svc('h3=":port"; ma=9'))
+        self.assertIsNone(h3.parse_alt_svc("h3"))     # '=' yok
+        self.assertIsNone(h3.parse_alt_svc('h3="443"'))  # iki nokta yok
+
+    def test_cache_hit_and_expiry(self):
+        url = "https://ornek.test/dosya.bin"
+        self.assertTrue(h3.remember_alt_svc(url, 'h3=":8443"; ma=60'))
+        self.assertEqual(h3.alt_svc_port(url), 8443)
+        self.clock.t += 59
+        self.assertEqual(h3.alt_svc_port(url), 8443)
+        self.clock.t += 2
+        self.assertIsNone(h3.alt_svc_port(url), "suresi dolan kayit silinmeli")
+
+    def test_ma_zero_clears(self):
+        url = "https://ornek.test/dosya.bin"
+        h3.remember_alt_svc(url, 'h3=":443"; ma=60')
+        self.assertFalse(h3.remember_alt_svc(url, 'h3=":443"; ma=0'))
+        self.assertIsNone(h3.alt_svc_port(url))
+
+    def test_non_h3_header_not_cached(self):
+        url = "https://ornek.test/dosya.bin"
+        self.assertFalse(h3.remember_alt_svc(url, 'h2=":443"; ma=60'))
+        self.assertIsNone(h3.alt_svc_port(url))
+
+    def test_broken_backoff_expires(self):
+        url = "https://ornek.test/dosya.bin"
+        h3.mark_broken(url)
+        self.assertTrue(h3.broken(url))
+        self.clock.t += h3.BROKEN_SECS - 1
+        self.assertTrue(h3.broken(url))
+        self.clock.t += 2
+        self.assertFalse(h3.broken(url), "10 dk sonra h3 yeniden denenmeli")
+
+    def test_broken_is_per_origin(self):
+        h3.mark_broken("https://ornek.test/a.bin")
+        self.assertTrue(h3.broken("https://ornek.test/b.bin"))
+        self.assertFalse(h3.broken("https://baska.test/a.bin"))
+
+
+class ModeTest(unittest.TestCase):
+    URL = "https://ornek.test/dosya.bin"
+
+    def setUp(self):
+        h3.reset_cache()
+        patcher = mock.patch.object(h3, "available", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_off_never_uses_h3(self):
+        h3.remember_alt_svc(self.URL, 'h3=":443"; ma=60')
+        opt = httpcli.DlOptions(http3="off")
+        self.assertFalse(h3.use_h3(self.URL, opt))
+        self.assertEqual(h3.mode_of(opt), "off")
+
+    def test_default_is_off(self):
+        self.assertEqual(httpcli.DlOptions().http3, "off")
+
+    def test_auto_needs_alt_svc(self):
+        opt = httpcli.DlOptions(http3="auto")
+        self.assertFalse(h3.use_h3(self.URL, opt), "Alt-Svc yok -> TCP")
+        h3.remember_alt_svc(self.URL, 'h3=":443"; ma=60')
+        self.assertTrue(h3.use_h3(self.URL, opt))
+
+    def test_auto_disabled_by_proxy(self):
+        h3.remember_alt_svc(self.URL, 'h3=":443"; ma=60')
+        opt = httpcli.DlOptions(http3="auto", proxy="socks5h://127.0.0.1:1080")
+        self.assertFalse(h3.use_h3(self.URL, opt))
+
+    def test_auto_disabled_without_aioquic(self):
+        h3.remember_alt_svc(self.URL, 'h3=":443"; ma=60')
+        opt = httpcli.DlOptions(http3="auto")
+        with mock.patch.object(h3, "available", return_value=False):
+            self.assertFalse(h3.use_h3(self.URL, opt))
+
+    def test_auto_disabled_for_http_scheme(self):
+        url = "http://ornek.test/dosya.bin"
+        h3.remember_alt_svc(url, 'h3=":443"; ma=60')
+        self.assertFalse(h3.use_h3(url, httpcli.DlOptions(http3="auto")))
+
+    def test_auto_skips_broken_origin(self):
+        h3.remember_alt_svc(self.URL, 'h3=":443"; ma=60')
+        opt = httpcli.DlOptions(http3="auto")
+        h3.mark_broken(self.URL)
+        self.assertFalse(h3.use_h3(self.URL, opt))
+
+    def test_force_ignores_alt_svc(self):
+        opt = httpcli.DlOptions(http3="force")
+        self.assertTrue(h3.use_h3(self.URL, opt))
+        h3.mark_broken(self.URL)          # force bozuk kaydi yok sayar
+        self.assertTrue(h3.use_h3(self.URL, opt))
+
+    def test_force_errors(self):
+        opt = httpcli.DlOptions(http3="force")
+        with self.assertRaises(h3.H3Unavailable):
+            h3.use_h3("http://ornek.test/x", opt)
+        with self.assertRaises(h3.H3Unavailable):
+            h3.use_h3(self.URL, httpcli.DlOptions(
+                http3="force", proxy="http://127.0.0.1:3128"))
+        with mock.patch.object(h3, "available", return_value=False):
+            with self.assertRaises(h3.H3Unavailable):
+                h3.use_h3(self.URL, opt)
+
+    def test_unknown_mode_falls_back_to_off(self):
+        opt = httpcli.DlOptions(http3="evet")
+        self.assertEqual(h3.mode_of(opt), "off")
+        self.assertFalse(h3.use_h3(self.URL, opt))
+
+    def test_aioquic_not_imported_by_core(self):
+        """Cekirdek import zinciri aioquic'i yuklememeli."""
+        code = ("import sys, ferdim.engine.httpcli; "
+                "print(','.join(m for m in sys.modules "
+                "if m == 'aioquic' or m.startswith('aioquic.')))")
+        out = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT),
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), "",
+                         "httpcli importu aioquic'i yuklememeli")
+
+    def test_available_imports_lazily(self):
+        code = ("import sys, ferdim.engine.h3 as h3; "
+                "print('aioquic' in sys.modules, h3.available())")
+        out = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT),
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        before, after = out.stdout.split()
+        self.assertEqual(before, "False", "modul importu aioquic yuklememeli")
+        self.assertEqual(after, str(HAVE_AIOQUIC))
+
+
+class FallbackTest(unittest.TestCase):
+    URL = "https://ornek.test/dosya.bin"
+
+    def setUp(self):
+        h3.reset_cache()
+        patcher = mock.patch.object(h3, "available", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_auto_falls_back_to_tcp_on_h3_error(self):
+        h3.remember_alt_svc(self.URL, 'h3=":443"; ma=60')
+        opt = httpcli.DlOptions(http3="auto", timeout=3)
+        fake = _FakeResponse(total=4321)
+        with mock.patch.object(h3, "request",
+                               side_effect=h3.H3Error("boom")), \
+                mock.patch.object(httpcli, "_open_tcp",
+                                  return_value=fake) as tcp:
+            res = httpcli.probe(self.URL, opt)
+        self.assertEqual(res.total, 4321)
+        self.assertEqual(res.etag, '"v1"')
+        self.assertEqual(tcp.call_count, 1, "h3 hatasinda TCP denenmeli")
+        self.assertTrue(fake.closed)
+
+    def test_auto_falls_back_for_range(self):
+        h3.remember_alt_svc(self.URL, 'h3=":443"; ma=60')
+        opt = httpcli.DlOptions(http3="auto", timeout=3)
+        fake = _FakeResponse(body=b"veri")
+        with mock.patch.object(h3, "request",
+                               side_effect=ConnectionError("x")), \
+                mock.patch.object(httpcli, "_open_tcp", return_value=fake):
+            resp = httpcli.open_range(self.URL, opt, 10, 20)
+        self.assertEqual(resp.read(4), b"veri")
+        resp.close()
+        self.assertTrue(fake.closed)
+
+    def test_force_does_not_fall_back(self):
+        opt = httpcli.DlOptions(http3="force", timeout=3)
+        with mock.patch.object(h3, "request",
+                               side_effect=h3.H3Error("boom")), \
+                mock.patch.object(httpcli, "_open_tcp") as tcp:
+            with self.assertRaises(h3.H3Error):
+                httpcli.open_range(self.URL, opt, 0, 9)
+        self.assertEqual(tcp.call_count, 0, "force modda TCP'ye dusulmez")
+
+    def test_http_error_is_not_a_transport_failure(self):
+        """Sunucunun 429 yaniti h3 calisiyor demek: TCP'ye dusulmez."""
+        import urllib.error
+        h3.remember_alt_svc(self.URL, 'h3=":443"; ma=60')
+        opt = httpcli.DlOptions(http3="auto", timeout=3)
+        err = urllib.error.HTTPError(self.URL, 429, "HTTP 429",
+                                     _message(Retry_After="1"), None)
+        try:
+            with mock.patch.object(h3, "request", side_effect=err), \
+                    mock.patch.object(httpcli, "_open_tcp") as tcp:
+                with self.assertRaises(urllib.error.HTTPError):
+                    httpcli.open_range(self.URL, opt, 0, 9)
+        finally:
+            err.close()
+        self.assertEqual(tcp.call_count, 0)
+
+    def test_session_failure_marks_origin_broken(self):
+        session = h3._Session(self.URL, httpcli.DlOptions(http3="auto"),
+                              {}, 1)
+        session._fail(ConnectionError("baglanti koptu"))
+        self.assertTrue(h3.broken(self.URL))
+
+    def test_timeout_raises_builtin_timeouterror(self):
+        """Okuma zaman asimi job.py'nin stall dalini tetiklemeli."""
+        session = h3._Session(self.URL, httpcli.DlOptions(http3="auto"),
+                              {}, 0.05)
+        session._loop = mock.Mock()
+        session._loop.is_closed.return_value = False
+        session._queue = mock.Mock()
+        waiter = concurrent.futures.Future()
+        waiter.set_exception(concurrent.futures.TimeoutError())
+        with mock.patch.object(h3.asyncio, "run_coroutine_threadsafe",
+                               return_value=waiter):
+            with self.assertRaises(TimeoutError):
+                session.read(10)
+        self.assertTrue(h3.broken(self.URL))
+
+
+class ConfigTest(unittest.TestCase):
+    def test_default_off(self):
+        self.assertEqual(paths.DEFAULTS["http3"], "off")
+
+    def test_sanitize_keeps_valid_and_resets_invalid(self):
+        from ferdim import api
+        for value in ("off", "auto", "force"):
+            cfg = dict(paths.DEFAULTS)
+            cfg["http3"] = value
+            api._sanitize_config(cfg)
+            self.assertEqual(cfg["http3"], value)
+        for value in ("evet", "", 1, None):
+            cfg = dict(paths.DEFAULTS)
+            cfg["http3"] = value
+            api._sanitize_config(cfg)
+            self.assertEqual(cfg["http3"], "off")
+
+
+class PackagingTest(unittest.TestCase):
+    def test_pyproject_version_matches_package(self):
+        try:
+            import tomllib
+        except ImportError:               # pragma: no cover - python < 3.11
+            self.skipTest("tomllib yok")
+        data = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))
+        init = (ROOT / "ferdim" / "__init__.py").read_text("utf-8")
+        found = re.search(r'^__version__ = "([^"]+)"', init, re.M)
+        self.assertIsNotNone(found, "__version__ bulunamadi")
+        self.assertEqual(data["project"]["version"], found.group(1),
+                         "pyproject.toml surumu ferdim/__init__.py ile ayni "
+                         "olmali")
+        self.assertEqual(data["project"]["version"], ferdim.__version__)
+        self.assertEqual(data["project"]["optional-dependencies"]["h3"],
+                         ["aioquic>=1.0"])
+
+    def test_no_runtime_dependencies(self):
+        try:
+            import tomllib
+        except ImportError:               # pragma: no cover - python < 3.11
+            self.skipTest("tomllib yok")
+        data = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))
+        self.assertFalse(data["project"].get("dependencies"),
+                         "cekirdek bagimlilik eklememeli (stdlib kurali)")
+
+
+class _QuicTestServer:
+    """127.0.0.1 uzerinde tek is parcacikli aioquic HTTP/3 sunucusu."""
+
+    def __init__(self, cert: Path, key: Path):
+        self._cert, self._key = cert, key
+        self._ready = threading.Event()
+        self._stop = None
+        self._loop = None
+        self._thread = None
+        self.port = 0
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="ferdim-h3-test-server")
+        self._thread.start()
+        if not self._ready.wait(15):
+            raise RuntimeError("h3 test sunucusu baslamadi")
+
+    def close(self) -> None:
+        loop, stop = self._loop, self._stop
+        if loop is not None and stop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(stop.set)
+        if self._thread is not None:
+            self._thread.join(5)
+
+    def _run(self) -> None:
+        from aioquic.asyncio import QuicConnectionProtocol, serve
+        from aioquic.h3.connection import H3_ALPN, H3Connection
+        from aioquic.h3.events import HeadersReceived
+        from aioquic.quic.configuration import QuicConfiguration
+
+        class Proto(QuicConnectionProtocol):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.h3c = H3Connection(self._quic)
+
+            def quic_event_received(self, event):
+                for ev in self.h3c.handle_event(event):
+                    if isinstance(ev, HeadersReceived):
+                        self._answer(ev)
+
+            def _answer(self, ev):
+                headers = dict(ev.headers)
+                rng = headers.get(b"range", b"")
+                start, end = 0, len(PAYLOAD) - 1
+                m = re.match(rb"bytes=(\d+)-(\d*)", rng or b"")
+                if m:
+                    start = int(m.group(1))
+                    if m.group(2):
+                        end = min(int(m.group(2)), end)
+                body = PAYLOAD[start:end + 1]
+                out = [(b":status", b"206" if m else b"200"),
+                       (b"content-type", b"application/octet-stream"),
+                       (b"content-length", str(len(body)).encode()),
+                       (b"accept-ranges", b"bytes"),
+                       (b"etag", b'"h3"')]
+                if m:
+                    span = f"bytes {start}-{end}/{len(PAYLOAD)}"
+                    out.append((b"content-range", span.encode()))
+                self.h3c.send_headers(ev.stream_id, out)
+                self.h3c.send_data(ev.stream_id, body, end_stream=True)
+                self.transmit()
+
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
+        stop = asyncio.Event()
+        self._stop = stop
+
+        async def main():
+            conf = QuicConfiguration(is_client=False,
+                                     alpn_protocols=list(H3_ALPN))
+            conf.load_cert_chain(str(self._cert), str(self._key))
+            server = await serve("127.0.0.1", 0, configuration=conf,
+                                 create_protocol=Proto)
+            self.port = server._transport.get_extra_info("sockname")[1]
+            self._ready.set()
+            await stop.wait()
+            server.close()
+
+        try:
+            loop.run_until_complete(main())
+        finally:
+            loop.close()
+
+
+@unittest.skipUnless(HAVE_AIOQUIC, "aioquic kurulu degil")
+@unittest.skipUnless(OPENSSL, "openssl komutu yok")
+class EndToEndTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.root = helpers.tmp_root(cls, "ferdim-h3-")
+        cls.cert = cls.root / "cert.pem"
+        cls.key = cls.root / "key.pem"
+        subprocess.run(
+            [OPENSSL, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", str(cls.key), "-out", str(cls.cert), "-days", "1",
+             "-subj", "/CN=localhost",
+             "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"],
+            check=True, capture_output=True)
+        cls.server = _QuicTestServer(cls.cert, cls.key)
+        cls.server.start()
+        cls.url = f"https://127.0.0.1:{cls.server.port}/dosya.bin"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.close()
+
+    def setUp(self):
+        h3.reset_cache()
+
+    def test_range_over_http3(self):
+        opt = httpcli.DlOptions(http3="force", insecure=True, timeout=10)
+        p = httpcli.probe(self.url, opt)
+        self.assertEqual(p.status, 206, p)
+        self.assertEqual(p.total, len(PAYLOAD))
+        self.assertTrue(p.accept_ranges)
+        self.assertEqual(p.etag, '"h3"')
+        with httpcli.open_range(self.url, opt, 100, 1123, timeout=10) as res:
+            self.assertEqual(res.status, 206)
+            self.assertEqual(res.headers.get("Content-Range"),
+                             f"bytes 100-1123/{len(PAYLOAD)}")
+            chunks = []
+            while True:                        # job.py gibi parca parca oku
+                chunk = res.read(250)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        self.assertEqual(b"".join(chunks), PAYLOAD[100:1124])
+        self.assertFalse(h3.broken(self.url),
+                         "basarili h3 kaynagi bozulmamali")
+
+    def test_force_without_aioquic_errors(self):
+        opt = httpcli.DlOptions(http3="force", insecure=True, timeout=10)
+        with mock.patch.object(h3, "available", return_value=False):
+            with self.assertRaises(h3.H3Unavailable):
+                httpcli.open_range(self.url, opt, 0, 9)
+
+    def test_self_signed_rejected_by_default(self):
+        """TLS dogrulamasi varsayilan acik: kendinden imzali sertifika
+        reddedilir ve kaynak bozuk isaretlenir."""
+        opt = httpcli.DlOptions(http3="force", timeout=8)
+        with warnings.catch_warnings():
+            # aioquic el sikismasi reddedilince tasimayi kapatmiyor
+            warnings.simplefilter("ignore", ResourceWarning)
+            with self.assertRaises(Exception):
+                with httpcli.open_range(self.url, opt, 0, 9, timeout=8) as res:
+                    res.read(16)
+        self.assertTrue(h3.broken(self.url))
+
+
+if __name__ == "__main__":
+    unittest.main()

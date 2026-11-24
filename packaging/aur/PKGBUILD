@@ -12,7 +12,8 @@ checkdepends=('python')
 optdepends=('python-gobject: GTK 4 front-end (ferdim-gui) and D-Bus bridge'
             'gtk4: GTK 4 front-end'
             'firefox: browser integration'
-            'wl-clipboard: clipboard watching on Wayland')
+            'wl-clipboard: clipboard watching on Wayland'
+            'python-aioquic: HTTP/3 transport')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('20ced0df037cb796fd2ee6f57e9560fa86addb6753d81d95c2e1871b21d7511a')
 

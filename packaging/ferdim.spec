@@ -28,6 +28,8 @@ Requires:       hicolor-icon-theme
 Requires:       mozilla-filesystem
 %endif
 Recommends:     python3-gobject
+# optional: HTTP/3 (QUIC) transport, see ferdim/engine/h3.py
+Suggests:       python3-aioquic
 Recommends:     firefox
 Supplements:    (firefox and python3-gobject)
 

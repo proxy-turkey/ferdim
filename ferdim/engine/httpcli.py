@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-from . import socks
+from . import h3, socks
 
 RCVBUF = 1 << 21  # 2 MB (cekirdek rmem_max ile kisitlanir, sorun degil)
 
@@ -118,6 +118,10 @@ class DlOptions:
     insecure: bool = False
     timeout: int = 30
     retries: int = 5
+    # HTTP/3 (QUIC) tasimasi: "off" (stdlib varsayilani) | "auto" | "force".
+    # "auto" yalnizca kaynak Alt-Svc ile h3 duyurduysa dener; aioquic
+    # kurulu degilse/proxy varsa sessizce TCP'de kalir.
+    http3: str = "off"
 
     def base_headers(self) -> dict:
         h = {
@@ -177,40 +181,76 @@ def _make_opener(opt: DlOptions):
     return urllib.request.build_opener(*handlers)
 
 
+def _open_tcp(url: str, opt: DlOptions, headers: dict, timeout: float):
+    """stdlib (TCP/TLS) yolu: tek istek, urllib yaniti."""
+    opener = _make_opener(opt)
+    return opener.open(urllib.request.Request(url, headers=headers),
+                       timeout=timeout)
+
+
+def _open_any(url: str, opt: DlOptions, headers: dict, timeout: float):
+    """h3 seciliyse HTTP/3, yoksa TCP. auto modda h3 hatasi TCP'ye duser.
+
+    HTTPError (sunucu yanit verdi) ve force modda H3Unavailable yukari
+    cikar; tasima hatasinda h3 kaynagi zaten "bozuk" isaretler.
+    """
+    if h3.use_h3(url, opt):
+        try:
+            return h3.request(url, opt, headers, timeout)
+        except (urllib.error.HTTPError, h3.H3Unavailable):
+            raise
+        except Exception:
+            if h3.mode_of(opt) == "force":
+                raise
+    return _open_tcp(url, opt, headers, timeout)
+
+
+def _probe_from(res) -> ProbeResult:
+    """Yanit nesnesinden (urllib ya da h3) kaynak ozellikleri."""
+    res_probe = ProbeResult()
+    res_probe.status = res.status
+    res_probe.final_url = res.geturl()
+    res_probe.content_type = res.headers.get("Content-Type", "") or ""
+    cr = res.headers.get("Content-Range", "") or ""
+    if res.status == 206 and "/" in cr:
+        total = cr.rsplit("/", 1)[1].strip()
+        if total.isdigit():
+            res_probe.total = int(total)
+        res_probe.accept_ranges = True
+    elif res.headers.get("Accept-Ranges", "").lower() == "bytes":
+        res_probe.accept_ranges = True
+        cl = res.headers.get("Content-Length", "")
+        if cl.isdigit():
+            res_probe.total = int(cl)
+    else:
+        cl = res.headers.get("Content-Length", "")
+        if cl.isdigit():
+            res_probe.total = int(cl)
+    res_probe.etag = res.headers.get("ETag", "") or ""
+    res_probe.last_modified = res.headers.get("Last-Modified", "") or ""
+    res_probe.filename = res.headers.get_filename() or ""
+    res_probe.content_disposition = res.headers.get(
+        "Content-Disposition", "") or ""
+    # 200 donduysa toplam boyut genelde Content-Length'tir
+    if res_probe.total < 0:
+        cl = res.headers.get("Content-Length", "")
+        res_probe.total = int(cl) if cl.isdigit() else -1
+    return res_probe
+
+
 def probe(url: str, opt: DlOptions) -> ProbeResult:
     """Range: bytes=0-0 ile kaynak ozelliklerini kesfeder."""
-    res = ProbeResult()
-    opener = _make_opener(opt)
-    req = urllib.request.Request(url, headers={**opt.base_headers(),
-                                               "Range": "bytes=0-0"})
-    with opener.open(req, timeout=opt.timeout) as r:
-        res.status = r.status
-        res.final_url = r.geturl()
-        res.content_type = r.headers.get("Content-Type", "") or ""
-        cr = r.headers.get("Content-Range", "") or ""
-        if r.status == 206 and "/" in cr:
-            total = cr.rsplit("/", 1)[1].strip()
-            if total.isdigit():
-                res.total = int(total)
-            res.accept_ranges = True
-        elif r.headers.get("Accept-Ranges", "").lower() == "bytes":
-            res.accept_ranges = True
-            cl = r.headers.get("Content-Length", "")
-            if cl.isdigit():
-                res.total = int(cl)
-        else:
-            cl = r.headers.get("Content-Length", "")
-            if cl.isdigit():
-                res.total = int(cl)
-        res.etag = r.headers.get("ETag", "") or ""
-        res.last_modified = r.headers.get("Last-Modified", "") or ""
-        res.filename = r.headers.get_filename() or ""
-        res.content_disposition = r.headers.get("Content-Disposition", "") or ""
-        # 200 donduysa toplam boyut genelde Content-Length'tir
-        if res.total < 0:
-            cl = r.headers.get("Content-Length", "")
-            res.total = int(cl) if cl.isdigit() else -1
-    return res
+    headers = {**opt.base_headers(), "Range": "bytes=0-0"}
+    res = _open_any(url, opt, headers, opt.timeout)
+    try:
+        out = _probe_from(res)
+        # Alt-Svc ogrenimi: "auto" modda sonraki istekler h3 deneyebilsin
+        for src in {url, out.final_url}:
+            if src:
+                h3.remember_alt_svc(src, res.headers.get("Alt-Svc"))
+    finally:
+        res.close()
+    return out
 
 
 def open_range(url: str, opt: DlOptions, start: int, end: int,
@@ -221,14 +261,13 @@ def open_range(url: str, opt: DlOptions, start: int, end: int,
     timeout hem baglanti kurulumuna hem her okumaya uygulanir; veri
     akisi bu sure boyunca durursa okuma TimeoutError ile kesilir (stall).
     """
-    opener = _make_opener(opt)
+    to = timeout or opt.timeout
     h = opt.base_headers()
     h["Range"] = f"bytes={start}-{end}"
     if etag or last_modified:
         h["If-Range"] = etag or last_modified
-    req = urllib.request.Request(url, headers=h)
     try:
-        resp = opener.open(req, timeout=timeout or opt.timeout)
+        resp = _open_any(url, opt, h, to)
     except urllib.error.HTTPError as e:
         if e.code == 416:
             raise RangeInvalid("416") from e

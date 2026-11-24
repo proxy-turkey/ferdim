@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ferdim"
+# ferdim/__init__.py __version__ ile esit olmali (tests/test_h3.py dogrular);
+# surum yukseltmesinde iki yer birlikte guncellenir.
+version = "1.5.1"
+description = "Dynamic, self-tuning segmented download manager for Linux"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Enes Aksu", email = "eaksu@pm.me" }]
+keywords = ["download-manager", "segmented-download", "firefox", "http"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Internet :: File Transfer Protocol (FTP)",
+  "Topic :: Internet :: WWW/HTTP",
+]
+
+[project.optional-dependencies]
+# HTTP/3 (QUIC) tasimasi; cekirdek yalnizca stdlib kullanir
+h3 = ["aioquic>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/proxy-turkey/ferdim"
+
+[tool.setuptools]
+packages = ["ferdim", "ferdim.engine", "ferdim.gui", "ferdim.server"]
