@@ -227,6 +227,42 @@ def cmd_history(a, env):
     return 0
 
 
+def cmd_hosts(a, env):
+    """Ogrenilen ana makine profilleri: listele / unut / tumunu sil."""
+    with _client(env) as c:
+        if a.clear:
+            r = c.request("hosts", clear=True)
+            if not r.get("ok"):
+                print(_("cli_error") + ":", r.get("error", ""), file=sys.stderr)
+                return 1
+            print(_("hosts_cleared", n=r.get("removed", 0)))
+            return 0
+        if a.forget:
+            r = c.request("hosts", forget=a.forget)
+            if not r.get("ok"):
+                print(_("hosts_unknown", host=a.forget), file=sys.stderr)
+                return 1
+            print(_("hosts_forgotten", host=a.forget))
+            return 0
+        r = c.request("hosts")
+    if not r.get("ok"):
+        print(_("cli_error") + ":", r.get("error", ""), file=sys.stderr)
+        return 1
+    rows = r.get("hosts") or []
+    if not rows:
+        print(_("hosts_empty"))
+        return 0
+    for h in rows:
+        band = _("rtt_" + h["rtt_band"]) if h.get("rtt_band") else "?"
+        seen = time.strftime("%Y-%m-%d",
+                             time.localtime(h.get("last_seen") or 0))
+        print(_("hosts_row", host=h.get("host", ""),
+                links=h.get("links", 0), rtt=band,
+                speed=util.human_size(h.get("per_link_bps") or 0),
+                samples=h.get("samples", 0), seen=seen))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ferdim",
@@ -310,6 +346,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--older-than", type=int, metavar="DAYS",
                     help="--clear ile: yalniz bu gunden eski kayitlar")
     sp.set_defaults(fn=cmd_history)
+
+    sp = sub.add_parser("hosts",
+                        help="ogrenilen ana makine profilleri (baglanti tavani)")
+    sp.add_argument("--forget", metavar="HOST", help="tek profili unut")
+    sp.add_argument("--clear", action="store_true", help="tum profilleri sil")
+    sp.set_defaults(fn=cmd_hosts)
 
     sp = sub.add_parser("daemon", help="arka plan servisini on planda calistir")
     sp.set_defaults(fn=cmd_daemon)

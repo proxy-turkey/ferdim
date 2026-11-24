@@ -9,6 +9,7 @@ from . import util
 from .history import STATES as HISTORY_STATES
 from .i18n import detect_lang, dict_for
 from . import metalink as _ml
+from .profiles import open_profiles
 from .watch import MAX_FILE, parse_url_list
 
 MAX_MIRRORS = 24              # metalink belgeleri sikca 10-20 ayna listeler
@@ -87,6 +88,10 @@ def _sanitize_config(cfg: dict, env=None) -> None:
         cfg["watch_interval"] = 3
     if cfg.get("watch_done") not in ("delete", "rename", "keep"):
         cfg["watch_done"] = "delete"
+    # "learn_hosts": elle duzenlenen config.json'da metin de olabilir
+    lh = cfg.get("learn_hosts", True)
+    cfg["learn_hosts"] = lh if isinstance(lh, bool) else \
+        str(lh).strip().lower() not in ("0", "false", "no", "off")
     dirs = cfg.get("watch_dirs")
     cfg["watch_dirs"] = [d for d in dirs if isinstance(d, str) and d.strip()] \
         if isinstance(dirs, list) else []
@@ -315,6 +320,18 @@ def handle(ctx, cmd: str, params: dict) -> dict:
             days = 0
         removed = qm.history.clear(older_than_days=days if days > 0 else None)
         return {"ok": True, "removed": removed}
+    if cmd == "hosts":
+        # ogrenilen ana makine profilleri: listele / unut / tumunu sil
+        store = open_profiles(env)
+        if params.get("clear"):
+            return {"ok": True, "removed": store.clear()}
+        forget = str(params.get("forget") or "")
+        if forget:
+            return ({"ok": True, "forgotten": forget}
+                    if store.forget(forget)
+                    else {"ok": False, "error": "profil yok"})
+        rows = store.hosts()
+        return {"ok": True, "hosts": rows, "count": len(rows)}
     if cmd == "limit":
         val = params.get("value", 0)
         if isinstance(val, str):

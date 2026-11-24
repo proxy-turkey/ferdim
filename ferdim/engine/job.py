@@ -22,6 +22,7 @@ from pathlib import Path
 
 from .. import util
 from ..paths import AppEnv
+from ..profiles import host_key, open_profiles
 from ..ratelimit import TokenBucket
 from . import dash, ftp, hls, httpcli, socks
 
@@ -32,6 +33,7 @@ SWRR_FLOOR = 0.05          # yavas kaynaklar bile en iyinin %5'i kadar pay alir
 RATE_WINDOW = 2.0          # kaynak hizi olcum penceresi (sn)
 SIDECAR_ALGOS = ("sha256", "sha512", "md5", "sha1")   # en gucluden
 SIDECAR_WAIT = 5.0         # sn: bitiste henuz aranan yan dosya bu kadar beklenir
+PROFILE_MIN_BYTES = 1 << 20   # daha az aktarim profil ogrenmek icin yetersiz
 
 
 def backoff_delay(attempt: int, cap: float = 15.0,
@@ -326,6 +328,13 @@ class DownloadJob:
         self._restarts = 0
         self._rand = random.Random()
         self._limit_mark = 0       # limit sayacini sifirlayan ilerleme isareti
+        # --- ogrenilen ana makine profili (1.6): olcumler bitiste bildirilir
+        self._host = ""            # profil anahtari: probe sonunda belli olur
+        self._probe_rtt = 0.0      # sn: yoklama yanitina kadar gecen sure
+        self._seeded = False       # profil baslangici is basina bir kez
+        self._reported_done = 0    # ayni baytlar iki kez bildirilmez
+        self._throttle_seen = False
+        self._safe_links = 0       # 429/503 sonrasi sunucunun kabul ettigi sayi
         self._reset_sources()
 
     # ----------------------------------------------------------------- durum
@@ -570,8 +579,13 @@ class DownloadJob:
             if src is None:
                 break
             try:
+                t0 = time.monotonic()
                 p = httpcli.probe(src.url, opt)
+                # RTT bandi: yanit basliklarina kadar gecen sure (ek istek yok)
+                self._probe_rtt = max(0.0, time.monotonic() - t0)
                 self._vsrc = src.url
+                # profil anahtari: veriyi gercekten sunan ana makine
+                self._host = host_key(p.final_url or src.url)
             except urllib.error.HTTPError as e:
                 last_err = e
                 if e.code in (429, 503):
@@ -621,6 +635,9 @@ class DownloadJob:
         # alabilir; limit sinyali gelince kaynak bazinda daralir
         for s in self._srcs:
             s.cap = max(1, self._allowed)
+        # ogrenilmis tavandan basla (soguk baslangic yok); governor kesif
+        # yonunu yine kendi olcumleriyle belirler
+        self._seed_profile()
         self._retries = max(0, int(opt.retries))
         try:
             self._stall = max(5, min(120, int(self.cfg.get("stall_timeout", 20))))
@@ -981,6 +998,7 @@ class DownloadJob:
             self._limit_mark = self.done
             self._limit_events = 0
         self._limit_events += 1
+        self._throttle_seen = True     # profilde "limitli sunucu" isareti
 
     def _dead_reason(self) -> str:
         names = {"conn": "baglanti hatasi", "http": "HTTP hatasi",
@@ -1106,11 +1124,77 @@ class DownloadJob:
             if self._allowed > 1:
                 self._allowed = max(1, self._allowed // 2)
                 self._server_floor = self._allowed
+                self._safe_links = self._allowed   # profilde guvenli tavan
                 self.extra["adaptive"] = self._allowed
                 self.extra["adaptive_reason"] = reason
+            self._throttle_seen = True
             if src is not None:
                 src.cap = max(1, min(src.cap, self._allowed))
             self._cond.notify_all()
+
+    # ------------------------------------------- ogrenilen ana makine profili
+    def _seed_profile(self) -> None:
+        """Isin baslangic noktasini ogrenilmis profilden kurar.
+
+        Profil yalniz BASLANGIC noktasidir: governor yine yukari/asagi yoklar
+        ve azami guc varsayilani degismez. Limit yemis ana makinede ogrenilmis
+        tavan ceza tabani olarak da kurulur; 60 sn buyume penceresi korunur.
+        """
+        if self.kind != "http" or not self.cfg.get("learn_hosts", True) \
+                or self._seeded:
+            return
+        self._seeded = True
+        if not self._host or self.extra.get("adaptive"):
+            return          # devam eden isin gercek olcumu profilden iyidir
+        prof = open_profiles(self.env).get(self._host)
+        if not prof:
+            return
+        try:
+            links = min(int(prof.get("links") or 0), self._seg_max)
+        except (TypeError, ValueError):
+            return
+        if links < 1:
+            return
+        with self._lock:
+            self._allowed = max(1, links)
+            if self._allowed < self._seg_max:
+                self.extra["adaptive"] = self._allowed
+                self.extra["adaptive_reason"] = "learned"
+            if prof.get("throttled"):
+                now = time.monotonic()
+                self._server_floor = self._allowed
+                self._last_limit_ts = now
+                self._gov["next_up"] = now + 60.0
+            for s in self._srcs:
+                s.cap = max(1, self._allowed)
+
+    def _report_profile(self) -> None:
+        """Olculen degeri ana makine profiline bildirir (bitis/duraklama).
+
+        Yalniz anlamli aktarim ve gercek bir governor olcumu varsa yazilir;
+        profil hatasi isi asla etkilemez (depo hatalari kendi icinde yutulur).
+        """
+        if self.kind != "http" or not self.cfg.get("learn_hosts", True) \
+                or not self._host:
+            return
+        with self._lock:
+            done = self.done
+            if done < PROFILE_MIN_BYTES or done <= self._reported_done:
+                return
+            ema = float(self._gov.get("ema") or 0.0)
+            throttled = bool(self._throttle_seen or self._safe_links)
+            if ema <= 0 and not throttled:
+                return          # governor henuz hiz olcemedi: ogrenecek sey yok
+            links = int(self._gov.get("best_workers") or self._allowed)
+            links = max(1, min(links, self._seg_max))
+            if self._safe_links:
+                links = min(links, max(1, self._safe_links))
+            allowed = max(1, self._allowed)
+            per_link = 0.0 if self._bucket.rate > 0 else ema / allowed
+            self._reported_done = done
+        open_profiles(self.env).record(
+            self._host, links=links, throttled=throttled,
+            rtt=self._probe_rtt, per_link_bps=per_link)
 
     def _crowded(self) -> bool:
         with self._lock:
@@ -1668,6 +1752,7 @@ class DownloadJob:
         self._checkpoint(force=True)
         if self.state in (JobState.DOWNLOADING, JobState.CONNECTING):
             self.state = JobState.PAUSED
+        self._report_profile()          # duraklatmadan once ogrenilenler yazilir
         self._changed()
 
     def _do_restart(self):
@@ -1737,6 +1822,8 @@ class DownloadJob:
         except Exception as ex:
             self.extra.pop("verifying", None)
             self._fail(str(ex), _code_for(ex))
+        if self.state == JobState.DONE:
+            self._report_profile()      # biten isin olcumu ana makine profiline
         self._changed()
 
     def _verify(self, dest: Path, found: dict | None = None) -> None:
@@ -1868,6 +1955,7 @@ class DownloadJob:
             with self._lock:
                 if self.state == JobState.DOWNLOADING:
                     self.state = JobState.PAUSED
+        self._report_profile()          # anlamli aktarim varsa profile yazilir
         self._changed()
 
     def resume(self):

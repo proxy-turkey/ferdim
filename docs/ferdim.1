@@ -63,6 +63,16 @@ follow progress until completion; returns only after verification.
 A URL starting with \fB@\fR names a local text file with one URL per line
 (comments start with #).
 .TP
+.BI hosts " [\-\-forget HOST | \-\-clear]"
+Show the learned per-host connection profiles: the link count the
+throughput governor settled at, the response-time band, the measured
+per-link speed and the number of samples. New jobs start from the learned
+link count (and from the learned safe ceiling when the host answered
+429/503) instead of a cold start; the governor keeps probing in both
+directions, so maximum power remains the default. \fB\-\-forget\fR drops
+one host, \fB\-\-clear\fR all of them. Set \fIlearn_hosts\fR to \fBfalse\fR
+to turn learning off.
+.TP
 .BI add-file " FILE..."
 Queue every URL listed in a text file, or every file described by a local
 \&.metalink / .meta4 document.
@@ -109,7 +119,9 @@ Open the web UI in the default browser.
 .TP
 .I ~/.local/state/ferdim/
 Socket, token, PID, queue state, job metadata and the download history
-database (\fIhistory.db\fR, mode 0600).
+database (\fIhistory.db\fR, mode 0600); learned host profiles live in
+\fIhosts.json\fR (same mode, at most 500 hosts, entries older than 90
+days are dropped).
 .TP
 .I ~/.config/ferdim/config.json
 User configuration (see \fBferdim config\fR; invalid values are reset to

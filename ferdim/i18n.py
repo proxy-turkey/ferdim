@@ -349,6 +349,35 @@ S = {
         "en": "Cannot read the history.", "tr": "Geçmiş okunamadı.",
         "es": "No se pudo leer el historial.",
         "ru": "Не удалось прочитать историю."},
+    # ------------------------------------------- ogrenilen ana makine profilleri
+    "hosts_row": {
+        "en": "{host}  {links} links  rtt {rtt}  {speed}/s per link  ({samples} samples, {seen})",
+        "tr": "{host}  {links} bağlantı  rtt {rtt}  bağlantı başına {speed}/sn  ({samples} örnek, {seen})",
+        "es": "{host}  {links} enlaces  rtt {rtt}  {speed}/s por enlace  ({samples} muestras, {seen})",
+        "ru": "{host}  {links} соединений  rtt {rtt}  {speed}/с на соединение  ({samples} замеров, {seen})"},
+    "hosts_empty": {
+        "en": "No learned host profiles yet.",
+        "tr": "Henüz öğrenilmiş ana makine profili yok.",
+        "es": "Aún no hay perfiles de servidor aprendidos.",
+        "ru": "Изученных профилей серверов пока нет."},
+    "hosts_forgotten": {
+        "en": "Forgot {host}.", "tr": "{host} unutuldu.",
+        "es": "Se olvidó {host}.", "ru": "{host} забыт."},
+    "hosts_unknown": {
+        "en": "No profile for {host}.", "tr": "{host} için profil yok.",
+        "es": "No hay perfil para {host}.",
+        "ru": "Нет профиля для {host}."},
+    "hosts_cleared": {
+        "en": "{n} host profiles deleted.",
+        "tr": "{n} ana makine profili silindi.",
+        "es": "{n} perfiles de servidor eliminados.",
+        "ru": "Удалено профилей серверов: {n}."},
+    "rtt_low": {
+        "en": "low", "tr": "düşük", "es": "baja", "ru": "низкий"},
+    "rtt_mid": {
+        "en": "mid", "tr": "orta", "es": "media", "ru": "средний"},
+    "rtt_high": {
+        "en": "high", "tr": "yüksek", "es": "alta", "ru": "высокий"},
 }
 
 
