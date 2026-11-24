@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ferdim import cdc, peer
+from ferdim import api, cdc, peer
 from ferdim.engine import httpcli
 from ferdim.engine import job as jobmod
 from ferdim.engine.job import DownloadJob, JobSpec, JobState
@@ -34,6 +34,14 @@ SMALL_DATA = hashlib.shake_256(b"ferdim-peer-small").digest(1 << 20)
 
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def free_port() -> int:
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    return port
 
 
 def wait_state(job, states, timeout=60):
@@ -163,6 +171,62 @@ class BeaconTests(unittest.TestCase):
         self.assertEqual(b["roots"], ["a" * 64])
 
 
+class DiscoveryFloodTests(unittest.TestCase):
+    """Beacon seli: kayit sayisi, kaynak IP hizi ve loopback sinirlanir."""
+
+    @staticmethod
+    def _disc(**kw):
+        return peer.PeerDiscovery("ben", enabled=False, **kw)
+
+    @staticmethod
+    def _beacon(port=8379, roots=()):
+        return {"node_id": "x", "port": port, "roots": list(roots)}
+
+    def test_loopback_beacons_ignored_unless_allowed(self):
+        self.assertTrue(peer._is_loopback("127.0.0.1"))
+        self.assertFalse(peer._is_loopback("10.0.0.5"))
+        disc = self._disc()
+        disc._remember("127.0.0.1", self._beacon())
+        self.assertEqual(disc.peers(), [])
+        disc = self._disc(allow_loopback=True)      # yalnizca testlerde
+        disc._remember("127.0.0.1", self._beacon())
+        self.assertEqual(len(disc.peers()), 1)
+
+    def test_beacon_flood_is_capped(self):
+        disc = self._disc()
+        for i in range(100):
+            disc._remember(f"10.0.0.{i + 1}", self._beacon(port=8000 + i))
+        self.assertEqual(len(disc.peers()), peer.MAX_PEER_ENTRIES)
+        self.assertLessEqual(len(disc._peers), peer.MAX_PEER_ENTRIES)
+
+    def test_one_beacon_per_source_ip_per_second(self):
+        disc = self._disc()
+        disc._remember("10.0.0.9", self._beacon(port=8379))
+        disc._remember("10.0.0.9", self._beacon(port=9999))   # sel: yok sayilir
+        self.assertEqual([p["port"] for p in disc.peers()], [8379])
+
+    def test_peers_ordered_by_freshness(self):
+        disc = self._disc()
+        now = time.monotonic()
+        disc._peers[("10.0.0.1", 1)] = {
+            "port": 1, "node_id": "a", "roots": [], "t": now - 10}
+        disc._peers[("10.0.0.2", 2)] = {
+            "port": 2, "node_id": "b", "roots": ["a" * 64], "t": now - 1}
+        self.assertEqual([p["host"] for p in disc.peers()],
+                         ["10.0.0.2", "10.0.0.1"])
+        self.assertEqual(disc.peers_for("a" * 64), [("10.0.0.2", 2)])
+
+    def test_stale_entries_are_forgotten(self):
+        disc = self._disc()
+        old = time.monotonic() - peer.PEER_STALE - 1
+        disc._peers[("10.0.0.3", 1)] = {
+            "port": 1, "node_id": "a", "roots": [], "t": old}
+        disc._beacon["10.0.0.4"] = old
+        self.assertEqual(disc.peers(), [])
+        disc._remember("10.0.0.5", self._beacon())
+        self.assertNotIn("10.0.0.4", disc._beacon)   # yas budama
+
+
 class ServerSecurityTests(unittest.TestCase):
     def setUp(self):
         self.root = tmp_root(self, "ferdim-peer-srv-")
@@ -179,7 +243,10 @@ class ServerSecurityTests(unittest.TestCase):
             with urllib.request.urlopen(self.base + path, timeout=5) as r:
                 return r.status, r.read()
         except urllib.error.HTTPError as e:
-            return e.code, e.read()
+            try:
+                return e.code, e.read()
+            finally:
+                e.close()
 
     def test_serves_only_known_chunk_hash(self):
         off, ln, hx = self.man.chunks[0]
@@ -213,9 +280,98 @@ class ServerSecurityTests(unittest.TestCase):
             url = f"http://127.0.0.1:{srv.port}/chunk/{self.man.chunks[0][2]}"
             with self.assertRaises(urllib.error.HTTPError) as cm:
                 urllib.request.urlopen(url, timeout=5)
-            self.assertEqual(cm.exception.code, 403)
+            code = cm.exception.code
+            cm.exception.close()
+            self.assertEqual(code, 403)
         finally:
             srv.stop()
+
+    def test_handler_has_socket_timeout(self):
+        """Yavas istemci soketi sonsuza kadar bagli tutamaz."""
+        self.assertEqual(peer.PeerHandler.timeout, peer.HANDLER_TIMEOUT)
+        self.assertGreater(peer.HANDLER_TIMEOUT, 0)
+
+    def test_serves_multi_block_chunk_intact(self):
+        """Parca 64 KiB bloklarla akitilir: icerik ve ozet bozulmaz."""
+        off, ln, hx = self.man.chunks[0]
+        self.assertGreater(ln, peer.CHUNK_BLOCK)
+        code, body = self._status(f"/chunk/{hx}")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(body), ln)
+        self.assertEqual(sha(body), hx)
+
+    def test_tampered_file_is_not_served(self):
+        """Dizin dogrulamasi yetmez: sunum oncesi hash yeniden hesaplanir."""
+        data = bytearray(self.src.read_bytes())
+        data[0] ^= 0xFF
+        self.src.write_bytes(bytes(data))
+        off, ln, hx = self.man.chunks[0]
+        self.assertEqual(self._status(f"/chunk/{hx}")[0], 404)
+
+    def test_connection_cap_answers_503_immediately(self):
+        """Eszamanli istek siniri asilinca beklemeden 503."""
+        conns = peer._Concurrency(total=1, per_ip=1)
+        srv = peer.PeerServer(self.idx, host="127.0.0.1", port=0, conns=conns)
+        self.assertTrue(conns.enter("127.0.0.1"))    # tek slotu elle tut
+        srv.start()
+        try:
+            url = f"http://127.0.0.1:{srv.port}/chunk/{self.man.chunks[0][2]}"
+            t0 = time.monotonic()
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(url, timeout=5)
+            code = cm.exception.code
+            cm.exception.close()
+            self.assertEqual(code, 503)
+            self.assertLess(time.monotonic() - t0, 2.0)
+        finally:
+            srv.stop()
+
+    def test_verify_chunk_signature(self):
+        path, off, ln, hx = (str(self.src),) + tuple(self.man.chunks[0])
+        sig = peer.verify_chunk(path, off, ln, hx)
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig[0], self.src.stat().st_size)
+        self.assertIsNone(peer.verify_chunk(path, off, ln, "0" * 64))
+        self.assertIsNone(peer.verify_chunk(path, off, ln + 1, hx))
+
+
+class ConcurrencyTests(unittest.TestCase):
+    def test_per_ip_and_total_limits_release(self):
+        c = peer._Concurrency(total=3, per_ip=2)
+        self.assertTrue(c.enter("a"))
+        self.assertTrue(c.enter("a"))
+        self.assertFalse(c.enter("a"))         # IP basina sinir
+        self.assertTrue(c.enter("b"))
+        self.assertFalse(c.enter("b"))         # toplam sinir
+        c.leave("a")
+        self.assertTrue(c.enter("b"))
+        self.assertEqual(c._by_ip.get("b"), 2)
+        c.leave("b")
+        c.leave("b")
+        self.assertNotIn("b", c._by_ip)        # bos IP kaydi budanir
+        self.assertEqual(c._active, 1)
+
+
+class RateLimiterTests(unittest.TestCase):
+    def test_bytes_are_charged_as_sent(self):
+        now = [0.0]
+        lim = peer._RateLimiter(rate=1000, burst=1000, now=lambda: now[0])
+        self.assertTrue(lim.allow("10.0.0.1"))
+        self.assertTrue(lim.charge(600))
+        self.assertFalse(lim.charge(600))      # kova bitti
+        now[0] += 1.0                          # 1 sn'de 1000 bayt yenilendi
+        self.assertTrue(lim.charge(600))
+
+    def test_request_map_prunes_old_windows(self):
+        now = [0.0]
+        lim = peer._RateLimiter(req_per_min=2, now=lambda: now[0])
+        self.assertTrue(lim.allow("10.0.0.1"))
+        self.assertTrue(lim.allow("10.0.0.1"))
+        self.assertFalse(lim.allow("10.0.0.1"))
+        now[0] = 61.0
+        self.assertTrue(lim.allow("10.0.0.2"))
+        self.assertNotIn("10.0.0.1", lim._req)  # eski pencere budandi
+        self.assertTrue(lim.allow("10.0.0.1"))
 
 
 class BadPeer(BaseHTTPRequestHandler):
@@ -291,6 +447,41 @@ def start_slow_peer(data, man, delay=0.0):
     SlowPeer.delay = delay
     SlowPeer.hits = 0
     srv = ThreadingHTTPServer(("127.0.0.1", 0), SlowPeer)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_address[1]
+
+
+class DripPeer(BaseHTTPRequestHandler):
+    """1 bayt / 50 ms yazan esbaz: mutlak butce testi (bitmez)."""
+
+    protocol_version = "HTTP/1.1"
+    timeout = 5
+    ln = 0
+    hits = 0
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        type(self).hits += 1
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(type(self).ln))
+        self.end_headers()
+        try:
+            while True:                 # istemci birakana kadar damla damla
+                self.wfile.write(b"\x00")
+                self.wfile.flush()
+                time.sleep(0.05)
+        except (OSError, ValueError):
+            pass
+
+
+def start_drip_peer(ln):
+    DripPeer.ln = int(ln)
+    DripPeer.hits = 0
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), DripPeer)
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, srv.server_address[1]
@@ -398,6 +589,52 @@ class PrefillGuardTests(unittest.TestCase):
     def test_prefill_budget_is_below_pause_wait(self):
         self.assertLessEqual(jobmod.PEER_PREFILL_BUDGET, 4.0)
         self.assertLess(jobmod.PEER_PREFILL_BUDGET, 8.0)
+
+    def test_slow_drip_peer_returns_within_budget(self):
+        """Damla damla veri gonderen esbaz toplam butceyi asamaz."""
+        root = tmp_root(self, "ferdim-peer-drip-")
+        _, man, man_path = prepare_source(root, SMALL_DATA)
+        srv, port = start_drip_peer(man.chunks[0][1])
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        env, cfg = self._env_job(root)
+        node = peer.open_peer(env)
+        node.discovery.enabled = False
+        node.set_peers([("127.0.0.1", port)])
+        job = DownloadJob(env, cfg, JobSpec(url="http://ornek.test/f.bin",
+                                           merkle=str(man_path)))
+        job.kind = "http"
+        job.total = man.size
+        job._merkle = man
+        job._merkle_auto = False
+        job._pending = [(0, man.size - 1)]
+        self._open_part(job)
+        t0 = time.monotonic()
+        job._peer_prefill(job.spec.options(cfg))
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, jobmod.PEER_PREFILL_BUDGET + 2.0,
+                        f"damla esbaz butceyi asti: {elapsed:.2f}s")
+        self.assertGreater(DripPeer.hits, 0, "esbaz denendi mi?")
+        self.assertEqual(job.done, 0)
+        self.assertEqual(job._pending, [(0, man.size - 1)])
+
+
+class SlowDripTests(unittest.TestCase):
+    def test_fetch_chunk_honours_absolute_deadline(self):
+        root = tmp_root(self, "ferdim-peer-dripc-")
+        _, man, _ = prepare_source(root, SMALL_DATA)
+        off, ln, hx = man.chunks[0]
+        srv, port = start_drip_peer(ln)
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        client = peer.PeerClient(peers=[("127.0.0.1", port)], budget=10.0)
+        t0 = time.monotonic()
+        data = client.fetch_chunk("127.0.0.1", port, hx, ln,
+                                  deadline=time.monotonic() + 0.4)
+        elapsed = time.monotonic() - t0
+        self.assertIsNone(data)
+        self.assertLess(elapsed, 2.0,
+                        f"mutlak sure siniri uygulanmadi: {elapsed:.2f}s")
 
 
 class PrefillLifecycleTests(unittest.TestCase):
@@ -561,6 +798,69 @@ class EndToEndTests(unittest.TestCase):
         finally:
             bad_srv.shutdown()
             bad_srv.server_close()
+
+
+class RuntimeToggleTests(unittest.TestCase):
+    """config-set ile peer_cache acilip kapanir: soket/thread sizmaz."""
+
+    def _setup(self):
+        root = tmp_root(self, "ferdim-peer-toggle-")
+        env = AppEnv(root=root / "env")
+        cfg = env.load_config()
+        node = peer.PeerNode(env, multicast=False, host="127.0.0.1")
+        env.peer_node = node           # api ayni dugumu bulur
+        ctx = {"qm": None, "env": env, "cfg": cfg,
+               "set_cfg": env.save_config}
+        self.addCleanup(node.stop)
+        return env, cfg, node, ctx
+
+    @staticmethod
+    def _http_threads():
+        return [t for t in threading.enumerate()
+                if t.name == "ferdim-peer-http"]
+
+    def test_toggle_off_stops_server_and_on_restarts(self):
+        env, cfg, node, ctx = self._setup()
+        base = len(self._http_threads())
+        self.assertIsNone(node.server)
+        r = api.handle(ctx, "config-set",
+                       {"config": {"peer_cache": True,
+                                   "peer_port": free_port(),
+                                   "peer_dirs": []}})
+        self.assertTrue(r["ok"], r)
+        self.assertIsNotNone(node.server)
+        port = node.server.port
+        self.assertEqual(len(self._http_threads()), base + 1)
+        # ayni ayar yeniden gonderilir: dugum yeniden baslatilmaz
+        api.handle(ctx, "config-set", {"config": {"peer_cache": True}})
+        self.assertEqual(node.server.port, port)
+        self.assertEqual(len(self._http_threads()), base + 1,
+                         "ayni ayar ikinci sunucu thread'i acti")
+        # kapat: sunucu durur, thread kalmaz
+        api.handle(ctx, "config-set", {"config": {"peer_cache": False}})
+        self.assertIsNone(node.server)
+        self.assertEqual(len(self._http_threads()), base)
+        # yeniden ac
+        api.handle(ctx, "config-set",
+                   {"config": {"peer_cache": True,
+                               "peer_port": free_port()}})
+        self.assertIsNotNone(node.server)
+        self.assertEqual(len(self._http_threads()), base + 1)
+
+    def test_port_change_rebinds(self):
+        env, cfg, node, ctx = self._setup()
+        base = len(self._http_threads())
+        api.handle(ctx, "config-set",
+                   {"config": {"peer_cache": True,
+                               "peer_port": free_port()}})
+        first = node.server.port
+        want = free_port()
+        api.handle(ctx, "config-set", {"config": {"peer_port": want}})
+        self.assertIsNotNone(node.server)
+        self.assertEqual(node.server.port, want)
+        self.assertNotEqual(node.server.port, first)
+        self.assertEqual(len(self._http_threads()), base + 1,
+                         "port degisimi thread sizdirdi")
 
 
 if __name__ == "__main__":

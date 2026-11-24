@@ -621,6 +621,14 @@ def handle(ctx, cmd: str, params: dict) -> dict:
             # deger diske yazilir (web ayarlari bu yolu kullanir)
             qm.set_speed_plan(cfg.get("speed_plan"),
                               manual=bool(cfg.get("speed_plan_manual")))
+        if any(k in new for k in ("peer_cache", "peer_port", "peer_dirs")):
+            # esbaz dugumu calisma aninda acilip kapanabilir: kapatinca
+            # soket/beacon durur, acinca yeniden baslar (idempotent)
+            try:
+                from .peer import open_peer
+                open_peer(ctx["env"]).start(cfg)
+            except Exception:
+                pass        # esbaz dugumu ayarin kaydini engellemez
         out = {"ok": True, "config": cfg}
         if warning:
             out["warning"] = warning

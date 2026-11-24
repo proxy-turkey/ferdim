@@ -206,9 +206,12 @@ birebir geri getirir. İsteğe bağlı LAN eşbaz önbelleği (\fIpeer_cache\fR,
 varsayılan kapalı) aynı ağdaki diğer FerDim makineleriyle doğrulanmış
 Merkle parçalarını \fIpeer_port\fR (varsayılan 8379) üzerinden paylaşır ve
 \fIpeer_dirs\fR içinde bulunan bildirimleri dizinler (boş: indirme
-klasörü). Bir multicast beacon hangi Merkle köklerine sahip olduğumuzu
-duyurduğu için özellik varsayılan kapalıdır; eşbazdan gelen parçalar
-güvenilmez sayılır ve yazılmadan önce SHA-256 ile doğrulanır.
+klasörü). Multicast beacon hangi Merkle köklerine sahip olduğumuzu tüm
+yerel ağa duyurur ve o ağdaki herhangi bir makine bir parçanın özetini
+isteyerek onun önbellekte olup olmadığını sınayabilir; dosya adları ve
+yollar makineden çıkmaz. Bu yüzden özellik varsayılan kapalıdır ve
+eşbazdan gelen parçalar güvenilmez sayılır: yazılmadan önce her biri
+SHA-256 ile doğrulanır.
 .TP
 .BI hosts " [\-\-forget SUNUCU | \-\-clear]"
 Öğrenilmiş sunucu bağlantı profillerini gösterir: hız denetleyicisinin

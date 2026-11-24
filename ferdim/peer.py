@@ -15,14 +15,17 @@ Bilesenler:
                     ayni gruptan gelen beacon'lardan esbaz listesi.
   * `PeerServer`  - HTTP; YALNIZCA `GET /chunk/<sha256>`. Birincil LAN
                     adresine baglanir, ozel olmayan kaynak IP'leri reddeder,
-                    hiz isteklerini sinirlar; sunmadan once parcanin
-                    SHA-256'sini dogrular. Dizin listesi yok.
+                    hiz ve eszamanli baglanti isteklerini sinirlar; parca
+                    dosyadan 64 KiB bloklarla akitilir, sunulmadan once
+                    SHA-256'si dogrulanir. Dizin listesi yok.
   * `PeerClient`  - koku duyuran esbazlardan parca ister; her parcayi
                     yazmadan once SHA-256 ile dogrular (esbazlar guvenilmez).
 
 Gizlilik: beacon'lar makinenin hangi Merkle koklerine sahip oldugunu LAN'a
-duyurur. Bu yuzden ozellik istege baglidir; `peer_cache` kapatilinca hicbir
-sey duyurulmaz. Beacon'lar yalnizca kok listesi tasir, dosya adi/yolu tasimaz.
+duyurur; LAN'daki herhangi bir makine bir parca ozetini isteyerek o parcanin
+onbellekte olup olmadigini sinayabilir (yol/dosya adi yine gorunmez). Bu
+yuzden ozellik istege baglidir; `peer_cache` kapatilinca hicbir sey
+duyurulmaz. Beacon'lar yalnizca kok listesi tasir, dosya adi/yolu tasimaz.
 """
 from __future__ import annotations
 
@@ -50,10 +53,16 @@ MAX_ROOTS = 64                  # beacon basina duyurulan kok
 MAX_INDEX_FILES = 2000
 MAX_INDEX_CHUNKS = 250_000
 BEACON_INTERVAL = 5.0           # sn
+BEACON_MIN_INTERVAL = 1.0       # sn: kaynak IP basina kabul edilen beacon araligi
 PEER_STALE = 20.0               # sn: beacon'i kesilen esbaz unutulur
 CHUNK_TIMEOUT = 5.0             # sn: tek parca istegi
 FETCH_BUDGET = 8.0              # sn: baslangicta esbaz taramasina ayrilan sure
-MAX_PEERS = 8
+MAX_PEERS = 8                   # istemcinin deneyecegi esbaz sayisi
+MAX_PEER_ENTRIES = 64           # izlenen esbaz kaydi ust siniri
+CHUNK_BLOCK = 64 << 10          # sunucu/istemci tek okuma blogu
+HANDLER_TIMEOUT = 10.0          # sn: yavas istemci soketi baglamasin
+CONN_MAX = 32                   # toplam eszamanli sunucu istegi
+CONN_PER_IP = 4                 # kaynak IP basina eszamanli istek
 RATE_BYTES_PER_SEC = 64 << 20   # sunucu cikis tavani
 RATE_BURST = 256 << 20
 RATE_REQ_PER_MIN = 600
@@ -75,6 +84,15 @@ def is_lan_ip(ip: str) -> bool:
     if addr.is_unspecified or addr.is_multicast:
         return False
     return bool(addr.is_private or addr.is_loopback or addr.is_link_local)
+
+
+def _is_loopback(ip: str) -> bool:
+    """Kaynak adresi loopback mi (testler disinda beacon'i yok sayilir)."""
+    try:
+        addr = ipaddress.ip_address(str(ip).split("%", 1)[0])
+    except ValueError:
+        return False
+    return bool(addr.is_loopback)
 
 
 def _hex64(value) -> str:
@@ -336,14 +354,18 @@ class PeerDiscovery:
 
     def __init__(self, node_id: str, port: int = DEFAULT_PORT,
                  roots_fn=None, group: str = MULTICAST_GROUP,
-                 enabled: bool = True):
+                 enabled: bool = True, allow_loopback: bool = False):
         self.node_id = node_id
         self.port = int(port)
         self.group = group
         self._roots_fn = roots_fn or (lambda: [])
         self.enabled = enabled
+        # loopback beacon'lari yalnizca testlerde kabul edilir: ayni makine
+        # kendi beacon'ini geri alsa da ise yaramaz, selini besler
+        self.allow_loopback = bool(allow_loopback)
         self._lock = threading.Lock()
         self._peers: dict[tuple, dict] = {}
+        self._beacon: dict[str, float] = {}      # kaynak IP -> son beacon
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._send = None
@@ -372,21 +394,24 @@ class PeerDiscovery:
         self._threads = []
         with self._lock:
             self._peers.clear()
+            self._beacon.clear()
 
     def set_port(self, port: int) -> None:
         self.port = int(port)
 
     # ------------------------------------------------------------- esbazlar
     def peers(self) -> list[dict]:
-        """Taze esbazlar: [{host, port, roots, node_id}]."""
+        """Taze esbazlar: [{host, port, roots, node_id}], en taze once."""
         now = time.monotonic()
         with self._lock:
             for key in [k for k, p in self._peers.items()
                         if now - p["t"] > PEER_STALE]:
                 del self._peers[key]
+            items = sorted(self._peers.items(),
+                           key=lambda kv: kv[1]["t"], reverse=True)
             return [dict(host=k[0], port=p["port"], roots=list(p["roots"]),
                          node_id=p["node_id"])
-                    for k, p in self._peers.items()]
+                    for k, p in items[:MAX_PEER_ENTRIES]]
 
     def peers_for(self, root: str) -> list[tuple[str, int]]:
         root = _hex64(root)
@@ -397,12 +422,32 @@ class PeerDiscovery:
         return out
 
     def _remember(self, host: str, beacon: dict) -> None:
+        """Beacon'i kaydeder: sel korumasi, yas budama ve ust sinir."""
         if not is_lan_ip(host):
             return
+        if not self.allow_loopback and _is_loopback(host):
+            return
+        now = time.monotonic()
         with self._lock:
+            last = self._beacon.get(host)
+            if last is not None and now - last < BEACON_MIN_INTERVAL:
+                return                  # ayni IP'den sel: yalnizca ilki sayilir
+            self._beacon[host] = now
+            for key in [k for k, p in self._peers.items()
+                        if now - p["t"] > PEER_STALE]:
+                del self._peers[key]
+            for key in [k for k, t in self._beacon.items()
+                        if now - t > PEER_STALE]:
+                del self._beacon[key]
             self._peers[(host, beacon["port"])] = {
                 "port": beacon["port"], "node_id": beacon["node_id"],
-                "roots": beacon["roots"], "t": time.monotonic()}
+                "roots": beacon["roots"], "t": now}
+            # ust sinir: en eski beacon'lar atilir (bellek sinirsiz buyumez)
+            if len(self._peers) > MAX_PEER_ENTRIES:
+                for key in sorted(self._peers,
+                                  key=lambda k: self._peers[k]["t"])[
+                        :len(self._peers) - MAX_PEER_ENTRIES]:
+                    del self._peers[key]
 
     # -------------------------------------------------------------- dongu
     def _listen_loop(self) -> None:
@@ -470,7 +515,11 @@ class PeerDiscovery:
 
 # --------------------------------------------------------------- HTTP sunucu
 class _RateLimiter:
-    """Kaba cikis siniri: bayt/sn + kaynak IP basina istek/dk."""
+    """Kaba cikis siniri: bayt/sn + kaynak IP basina istek/dk.
+
+    Baytlar kabulde degil GONDERILDIKCE dusulur; boylece buyuk bir parca
+    istegi tum kovayi onceden kilitlemez.
+    """
 
     def __init__(self, rate: float = RATE_BYTES_PER_SEC,
                  burst: float = RATE_BURST,
@@ -484,27 +533,101 @@ class _RateLimiter:
         self._t = self._now()
         self._req: dict[str, tuple[float, int]] = {}
 
-    def allow(self, ip: str, nbytes: int) -> bool:
+    def _refill_locked(self, now: float) -> None:
+        dt = max(0.0, now - self._t)
+        self._t = now
+        self._tokens = min(self.burst, self._tokens + dt * self.rate)
+
+    def allow(self, ip: str) -> bool:
+        """Istek kabulu: kaynak IP basina dakikalik sayac (bayt dusulmez)."""
         now = self._now()
         with self._lock:
-            dt = max(0.0, now - self._t)
-            self._t = now
-            self._tokens = min(self.burst, self._tokens + dt * self.rate)
+            self._refill_locked(now)
+            # pencere disi kayitlar budanir: harita sonsuza buyumesin
+            for k in [k for k, (start, _n) in self._req.items()
+                      if now - start >= 60.0]:
+                del self._req[k]
             start, count = self._req.get(ip, (now, 0))
             if now - start >= 60.0:
                 start, count = now, 0
             count += 1
             self._req[ip] = (start, count)
-            if count > self.req_per_min or self._tokens < nbytes:
+            return count <= self.req_per_min
+
+    def charge(self, nbytes: int) -> bool:
+        """Gonderilen baytlari kovadan duser; kova tukendiyse False."""
+        now = self._now()
+        with self._lock:
+            self._refill_locked(now)
+            if self._tokens < nbytes:
                 return False
             self._tokens -= nbytes
             return True
+
+
+class _Concurrency:
+    """Toplam ve kaynak IP basina eszamanli istek siniri (bloklamaz).
+
+    Sinir asilirsa istek hemen reddedilir; bekleyen baglanti biriktirip
+    kaynak tuketilmez.
+    """
+
+    def __init__(self, total: int = CONN_MAX, per_ip: int = CONN_PER_IP):
+        self.total = max(1, int(total))
+        self.per_ip = max(1, int(per_ip))
+        self._lock = threading.Lock()
+        self._active = 0
+        self._by_ip: dict[str, int] = {}
+
+    def enter(self, ip: str) -> bool:
+        with self._lock:
+            if self._active >= self.total \
+                    or self._by_ip.get(ip, 0) >= self.per_ip:
+                return False
+            self._active += 1
+            self._by_ip[ip] = self._by_ip.get(ip, 0) + 1
+            return True
+
+    def leave(self, ip: str) -> None:
+        with self._lock:
+            self._active = max(0, self._active - 1)
+            n = self._by_ip.get(ip, 0) - 1
+            if n > 0:
+                self._by_ip[ip] = n
+            else:
+                self._by_ip.pop(ip, None)
+
+
+def verify_chunk(path: str, off: int, ln: int, hx: str):
+    """Parcayi 64 KiB bloklarla hash'ler; eslesirse dosya imzasi doner.
+
+    Butun parca bellekte tutulmaz; imza (boyut, mtime, ino) dogrulama ile
+    gonderme arasinda dosya degistiyse sunum iptal edilir.
+    """
+    digest = hashlib.sha256()
+    try:
+        st = os.stat(path)
+        with open(path, "rb") as f:
+            f.seek(off)
+            left = int(ln)
+            while left > 0:
+                block = f.read(min(CHUNK_BLOCK, left))
+                if not block:
+                    return None
+                digest.update(block)
+                left -= len(block)
+    except OSError:
+        return None
+    if digest.hexdigest() != hx:
+        return None
+    return (st.st_size, st.st_mtime_ns, st.st_ino)
 
 
 class PeerHandler(BaseHTTPRequestHandler):
     """Yalnizca `/chunk/<sha256>`; yol, listeleme veya dosya adi yok."""
 
     protocol_version = "HTTP/1.1"
+    timeout = HANDLER_TIMEOUT       # yavas istemci soketi baglamaz
 
     def log_message(self, *a):
         pass
@@ -520,7 +643,8 @@ class PeerHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         srv = self.server
-        if not srv.peer_source_ok(self.client_address[0]):
+        ip = self.client_address[0]
+        if not srv.peer_source_ok(ip):
             self._err(403)
             return
         path = urlsplit(self.path).path
@@ -539,42 +663,75 @@ class PeerHandler(BaseHTTPRequestHandler):
         if ent is None:
             self._err(404)
             return
-        path_s, off, ln = ent
-        if not srv.peer_limiter.allow(self.client_address[0], ln):
+        if not srv.peer_limiter.allow(ip):
             self._err(429)
             return
+        if not srv.peer_conns.enter(ip):
+            self._err(503)          # eszamanli istek siniri: bekleme yok
+            return
         try:
-            with open(path_s, "rb") as f:
-                f.seek(off)
-                data = f.read(ln)
+            self._serve(srv, ent, hx)
+        finally:
+            srv.peer_conns.leave(ip)
+
+    def _serve(self, srv, ent, hx: str) -> None:
+        path_s, off, ln = ent
+        sig = verify_chunk(path_s, off, ln, hx)
+        if sig is None:
+            self._err(404)          # bozuk/eski dosya sunulmaz
+            return
+        try:
+            f = open(path_s, "rb")
         except OSError:
             self._err(404)
             return
-        if len(data) != ln or hashlib.sha256(data).hexdigest() != hx:
-            self._err(404)          # bozuk/eski dosya sunulmaz
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(ln))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(data)
+        with f:
+            try:
+                f.seek(off)
+                st = os.fstat(f.fileno())
+            except OSError:
+                self._err(404)
+                return
+            if (st.st_size, st.st_mtime_ns, st.st_ino) != sig:
+                self._err(404)      # dogrulama ile sunum arasinda degisti
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(ln))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            left = int(ln)
+            try:
+                while left > 0:
+                    block = f.read(min(CHUNK_BLOCK, left))
+                    if not block:
+                        break
+                    if not srv.peer_limiter.charge(len(block)):
+                        break       # kova bitti: baglanti kesilir, istemci atar
+                    self.wfile.write(block)
+                    left -= len(block)
+            except (OSError, ValueError):
+                pass                    # istemci gitti / soket zaman asimi
+            if left:
+                self.close_connection = True
 
 
 class PeerServer:
     """HTTP parca sunucusu: birincil LAN adresine baglanir."""
 
     def __init__(self, index: PeerIndex, host: str | None = None,
-                 port: int = DEFAULT_PORT, limiter=None):
+                 port: int = DEFAULT_PORT, limiter=None, conns=None):
         self.index = index
         self.host = host or primary_address() or "127.0.0.1"
         self._limiter = limiter or _RateLimiter()
+        self._conns = conns or _Concurrency()
         self._httpd = ThreadingHTTPServer(
             (self.host, int(port)), PeerHandler)
         self._httpd.daemon_threads = True
         self._httpd.peer_index = index
         self._httpd.peer_limiter = self._limiter
+        self._httpd.peer_conns = self._conns
         self._httpd.peer_source_ok = self.source_ok
         self._thread = None
 
@@ -666,21 +823,32 @@ class PeerClient:
                 uniq.append(ep)
         return uniq[:MAX_PEERS]
 
+    def _remaining(self, deadline: float) -> float:
+        """Verilen mutlak sinira kalan sure (en fazla tek istek zaman asimi)."""
+        return min(self.timeout, max(0.0, float(deadline) - self._now()))
+
     def fetch_chunk(self, host: str, port: int, hx: str, ln: int,
-                    timeout: float | None = None):
+                    timeout: float | None = None,
+                    deadline: float | None = None):
         """Tek parcayi ister ve dogrular; basarisizsa None (istisna yok).
 
-        `timeout`: cagiranin kalan butcesi; toplam soz verilen sureyi
-        asmamak icin tek istek de bu sinirla kesilir."""
-        if timeout is None:
-            timeout = self.timeout
-        try:
-            timeout = max(0.2, min(self.timeout, float(timeout)))
-        except (TypeError, ValueError):
-            timeout = self.timeout
+        `deadline`: mutlak (monotonic) sure siniri; `timeout` yalnizca geriye
+        uyum icin kalan sure olarak kabul edilir. Govde 64 KiB bloklarla
+        okunur ve her bloktan once soket zaman asimi kalan sureye cekilir:
+        damla damla veri gonderen bir esbaz toplam butceyi asamaz."""
+        if deadline is None:
+            try:
+                t = self.timeout if timeout is None else \
+                    max(0.2, min(self.timeout, float(timeout)))
+            except (TypeError, ValueError):
+                t = self.timeout
+            deadline = self._now() + t
+        rem = self._remaining(deadline)
+        if rem <= 0:
+            return None
         conn = None
         try:
-            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            conn = http.client.HTTPConnection(host, port, timeout=rem)
             conn.request("GET", f"/chunk/{hx}", headers={
                 "User-Agent": "ferdim-peer", "Accept": "application/octet-stream",
                 "Connection": "close"})
@@ -688,9 +856,29 @@ class PeerClient:
             if resp.status != 200:
                 return None
             cl = resp.getheader("Content-Length")
-            if cl is not None and int(cl) != ln:
+            # Content-Length ZORUNLU: parcali (chunked) yanit basligi damla
+            # damla gonderilerek mutlak sinir asilabilirdi (bozuk baslik da
+            # asagidaki ValueError yakalamasina duser)
+            if cl is None or int(cl) != ln:
                 return None
-            data = resp.read(ln)
+            buf = bytearray()
+            while len(buf) < ln:
+                rem = self._remaining(deadline)
+                if rem <= 0:
+                    return None     # butce doldu: yarim parca yazilmaz
+                sock = conn.sock
+                if sock is not None:
+                    try:
+                        sock.settimeout(max(0.05, rem))
+                    except OSError:
+                        return None
+                # read1: TEK soket okumasi; read(n) kendi icinde bloklayip
+                # mutlak siniri asardi (damla damla veri = sonsuz bekleme)
+                block = resp.read1(min(CHUNK_BLOCK, ln - len(buf)))
+                if not block:
+                    break
+                buf += block
+            data = bytes(buf)
         except (OSError, ValueError, http.client.HTTPException):
             return None
         finally:
@@ -742,11 +930,9 @@ class PeerClient:
                 continue
             data = None
             for host, port in peers:
-                remaining = deadline - self._now()
-                if remaining <= 0:
+                if deadline - self._now() <= 0:
                     break
-                data = self.fetch_chunk(host, port, hx, ln,
-                                        timeout=remaining)
+                data = self.fetch_chunk(host, port, hx, ln, deadline=deadline)
                 if data is not None:
                     break
             if data is None:
@@ -773,28 +959,46 @@ class PeerNode:
                  host: str | None = None):
         self.env = env
         self.node_id = secrets.token_hex(8)
+        self._multicast = bool(multicast)
         self.index = PeerIndex(cache_path=Path(env.state_dir) / CACHE_NAME)
         self.discovery = PeerDiscovery(self.node_id,
                                        roots_fn=lambda: self.index.roots(),
-                                       enabled=multicast)
+                                       enabled=self._multicast)
         self.client = PeerClient(self.discovery, peers=peers)
         self.server: PeerServer | None = None
         self._host = host
         self._lock = threading.Lock()
+        self._sig: tuple | None = None     # uygulanan (port, dizinler)
 
     def set_peers(self, peers) -> None:
         self.client.set_peers(peers)
 
+    def _stop_locked(self) -> None:
+        self.discovery.stop()
+        if self.server is not None:
+            self.server.stop()
+            self.server = None
+        self._sig = None
+
     def start(self, cfg: dict) -> bool:
-        """`peer_cache` acikken sunucuyu ve beacon'lari baslatir."""
+        """`peer_cache` acikken sunucuyu ve beacon'lari baslatir.
+
+        Idempotent: ayni ayarla tekrar cagirmak var olan dugumu kullanir;
+        ayar degistiyse (port/dizin) once durdurup yeniden baslatir ve
+        `peer_cache` kapaliysa calisan dugumu durdurur."""
         if not cfg.get("peer_cache"):
+            self.stop()
             return False
         try:
             port = int(cfg.get("peer_port") or DEFAULT_PORT)
         except (TypeError, ValueError):
             port = DEFAULT_PORT
-        dirs = cfg.get("peer_dirs") or [str(self.env.download_dir)]
+        dirs = tuple(str(d) for d in
+                     (cfg.get("peer_dirs") or [str(self.env.download_dir)]))
         with self._lock:
+            if self._sig is not None and self._sig != (port, dirs):
+                self._stop_locked()
+            self._sig = (port, dirs)
             self.index.set_dirs(dirs)
             try:
                 self.index.refresh(force=True)
@@ -806,19 +1010,17 @@ class PeerNode:
                                              port=port)
                 except OSError as exc:
                     log.warning("esbaz sunucusu baslatilamadi: %s", exc)
+                    self._sig = None
                     return False
                 self.server.start()
             self.discovery.set_port(self.server.port)
-            self.discovery.enabled = True
+            self.discovery.enabled = self._multicast
             self.discovery.start()
         return True
 
     def stop(self) -> None:
         with self._lock:
-            self.discovery.stop()
-            if self.server is not None:
-                self.server.stop()
-                self.server = None
+            self._stop_locked()
 
     def add_verified(self, man, path) -> bool:
         return self.index.add(man, path)
