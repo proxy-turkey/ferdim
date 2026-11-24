@@ -15,12 +15,16 @@ Dosya durum dizininde 0600 modunda, atomik yazilir (tmp + os.replace);
 en fazla MAX_HOSTS kayit tutulur (en eski last_seen duser) ve
 MAX_AGE_DAYS gun gormeyen kayitlar atilir. Dosya bir sema surumu tasir
 (FORMAT_VERSION) ve sirali goclardan gecer; bilinmeyen alanlar korunur.
-Dosya baska bir surec tarafindan degistirildiyse (mtime + boyut) yazim
+Yazimlar `hosts.json.lock` uzerindeki flock ile surecler arasi siralanir;
+dosya baska bir surec tarafindan degistirildiyse (mtime + boyut) yazim
 oncesinde yeniden okunup birlestirilir; kayitlar birbirini ezmez.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -36,22 +40,27 @@ RTT_MID = 0.20            # sn: altinda "mid", ustu "high"
 FORMAT_VERSION = 1
 
 
-def _hosts_migration_1(data: dict) -> None:
-    """v1: 'version' alani + 'hosts' sozlugu; surum alani olmayan dosya v0."""
+def _hosts_migration_1(raw: dict) -> None:
+    """v1: 'version' alani + 'hosts' sozlugu; surum alani olmayan dosya v0.
+
+    Goc TUM dosya govdesini alir (kayitlar degil): ileride ust duzey
+    alanlari yeniden duzenleyen bir goc de buradan calisabilir.
+    """
 
 
 # ileri goc: her adim bir onceki surumun uzerine ekler (history.py gibi)
 HOSTS_MIGRATIONS = {1: _hosts_migration_1}
 
 
-def _migrate_hosts(data: dict, version: int) -> int:
-    """Sirali goclari uygular; dosya bizden yeniyse dokunmaz.
+def _migrate_hosts(raw: dict, version: int) -> int:
+    """Sirali goclari dosya govdesine uygular; bizden yeniyse dokunmaz.
 
-    Bilinmeyen alanlar (ust duzey ve kayit icinde) korunur; bizden yeni
-    surum tasiyan dosya en iyi cabayla okunur, goc ettirilmez.
+    Gocler tam govdeyi (`{"version", "hosts", ...}`) gorur. Bilinmeyen
+    alanlar (ust duzey ve kayit icinde) korunur; bizden yeni surum tasiyan
+    dosya en iyi cabayla okunur, goc ettirilmez.
     """
     while version < FORMAT_VERSION:
-        HOSTS_MIGRATIONS[version + 1](data)
+        HOSTS_MIGRATIONS[version + 1](raw)
         version += 1
     return version
 
@@ -59,11 +68,18 @@ def _migrate_hosts(data: dict, version: int) -> int:
 def _parse_file(raw) -> tuple[dict[str, dict], dict, int]:
     """hosts.json govdesini (kayitlar, bilinmeyen ust alanlar, surum) ayirir.
 
-    Bozuk ya da eksik dosya bos depo sayilir; tek bozuk kayit digerlerini
-    dusurmez (ayni kuyruk kurtarma sozlesmesi).
+    Gocler once TUM govde uzerinde kosar, sonra kayitlar okunur. Bozuk ya da
+    eksik dosya bos depo sayilir; tek bozuk kayit digerlerini dusurmez (ayni
+    kuyruk kurtarma sozlesmesi).
     """
     if not isinstance(raw, dict):
         return {}, {}, 0
+    raw = dict(raw)
+    try:
+        version = max(0, int(raw.get("version") or 0))
+    except (TypeError, ValueError):
+        version = 0
+    version = _migrate_hosts(raw, version)
     hosts = raw.get("hosts")
     data: dict[str, dict] = {}
     if isinstance(hosts, dict):
@@ -72,11 +88,7 @@ def _parse_file(raw) -> tuple[dict[str, dict], dict, int]:
             if isinstance(host, str) and host and rec is not None:
                 data[host.lower()] = rec
     extra = {k: v for k, v in raw.items() if k not in ("version", "hosts")}
-    try:
-        version = max(0, int(raw.get("version") or 0))
-    except (TypeError, ValueError):
-        version = 0
-    return data, extra, _migrate_hosts(data, version)
+    return data, extra, version
 
 
 # semaya gore varsayilan portlar: URL'de yazilsa da anahtar sadelesir
@@ -184,6 +196,23 @@ class HostProfiles:
             return None
         return (st.st_mtime_ns, st.st_size)
 
+    @contextlib.contextmanager
+    def _file_lock(self):
+        """Surecler arasi okuma-degistirme-yazma kilidi (yan dosya).
+
+        atomic replace tek basina yetmez: iki surec ayni anda okuyup
+        yazarsa biri digerinin kaydini kaybeder. `hosts.json.lock`
+        uzerindeki flock kritik bolumu (tazele + yaz) kapatir; kilit
+        surec olunce cekirdek tarafindan dusurulur.
+        """
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
     def _refresh_locked(self) -> None:
         """Baska bir surec dosyayi degistirdiyse yeniden okur ve birlestirir.
 
@@ -283,7 +312,8 @@ class HostProfiles:
         except (TypeError, ValueError):
             return False
         try:
-            with self._lock:
+            # surec ici kilit + dosya kilidi: tazele/degistir/yaz butunlugu
+            with self._lock, self._file_lock():
                 stamp = float(self._now() if now is None else now)
                 data = self._load_locked(stamp)
                 e = data.get(key) or {"links": 0, "seg_workers": 0,
@@ -321,7 +351,7 @@ class HostProfiles:
         if not key:
             return False
         try:
-            with self._lock:
+            with self._lock, self._file_lock():
                 data = self._load_locked(self._now())
                 if data.pop(key, None) is None:
                     return False
@@ -334,7 +364,7 @@ class HostProfiles:
     def clear(self) -> int:
         """Tum profilleri siler; silinen kayit sayisini dondurur."""
         try:
-            with self._lock:
+            with self._lock, self._file_lock():
                 data = self._load_locked(self._now())
                 removed = len(data)
                 data.clear()

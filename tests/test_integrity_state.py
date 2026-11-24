@@ -15,10 +15,13 @@ Testler yoklamali bekleme kullanmaz; her sey gecici koklerde kosar.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import os
+import stat
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -28,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import ferdim.api as api
 import ferdim.paths as paths
+import ferdim.profiles as profiles
 from ferdim import cdc, daemon, util
 from ferdim.engine.job import JobSpec, JobState
 from ferdim.engine.queue import (QUEUE_FILE, QUEUE_PREV, QUEUE_ITEM_VERSION,
@@ -75,6 +79,113 @@ class FsyncTests(unittest.TestCase):
             cdc.write_atomic(path, "govde\n")
         self.assertEqual(path.read_text("utf-8"), "govde\n")
         self.assertGreaterEqual(fs.call_count, 2)
+
+
+class AtomicWriterTests(unittest.TestCase):
+    """Yazicilar sabit '.tmp' adi kullanmaz: es zamanli yazar yarisi yok.
+
+    Eski kod sabit `<ad>.tmp` dosyasini EEXIST'te siliyordu; daemon + CLI
+    ayni anda yazinca biri digerinin canli gecici dosyasini siliyor ve bos
+    dosya yayinlanabiliyordu.
+    """
+
+    def test_fixed_dot_tmp_file_is_never_touched(self):
+        root = tmp_root(self, "ferdim-writer-")
+        target = root / "queue.json"
+        stale = target.with_suffix(target.suffix + ".tmp")
+        stale.write_text("baska surecin canli gecici dosyasi", "utf-8")
+        util.atomic_write_json(target, {"a": 1})
+        # eski sabit ad silinmez: sahibi baska bir surec olabilir
+        self.assertTrue(stale.exists())
+        self.assertEqual(stale.read_text("utf-8"),
+                         "baska surecin canli gecici dosyasi")
+        self.assertEqual(json.loads(target.read_text("utf-8")), {"a": 1})
+
+    def test_atomic_write_bytes_uses_a_unique_temp_in_target_dir(self):
+        root = tmp_root(self, "ferdim-uniq-")
+        target = root / "durum.json"
+        real = util.tempfile.mkstemp
+        seen = {}
+
+        def spy(*args, **kw):
+            seen.update(kw)
+            return real(*args, **kw)
+
+        with mock.patch.object(util.tempfile, "mkstemp", spy):
+            util.atomic_write_bytes(target, b"veri", mode=0o600)
+        self.assertEqual(seen.get("dir"), str(root))
+        self.assertTrue(seen.get("prefix", "").startswith("durum.json"))
+        self.assertEqual([p for p in root.iterdir() if p != target], [])
+
+    def test_atomic_write_bytes_keeps_the_configured_mode(self):
+        root = tmp_root(self, "ferdim-mode-")
+        shared = root / "paylasilan"
+        util.atomic_write_bytes(shared, b"x", mode=0o644)
+        self.assertEqual(stat.S_IMODE(shared.stat().st_mode), 0o644)
+        private = root / "ozel.json"
+        util.atomic_write_json(private, {})
+        self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o600)
+
+    def test_atomic_write_bytes_removes_temp_on_failure(self):
+        root = tmp_root(self, "ferdim-fail-")
+        target = root / "hedef"
+        with mock.patch.object(util.os, "replace",
+                               side_effect=OSError("disk hatasi")), \
+                self.assertRaises(OSError):
+            util.atomic_write_bytes(target, b"x")
+        self.assertFalse(target.exists())
+        self.assertEqual(list(root.iterdir()), [],
+                         "basarisiz yazim gecici dosya birakmamali")
+
+    def test_concurrent_writers_publish_a_complete_file(self):
+        """Iki yazar ayni dosyaya: sonuc her zaman TAM bir govde olmali."""
+        root = tmp_root(self, "ferdim-race-")
+        target = root / "queue.json"
+        payloads = [{"n": i, "pad": "x" * (20_000 + i)} for i in range(2)]
+        errors: list = []
+
+        def writer(obj):
+            try:
+                for _ in range(15):
+                    util.atomic_write_json(target, obj)
+            except Exception as exc:        # eski kodda FileNotFoundError
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(p,))
+                   for p in payloads]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertIn(json.loads(target.read_text("utf-8")), payloads)
+        self.assertEqual(list(root.glob("*.tmp")), [],
+                         "gecici dosya kalmamali")
+
+    def test_concurrent_save_config_publishes_complete_json(self):
+        env = AppEnv(root=tmp_root(self, "ferdim-race-cfg-"))
+        cfgs = []
+        for seg in (4, 8):
+            cfg = env.load_config()
+            cfg["segments"] = seg
+            cfg["pad"] = "x" * (20_000 + seg)
+            cfgs.append(cfg)
+        errors: list = []
+
+        def writer(cfg):
+            try:
+                for _ in range(10):
+                    env.save_config(cfg)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(c,)) for c in cfgs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertIn(json.loads(env.config_path.read_text("utf-8")), cfgs)
 
 
 class QueueRecoveryTests(unittest.TestCase):
@@ -173,6 +284,91 @@ class QueueRecoveryTests(unittest.TestCase):
         rec = json.loads(self.path.read_text("utf-8"))[0]
         self.assertEqual(rec["v"], 7, "daha yeni surum numarasi korunmali")
         self.assertEqual(rec["future_field"], "x")
+
+    def test_06_error_reason_survives_restart(self):
+        """Hata nedeni kuyrukta kalir; durum yine 'paused' olarak doner."""
+        qm = self._queue()
+        job = qm.add(JobSpec(url="http://127.0.0.1:1/hata.bin"), paused=True)
+        job.state = JobState.ERROR
+        job.error = "sunucu 403 dondurdu"
+        job.error_code = "http_403"
+        qm._save()
+
+        rec = json.loads(self.path.read_text("utf-8"))[0]
+        self.assertEqual(rec["error"], "sunucu 403 dondurdu")
+        self.assertEqual(rec["error_code"], "http_403")
+
+        qm.shutdown()
+        again = self._queue().get(job.id)
+        self.assertIsNotNone(again)
+        # mevcut davranis: hatali is kendiliginden yeniden denenmez
+        self.assertEqual(again.state, JobState.PAUSED)
+        snap = again.snapshot()
+        self.assertEqual(snap["error"], "sunucu 403 dondurdu")
+        self.assertEqual(snap["error_code"], "http_403")
+
+    def test_07_quarantine_keeps_only_the_newest_three_copies(self):
+        for stamp in ("20200101-000000", "20200102-000000",
+                      "20200103-000000", "20200104-000000"):
+            (self.env.state_dir / f"{QUEUE_FILE}.bad-{stamp}").write_text(
+                "x", "utf-8")
+        self.path.write_text("{bozuk", "utf-8")
+        self._queue()
+
+        bads = sorted(p.name for p in
+                      self.env.state_dir.glob(QUEUE_FILE + ".bad-*"))
+        self.assertEqual(len(bads), 3, bads)
+        self.assertNotIn(f"{QUEUE_FILE}.bad-20200101-000000", bads,
+                         "en eski kopyalar silinmeli")
+
+    def test_08_clear_finished_drops_stopped_job_temp_files(self):
+        qm = self._queue()
+        job = qm.add(JobSpec(url="http://127.0.0.1:1/yarim.bin"), paused=True)
+        job.state = JobState.ERROR
+        part = job.part_path
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(b"yarim veri")
+        meta = job.meta_path
+        meta.write_text("{}", "utf-8")
+        segs = Path(str(meta) + ".segs")
+        segs.mkdir()
+        (segs / "0.part").write_bytes(b"parca")
+
+        qm.clear_finished()
+
+        self.assertIsNone(qm.get(job.id))
+        self.assertFalse(part.exists(), "yarim .part sahipsiz kalmamali")
+        self.assertFalse(meta.exists(), "denetim noktasi silinmeli")
+        self.assertFalse(segs.exists(), ".segs klasoru silinmeli")
+
+    def test_09_clear_finished_keeps_a_downloaded_file(self):
+        qm = self._queue()
+        job = qm.add(JobSpec(url="http://127.0.0.1:1/biten.bin"), paused=True)
+        final = job.final_path
+        final.parent.mkdir(parents=True, exist_ok=True)
+        final.write_bytes(b"tam veri")
+        job.state = JobState.DONE
+
+        qm.clear_finished()
+
+        self.assertIsNone(qm.get(job.id))
+        self.assertTrue(final.exists(), "indirilen dosya silinmemeli")
+
+    def test_10_ephemeral_error_text_does_not_leak_credentials(self):
+        secret = "PAROLA-SIRRI-999"
+        qm = self._queue()
+        job = qm.add(JobSpec(url=f"http://kullanici:{secret}@127.0.0.1:1/a.bin",
+                             password=secret, ephemeral=True), paused=True)
+        job.state = JobState.ERROR
+        job.error = f"istek basarisiz: http://kullanici:{secret}@127.0.0.1:1/a.bin"
+        job.error_code = "http_403"
+        qm._save()
+
+        raw = self.path.read_text("utf-8")
+        self.assertNotIn(secret, raw, "ozel pencere hatasi kimlik sizdirmamali")
+        self.assertIn("http_403", raw)
+        # bellekteki is etkilenmez: kullanici nedeni gormeye devam eder
+        self.assertIn(secret, job.error)
 
 
 class ConfigSchemaTests(unittest.TestCase):
@@ -302,6 +498,59 @@ class HostsSchemaTests(unittest.TestCase):
         saved = self._saved()
         self.assertEqual(set(saved["hosts"]), {"b.test"})
 
+    def test_migration_receives_the_whole_file(self):
+        """Gocler kayit sozlugu degil TUM govdeyi gorur (ust duzey goc)."""
+        self._write({"hosts": {"eski.test": {"links": 3,
+                                             "last_seen": time.time()}}})
+        seen = {}
+
+        def migrate(raw):
+            seen["top"] = set(raw)
+            hosts = raw.get("hosts") or {}
+            # ust duzeyi yeniden duzenleyen bir goc: kaydi tasi
+            raw["hosts"] = {"yeni.test": dict(next(iter(hosts.values())))}
+            raw["note"] = "goc"
+
+        with mock.patch.dict(profiles.HOSTS_MIGRATIONS,
+                             {1: migrate, 2: lambda raw: None}), \
+                mock.patch.object(profiles, "FORMAT_VERSION", 2):
+            store = HostProfiles(self.env)
+            hosts = store.hosts()
+
+        self.assertIn("hosts", seen["top"], "goc tam dosya govdesini almali")
+        self.assertEqual([h["host"] for h in hosts], ["yeni.test"])
+        self.assertIsNone(store.get("eski.test"))
+
+    def test_mutations_take_the_sidecar_flock(self):
+        store = HostProfiles(self.env)
+        real = profiles.fcntl.flock
+        calls = []
+
+        def spy(fd, op):
+            calls.append(op)
+            return real(fd, op)
+
+        with mock.patch.object(profiles.fcntl, "flock", spy):
+            self.assertTrue(store.record("a.test", links=2))
+        self.assertEqual(calls, [profiles.fcntl.LOCK_EX])
+        self.assertTrue((self.env.state_dir / (FILE_NAME + ".lock")).exists())
+
+    def test_sidecar_lock_is_exclusive_across_writers(self):
+        store = HostProfiles(self.env)
+        store.record("a.test", links=2)
+        lock_path = self.env.state_dir / (FILE_NAME + ".lock")
+        held = os.open(lock_path, os.O_RDWR)
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            other = os.open(lock_path, os.O_RDWR)
+            try:
+                with self.assertRaises(OSError):
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(other)
+        finally:
+            os.close(held)
+
 
 class InstanceLockTests(unittest.TestCase):
     """Tek daemon kilidi: bayat PID iki daemon baslatamaz."""
@@ -330,6 +579,8 @@ class InstanceLockTests(unittest.TestCase):
     def test_daemon_main_refuses_a_second_instance(self):
         env = AppEnv(root=tmp_root(self, "ferdim-state-lock3-"))
         env.pid_path.write_text("4242")
+        # sanitize bu degeri 32'ye ceker; kilit ONCE alinirsa dosya dokunulmaz
+        env.config_path.write_text(json.dumps({"segments": 999}), "utf-8")
         fd = daemon.instance_lock(env)
         self.addCleanup(os.close, fd)
 
@@ -339,6 +590,9 @@ class InstanceLockTests(unittest.TestCase):
             rc = daemon.main()
         self.assertEqual(rc, 1)
         self.assertIn("zaten calisiyor", err.getvalue())
+        # ikinci ornek, birincinin config'ini okuyup yeniden yazmadi
+        self.assertEqual(json.loads(env.config_path.read_text("utf-8")),
+                         {"segments": 999})
 
     def test_lock_file_lives_in_state_dir(self):
         env = AppEnv(root=tmp_root(self, "ferdim-state-lock4-"))
