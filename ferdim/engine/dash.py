@@ -12,6 +12,9 @@ import xml.etree.ElementTree as ET
 
 from . import httpcli
 
+MAX_SEGMENTS = 20_000            # tek MPD icin segment URL ust siniri
+                                 # (~5.5 saat 1 sn'lik segment; ustu patolojik)
+
 
 class DashError(Exception):
     pass
@@ -63,7 +66,9 @@ def build_segment_list(mpd_text: str, mpd_url: str):
         mpd_url, (base.text or "").strip() if base is not None else mpd_url)
 
     best = None  # (score, adaptation, rep)
-    period = _el(root, "Period") or root
+    period = _el(root, "Period")
+    if period is None:              # cocuksuz eleman 'or' ile falsy olur
+        period = root
     for ad in _els(period, "AdaptationSet") or [period]:
         mime = (_attr(ad, "mimeType") or _attr(ad, "contentType") or "").lower()
         for rep in _els(ad, "Representation"):
@@ -94,21 +99,25 @@ def build_segment_list(mpd_text: str, mpd_url: str):
         media = _attr(tmpl, "media") or ""
         init_attr = _attr(tmpl, "initialization") or ""
         start = int(_attr(tmpl, "startNumber", "1") or 1)
+        rep_id = _attr(rep, "id", "")
         init_url = u(init_attr.replace("$RepresentationID$",
-                                      _attr(rep, "id", ""))) if init_attr else None
+                                       rep_id)) if init_attr else None
 
         timeline = _el(tmpl, "SegmentTimeline")
         seg_urls: list[str] = []
         if timeline is not None:
             number = start
             for s in _els(timeline, "S"):
-                t = _attr(s, "t")
+                # S@r sinirsiz tekrar edebilir: biriktirirken sinirla
                 n = int(_attr(s, "r", "0") or 0) + 1
+                if len(seg_urls) + n > MAX_SEGMENTS:
+                    raise DashError("segment sayisi ust sinirin uzerinde")
+                t = _attr(s, "t") or ""
                 for _ in range(n):
-                    media_n = media.replace("$RepresentationID$",
-                                            _attr(rep, "id", ""))
+                    media_n = media.replace("$RepresentationID$", rep_id)
                     media_n = media_n.replace("$Number$", str(number))
-                    media_n = re.sub(r"\$Time\$", t or "", media_n)
+                    # re.sub degil: t yer tutucu sablonu degil, duz metin
+                    media_n = media_n.replace("$Time$", t)
                     seg_urls.append(u(media_n))
                     number += 1
         else:
@@ -126,10 +135,14 @@ def build_segment_list(mpd_text: str, mpd_url: str):
                         break
             if not duration or total_dur is None:
                 raise DashError("SegmentTemplate duration/Period suresi yok")
-            count = max(1, int(total_dur * timescale / duration))
+            try:
+                count = max(1, int(total_dur * timescale / duration))
+            except OverflowError:
+                raise DashError("segment sayisi ust sinirin uzerinde")
+            if count > MAX_SEGMENTS:
+                raise DashError("segment sayisi ust sinirin uzerinde")
             for i in range(count):
-                media_n = media.replace("$RepresentationID$",
-                                        _attr(rep, "id", ""))
+                media_n = media.replace("$RepresentationID$", rep_id)
                 media_n = media_n.replace("$Number$", str(start + i))
                 seg_urls.append(u(media_n))
         return init_url, seg_urls
