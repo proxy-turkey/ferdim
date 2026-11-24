@@ -14,7 +14,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from . import util
 
@@ -86,10 +86,35 @@ def _url_password(url: str) -> str:
     return unquote(password) if password else ""
 
 
+def redact_credentials(url: str) -> str:
+    """URL'den userinfo'yu (kullanici:sifre@) tamamen siler.
+
+    `util.redact_url` yalniz sifreyi gizler; ozel pencere islerinde
+    kullanici adi da diske yazilmaz. Yol, sorgu ve parca korunur, boylece
+    gecmis kaydi okunabilir kalir. Kuyruk kaliciligi da ayni kurali
+    kullanir (bkz. engine.queue._scrub_ephemeral).
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        head, sep, tail = str(url).partition("://")
+        if not sep:
+            return str(url)
+        return head + sep + tail.rsplit("@", 1)[-1]
+    netloc = parts.netloc.rsplit("@", 1)[-1]
+    if netloc == parts.netloc:          # userinfo yok: URL aynen kalir
+        return url
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query,
+                       parts.fragment))
+
+
 def _options(job, spec) -> str:
     """Yeniden indirme parametreleri (add komutunun alan adlariyla).
 
     Sifre yalniz burada durur; arama/liste yanitlarina hic girmez.
+    Ozel pencere islerinde kimlik bilgileri hic yazilmaz: yeniden indirme
+    cerezsiz/parolasiz dener (oturum gereken kaynakta basarisiz olur,
+    kabul edilen davranis).
     """
     try:
         directory = str(job.target_dir)
@@ -113,6 +138,9 @@ def _options(job, spec) -> str:
         "merkle": spec.merkle,
         "limit": int(spec.limit or 0),
     }
+    if getattr(spec, "ephemeral", False):
+        for key in ("headers", "cookies", "user", "password"):
+            opts.pop(key, None)
     return json.dumps({k: v for k, v in opts.items() if v}, ensure_ascii=False)
 
 
@@ -121,9 +149,12 @@ def _row(job) -> tuple:
     kilidi tutulurken de gelebilir; okunan alanlar tek tek atanir."""
     finished = time.time()
     spec = getattr(job, "spec", None)
-    url = util.redact_url(getattr(job, "url", "") or "")
+    raw_url = getattr(job, "url", "") or ""
+    # ozel pencere kaydi: URL userinfo'su (kullanici ve sifre) silinir
+    url = (redact_credentials(raw_url)
+           if getattr(spec, "ephemeral", False) else util.redact_url(raw_url))
     filename = (getattr(job, "final_filename", "") or
-                util.filename_from_url(getattr(job, "url", "") or ""))
+                util.filename_from_url(raw_url))
     created = float(getattr(job, "created", finished) or finished)
     samples = int(getattr(job, "_links_samples", 0) or 0)
     links_sum = int(getattr(job, "_links_sum", 0) or 0)

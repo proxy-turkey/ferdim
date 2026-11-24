@@ -85,6 +85,9 @@ def _spec_from(params: dict, cfg: dict) -> JobSpec:
         user_agent=params.get("ua") or params.get("user_agent") or "",
         limit=util.parse_size(params.get("limit")) if params.get("limit") else 0,
         merkle=str(params.get("merkle") or "").strip()[:2048],
+        # ozel pencere isareti eklentiden gelir: kimlik bilgileri diske
+        # yazilmaz (kuyruk/gecmis). Duz HTTP istemcisi de gonderebilir.
+        ephemeral=bool(params.get("ephemeral")),
     )
 
 

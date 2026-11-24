@@ -6,12 +6,28 @@ import time
 
 from .. import util
 from ..coexist import DEFAULT_LATENCY, DEFAULT_THRESHOLD, LineMonitor
-from ..history import STATES as HISTORY_STATES, open_history
+from ..history import STATES as HISTORY_STATES, open_history, redact_credentials
 from ..paths import AppEnv
 from .job import DownloadJob, JobSpec, JobState
 
 QUEUE_FILE = "queue.json"
 STATES_RUNNING = (JobState.CONNECTING, JobState.DOWNLOADING)
+
+
+def _scrub_ephemeral(rec: dict) -> None:
+    """Ozel pencere isinin disk kaydindan kimlik bilgilerini siler.
+
+    Cerez, ozel istek basliklari (Authorization dahil), kullanici/parola ve
+    URL userinfo'su dusurulur; is yine saklanir ki yeniden baslatmada
+    kuyrukta gorunsun. Boyle bir is cerezsiz geri yuklenir: oturum
+    gerektiren kaynakta kimlik dogrulamasi basarisiz olabilir. Bu kabul
+    edilen davranistir - ozel pencere verisi diskte kalmamalidir.
+    """
+    rec["headers"] = {}
+    rec["cookies"] = ""
+    rec["user"] = ""
+    rec["password"] = ""
+    rec["url"] = redact_credentials(rec.get("url", ""))
 
 
 class QueueManager:
@@ -508,7 +524,7 @@ class QueueManager:
     def _save_locked(self):
         data = []
         for j in self.jobs:
-            data.append({
+            rec = {
                 "id": j.id, "url": j.url, "filename": j.final_filename,
                 # hedef klasor her zaman yazilir: varsayilan indirme
                 # klasoru degisse de is yeniden yuklenince yerini korur
@@ -528,7 +544,11 @@ class QueueManager:
                 "checksums": j.spec.wanted(),
                 "merkle": j.spec.merkle,
                 "limit": int(j.spec.limit or 0),
-            })
+                "ephemeral": bool(j.spec.ephemeral),
+            }
+            if rec["ephemeral"]:
+                _scrub_ephemeral(rec)
+            data.append(rec)
         util.atomic_write_json(self.env.state_dir / QUEUE_FILE, data)
 
     def _load(self):
@@ -557,6 +577,8 @@ class QueueManager:
                            if a not in ("sha256", "md5")},
                 limit=int(item.get("limit", 0) or 0),
                 merkle=str(item.get("merkle") or ""),
+                # ozel pencere kaydi cerezsiz saklanir (bkz. _scrub_ephemeral)
+                ephemeral=bool(item.get("ephemeral")),
             )
             job = DownloadJob(self.env, self.cfg, spec, job_id=item.get("id"))
             job.kind = item.get("kind", "http")
