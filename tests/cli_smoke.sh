@@ -28,7 +28,8 @@ PREV_DL=$(api config | python3 -c "import json,sys; print(json.dumps(json.load(s
 PREV_WD=$(api config | python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin)['config'].get('watch_dirs', [])))")
 PREV_TURBO=$(api stats | python3 -c "import json,sys; print(json.load(sys.stdin)['turbo'])")
 restore() {
-  api config "{\"config\":{\"download_dir\":$PREV_DL,\"watch_dirs\":$PREV_WD}}" > /dev/null
+  # ayarlar socket uzerinden (CLI): HTTP API ev dizini disina izin vermez
+  $f config --set "{\"download_dir\":$PREV_DL,\"watch_dirs\":$PREV_WD}" > /dev/null
   [ "$PREV_TURBO" = True ] && $f turbo on > /dev/null 2>&1 || $f turbo off > /dev/null 2>&1
   [ -z "${SRV_PID:-}" ] || kill "$SRV_PID" 2>/dev/null
   for j in $(sort -u "$MINE"); do [ -n "$j" ] && $f remove "$j" > /dev/null 2>&1; done
@@ -39,7 +40,7 @@ trap restore EXIT
 python3 "$REPO/tests/ui/srv.py" $S/www 0 > $S/srv.port 2>/dev/null & SRV_PID=$!
 for _ in $(seq 1 40); do [ -s $S/srv.port ] && break; sleep 0.1; done
 B="http://127.0.0.1:$(head -1 $S/srv.port)"
-r=$(api config "{\"config\":{\"download_dir\":\"$S/dl\"}}")
+r=$($f config --set "{\"download_dir\":\"$S/dl\"}" 2>&1)
 [ "$(api stats | python3 -c "import json,sys; print(json.load(sys.stdin)['download_dir'])")" = "$S/dl" ] && ok "indirme dizini ayari CANLI degisti (yeniden baslatma yok)" || bad "indirme dizini" "$(api stats | python3 -c "import json,sys; print(json.load(sys.stdin)['download_dir'])")"
 echo "dosya sunucusu: $B | $($f --version) | locale: $LANG"
 
