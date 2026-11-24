@@ -9,6 +9,8 @@
 </head>
 <body>
 <a class="skip" href="#jobPanel" data-i18n="skip_to_list">İndirmelere atla</a>
+<!-- Token yok: sayfa yalniz "nasil acilir" iletisini gosterir (app.js) -->
+<p id="noSession" class="noauth" role="alert" data-i18n="web_no_session" hidden></p>
 
 <header>
   <div class="brand">
@@ -223,7 +225,6 @@
   </div>
 </dialog>
 
-<script>window.FERDIM_TOKEN="__TOKEN__";</script>
 <script src="/app.js"></script>
 </body>
 </html>

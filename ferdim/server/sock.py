@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 import socketserver
 import threading
+
+MAX_RPC_LINE = 1024 * 1024   # tek satir istek: 1 MiB (bellek sinirsiz buyumesin)
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -11,13 +14,28 @@ class _Handler(socketserver.StreamRequestHandler):
         server: SockServer = self.server
         watcher = None
         try:
-            for line in self.rfile:
-                line = line.strip()
+            while True:
+                # satir sinirlidir: istemci sonlandirici gondermezse okuma
+                # 1 MiB + 1 baytta doner, baglanti too_large ile kapanir
+                raw = self.rfile.readline(MAX_RPC_LINE + 1)
+                if not raw:
+                    break
+                if len(raw) > MAX_RPC_LINE:
+                    try:
+                        self.wfile.write(b'{"ok":false,"code":"too_large"}\n')
+                        self.wfile.flush()
+                    except Exception:
+                        pass
+                    break
+                line = raw.strip()
                 if not line:
                     continue
                 try:
                     msg = json.loads(line)
                 except Exception:
+                    self.wfile.write(b'{"ok":false,"error":"gecersiz JSON"}\n')
+                    continue
+                if not isinstance(msg, dict):
                     self.wfile.write(b'{"ok":false,"error":"gecersiz JSON"}\n')
                     continue
                 cmd = msg.pop("cmd", "")
@@ -58,12 +76,17 @@ class SockServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.ctx = ctx
         self._watch_lock = threading.Lock()
         self._watchers: list = []
-        import os
         try:
             os.unlink(path)
         except FileNotFoundError:
             pass
-        super().__init__(path, _Handler)
+        # soket dosyasi umask'tan bagimsiz 0700 kipte dogar: baglama ile
+        # chmod arasinda dunyaya acik bir pencere kalmasin
+        old = os.umask(0o077)
+        try:
+            super().__init__(path, _Handler)
+        finally:
+            os.umask(old)
         os.chmod(path, 0o600)
         qm = ctx["qm"]
         qm.add_listener(self._on_change)

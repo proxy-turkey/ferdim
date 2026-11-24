@@ -1,8 +1,10 @@
 /* FerDim web arayuzu - cok dilli (tr/en/es/ru) + turbo.
  * Sunucudan gelen her metin (dosya adi, URL, hata) DOM'a yalniz
- * textContent / value ile yazilir; HTML ayristiran hicbir yol yoktur. */
+ * textContent / value ile yazilir; HTML ayristiran hicbir yol yoktur.
+ * Sayfa token tasimaz: adresteki tek kullanimlik bilet (#s=...) bir kez
+ * token'a cevrilir, token sekme omru boyunca sessionStorage'da durur. */
 "use strict";
-const TOKEN = window.FERDIM_TOKEN;
+let TOKEN = sessionStorage.getItem("ferdimToken") || "";
 const $ = (s) => document.querySelector(s);
 const CATS = ["video", "music", "compressed", "program", "document", "other"];
 const FINAL = new Set(["done", "error", "canceled"]);
@@ -74,6 +76,25 @@ async function loadLang(lang) {
   for (const r of hostRows.values()) r.root.remove();   // profil satirlari
   hostRows.clear();
   if (hostsDlg.open) loadHosts();
+}
+
+/* ------------------------------------------------------------------ oturum
+ * Bilet adresin #s=... kismindadir. Hemen adres cubugundan (ve gecmisten)
+ * silinir, sunucuda bir kez token'a cevrilir. Ayni sekmede yeniden yukleme
+ * sessionStorage'daki token ile calisir; yeni sekme yeni bilet ister. */
+async function claimSession() {
+  if (TOKEN) return TOKEN;
+  const m = /(?:^#|&)s=([^&]*)/.exec(location.hash || "");
+  if (!m) return "";
+  history.replaceState(null, "", location.pathname + location.search);
+  const r = await fetch("/api/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nonce: decodeURIComponent(m[1]) }),
+  }).then((x) => x.json()).catch(() => ({}));
+  if (!r || !r.ok || !r.token) return "";
+  sessionStorage.setItem("ferdimToken", r.token);
+  return r.token;
 }
 
 /* ------------------------------------------------------------- yardimcilar */
@@ -216,10 +237,19 @@ function updateGraphs() {
 }
 
 async function api(path, body) {
-  const opt = { headers: { "X-FerDim-Token": TOKEN } };
+  const headers = {};
+  if (TOKEN) headers["X-FerDim-Token"] = TOKEN;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const opt = { headers };
   if (body !== undefined) { opt.method = "POST"; opt.body = JSON.stringify(body); }
   const r = await fetch(path, opt);
-  if (r.status === 401) { location.reload(); return {}; }
+  if (r.status === 401) {
+    // token dondurulmus/gecersiz: sekmedeki kopyayi at, sayfa yeniden yuklenir
+    // ve "oturum baglantisi" iletisini gosterir (sonsuz dongu yok)
+    sessionStorage.removeItem("ferdimToken");
+    location.reload();
+    return {};
+  }
   return r.json();
 }
 
@@ -983,7 +1013,17 @@ $("#setSave").onclick = async () => {
 
 /* ---- baslangic ---- */
 (async () => {
+  TOKEN = await claimSession();
   await loadLang();
+  if (!TOKEN) {
+    // elde token yok: API'ye hic gidilmez, yalniz "nasil acilir" iletisi
+    const n = $("#noSession");
+    n.textContent = tr("web_no_session");
+    n.hidden = false;
+    $("#connState").textContent = "● " + tr("daemon_lost");
+    $("#connState").className = "conn bad";
+    return;
+  }
   const r = await api("/api/config").catch(() => ({}));
   if (r && r.config) cfg = r.config;
   await poll();

@@ -1,8 +1,12 @@
 """Komut tasiyicilari: socket ve HTTP sunucularinin ortak API katmani."""
 from __future__ import annotations
 
+import hmac
 import os
 import re
+import secrets
+import tempfile
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -446,6 +450,31 @@ def handle(ctx, cmd: str, params: dict) -> dict:
     if cmd == "version":
         from . import __version__
         return {"ok": True, "version": __version__}
+    if cmd in ("web-session", "token-rotate") and ctx.get("transport") == "http":
+        # Bu iki komut yalniz Unix soketinden gelir (ayni kullanici guveni).
+        # HTTP yol tablosunda yer almazlar; bu kapi tabloya ileride yanlislikla
+        # eklenirlerse de yetki yukseltmesine donusmemelerini garanti eder.
+        return {"ok": False, "error": f"bilinmeyen komut: {cmd}"}
+    if cmd == "web-session":
+        # Tarayici bileti: sayfada token yok, adres #s=<nonce> ile acilir.
+        port = ctx.get("web_port") or 0
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            port = 0
+        if port <= 0:
+            # web arayuzu kapali: tarayiciya verilecek bir sey yok
+            return {"ok": False, "code": "web_disabled",
+                    "error": "web arayuzu kapali"}
+        return {"ok": True,
+                "url": f"http://127.0.0.1:{port}/#s={web_access(ctx).mint()}"}
+    if cmd == "token-rotate":
+        # Donusum kosan sunucuda aninda etkilidir: HTTP katmani token'i her
+        # istekte paylasilan tutucudan okur, eski token 401 alir.
+        token = secrets.token_hex(16)
+        write_token(env.token_path, token)
+        web_access(ctx).set_token(token)
+        return {"ok": True}
     if cmd == "i18n":
         lang = params.get("lang") or cfg.get("language")
         return {"ok": True, "lang": detect_lang(lang), "strings": dict_for(
@@ -638,3 +667,96 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         qm.last_nm_ping = _t.time()
         return {"ok": True}
     return {"ok": False, "error": f"bilinmeyen komut: {cmd}"}
+
+
+# --------------------------------------------------------------- web erisimi
+# Web arayuzune iki ayri kimlik girer:
+#  1) kalici token (state/token, 0600): CLI, curl, eklenti, native host
+#  2) tek kullanimlik oturum bileti (nonce): tarayiciya verilir; 120 sn yasar,
+#     bir kez kullanilir ve POST /api/session ile token'a cevrilir.
+# Ikisi de ctx'te paylasilan TEK nesnede durur: daemon, Unix soketi ve HTTP
+# katmani ayni nesneyi gorur, boylece token donusumu kosan sunucuda aninda
+# etkili olur (eski token bir sonraki istekte 401 alir).
+WEB_SESSION_TTL = 120.0      # sn: bilet omru
+WEB_SESSION_MAX = 16         # ayni anda bekleyen bilet (eskisi dusurulur)
+_NONCE_MAXLEN = 128          # sabit zamanli karsilastirma maliyeti sinirli
+_WEB_INIT_LOCK = threading.Lock()
+
+
+class WebAccess:
+    """Token tutucusu + bilet deposu; her erisim ayni kilitten gecer."""
+
+    def __init__(self, token: str, clock=time.time):
+        self.lock = threading.Lock()
+        self.token = token
+        self.nonces: dict[str, float] = {}   # nonce -> son kullanma
+        self.clock = clock                   # testler saati enjekte eder
+
+    def set_token(self, token: str) -> None:
+        with self.lock:
+            self.token = token
+
+    def get_token(self) -> str:
+        with self.lock:
+            return self.token
+
+    def mint(self) -> str:
+        """Tek kullanimlik bilet; dolunca en eski bilet dusurulur."""
+        nonce = secrets.token_urlsafe(24)
+        now = self.clock()
+        with self.lock:
+            for k in [k for k, exp in self.nonces.items() if exp <= now]:
+                del self.nonces[k]
+            while len(self.nonces) >= WEB_SESSION_MAX:
+                del self.nonces[next(iter(self.nonces))]
+            self.nonces[nonce] = now + WEB_SESSION_TTL
+        return nonce
+
+    def consume(self, nonce) -> str:
+        """Bileti tuketir ve token dondurur; gecersiz/suresi dolmus bilet "".
+        Karsilastirma sabit zamanlidir ve tek kullanimliktir."""
+        if not isinstance(nonce, str) or not nonce or len(nonce) > _NONCE_MAXLEN:
+            return ""
+        want = nonce.encode("utf-8")
+        now = self.clock()
+        with self.lock:
+            for k in [k for k, exp in self.nonces.items() if exp <= now]:
+                del self.nonces[k]        # suresi gecmis bilet birikmesin
+            hit = next((k for k in self.nonces
+                        if hmac.compare_digest(k.encode(), want)), None)
+            if hit is None:
+                return ""
+            del self.nonces[hit]          # tek kullanimlik
+            return self.token
+
+
+def web_access(ctx) -> WebAccess:
+    """ctx'teki paylasilan WebAccess; ilk cagrida token dosyasindan kurulur."""
+    st = ctx.get("web_access")
+    if st is not None:
+        return st
+    with _WEB_INIT_LOCK:
+        st = ctx.get("web_access")
+        if st is None:
+            try:
+                token = ctx["env"].token_path.read_text("utf-8").strip()
+            except OSError:
+                token = ""
+            st = WebAccess(token)
+            ctx["web_access"] = st
+        return st
+
+
+def write_token(path, token: str) -> None:
+    """Token'i 0600 izinli gecici dosyaya yazip atomik olarak yerine tasir:
+    yarim token ya da genis izinli dosya okuyucuya gorunmez."""
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".token-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(token)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise

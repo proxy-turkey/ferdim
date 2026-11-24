@@ -155,11 +155,53 @@ class RpcNativeTests(unittest.TestCase):
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 401)
 
-        # ana sayfa token'i gomuluyor
+        # ana sayfa token GOMMEZ: tarayici tek kullanimlik biletle acilir
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/") as r:
             html = r.read().decode()
-        self.assertIn(token, html)
+        self.assertNotIn(token, html)
         self.assertNotIn("__TOKEN__", html)
+        self.assertNotIn("FERDIM_TOKEN", html)
+
+        # `ferdim web` akisi: soketten bilet, HTTP'de tek kullanimlik takas
+        with self._client() as c:
+            r = c.request("web-session")
+        self.assertTrue(r.get("ok"), r)
+        self.assertEqual(r["url"].split("/#s=")[0], f"http://127.0.0.1:{port}")
+        nonce = r["url"].split("#s=", 1)[1]
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/session",
+            data=json.dumps({"nonce": nonce}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as resp:
+            minted = json.loads(resp.read())["token"]
+        self.assertEqual(minted, token)          # bilet gercek token'i verdi
+        # bilet tek kullanimlik: ikinci takas 403
+        try:
+            urllib.request.urlopen(req)
+            self.fail("403 bekleniyordu")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 403)
+
+        # token donusumu kosan daemon'da aninda gecerli olur
+        with self._client() as c:
+            self.assertTrue(c.request("token-rotate")["ok"])
+        new = (root / "token").read_text().strip()
+        self.assertNotEqual(new, token)
+        old = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/stats",
+            headers={"X-FerDim-Token": token})
+        try:
+            urllib.request.urlopen(old)
+            self.fail("eski token 401 almaliydi")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 401)
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/stats",
+            headers={"X-FerDim-Token": new})
+        with urllib.request.urlopen(req) as r:
+            self.assertIn(b'"jobs"', r.read())
+        # sonraki testler (native host) token dosyasini okumaz, ama daemon'in
+        # token'i artik yeni degerdir; testleri etkilemez.
 
     def test_04_native_host_protocol(self):
         p = subprocess.Popen(
