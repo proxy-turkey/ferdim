@@ -68,6 +68,7 @@ def _spec_from(params: dict, cfg: dict) -> JobSpec:
         referer=params.get("referer") or params.get("page") or "",
         user_agent=params.get("ua") or params.get("user_agent") or "",
         limit=util.parse_size(params.get("limit")) if params.get("limit") else 0,
+        merkle=str(params.get("merkle") or "").strip()[:2048],
     )
 
 
@@ -168,7 +169,7 @@ def _add_metalink_items(ctx, items: list, base: dict) -> dict:
     dizin, kimlik, hiz limiti gibi ayarlar her dosyaya tasinir."""
     keep = {k: v for k, v in (base or {}).items()
             if k not in ("url", "filename", "mirrors", "sha256", "md5",
-                         "sha1", "sha512", "checksums", "checksum")}
+                         "sha1", "sha512", "checksums", "checksum", "merkle")}
     ids, first = [], None
     for it in items[:MAX_METALINK_FILES]:
         r = handle(ctx, "add", {

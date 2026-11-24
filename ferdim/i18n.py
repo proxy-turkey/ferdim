@@ -138,6 +138,25 @@ S = {
     "cli_added":     {"en": "added", "tr": "eklendi", "es": "añadida", "ru": "добавлено"},
     "cli_queue_empty": {"en": "queue is empty", "tr": "kuyruk boş", "es": "la cola está vacía", "ru": "очередь пуста"},
     "cli_file":      {"en": "file", "tr": "dosya", "es": "archivo", "ru": "файл"},
+    "merkle_manifest": {"en": "manifest", "tr": "bildirim", "es": "manifiesto", "ru": "манифест"},
+    "merkle_chunks": {"en": "chunks", "tr": "parça", "es": "fragmentos", "ru": "фрагментов"},
+    "merkle_root":   {"en": "root", "tr": "kök", "es": "raíz", "ru": "корень"},
+    "merkle_ok": {
+        "en": "manifest verified", "tr": "bildirim doğrulandı",
+        "es": "manifiesto verificado", "ru": "манифест подтверждён"},
+    "merkle_bad": {
+        "en": "{n} corrupted chunks", "tr": "{n} bozuk parça",
+        "es": "{n} fragmentos corruptos", "ru": "{n} повреждённых фрагментов"},
+    "merkle_size_bad": {
+        "en": "size does not match the manifest",
+        "tr": "boyut bildirimle uyuşmuyor",
+        "es": "el tamaño no coincide con el manifiesto",
+        "ru": "размер не совпадает с манифестом"},
+    "merkle_update": {
+        "en": "{reused} kept from the local file, {fetched} fetched",
+        "tr": "{reused} yerelden korundu, {fetched} indirildi",
+        "es": "{reused} conservados del archivo local, {fetched} descargados",
+        "ru": "{reused} взято из локального файла, {fetched} загружено"},
     "cli_error":     {"en": "ERROR", "tr": "HATA", "es": "ERROR", "ru": "ОШИБКА"},
     "cli_daemon_fail": {
         "en": "FerDim daemon could not be started.",
@@ -310,6 +329,16 @@ S = {
         "tr": "indirme başarısız oldu (bilinmeyen neden)",
         "es": "la descarga falló (motivo desconocido)",
         "ru": "загрузка не удалась (неизвестная причина)"},
+    "err_merkle_mismatch": {
+        "en": "content-defined chunk verification failed: some byte ranges do not match the manifest",
+        "tr": "parça doğrulaması başarısız: bazı bayt aralıkları bildirimle uyuşmuyor",
+        "es": "la verificación por fragmentos falló: algunos rangos no coinciden con el manifiesto",
+        "ru": "проверка по фрагментам не удалась: часть диапазонов не совпадает с манифестом"},
+    "err_merkle_manifest": {
+        "en": "the Merkle manifest could not be read or is invalid",
+        "tr": "Merkle bildirimi okunamadı ya da geçersiz",
+        "es": "no se pudo leer el manifiesto Merkle o no es válido",
+        "ru": "манифест Merkle не прочитан или недействителен"},
     # --------------------------------------------------------------- gecmis
     "hist_title": {
         "en": "History", "tr": "Geçmiş", "es": "Historial", "ru": "История"},

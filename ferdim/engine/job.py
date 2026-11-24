@@ -20,7 +20,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from .. import util
+from .. import cdc, util
 from ..paths import AppEnv
 from ..profiles import host_key, open_profiles
 from ..ratelimit import TokenBucket
@@ -34,6 +34,7 @@ RATE_WINDOW = 2.0          # kaynak hizi olcum penceresi (sn)
 SIDECAR_ALGOS = ("sha256", "sha512", "md5", "sha1")   # en gucluden
 SIDECAR_WAIT = 5.0         # sn: bitiste henuz aranan yan dosya bu kadar beklenir
 PROFILE_MIN_BYTES = 1 << 20   # daha az aktarim profil ogrenmek icin yetersiz
+MERKLE_REPAIR_MAX = 2      # bozuk parca onarim turu (sonra merkle_mismatch)
 
 
 def backoff_delay(attempt: int, cap: float = 15.0,
@@ -112,6 +113,10 @@ class SourceInvalid(Exception):
         self.code = code
 
 
+class MerkleError(Exception):
+    """Acikca verilen merkle bildirimi okunamadi/gecersiz (kalici hata)."""
+
+
 _SRC_CODES = {           # kaynak basarisizlik nedeni -> kararli hata kodu
     "gone": "not_found", "conn": "network", "stall": "stall",
     "reset": "network", "read": "network", "http": "unknown",
@@ -136,6 +141,8 @@ def _code_for(e: BaseException) -> str:
         return _code_for(r) if isinstance(r, BaseException) else "network"
     if isinstance(e, (SourceInvalid, ftp.FtpError, socks.SocksError)):
         return e.code
+    if isinstance(e, MerkleError):
+        return "merkle_manifest"
     if isinstance(e, (TimeoutError, ConnectionError)):
         return "network"
     if isinstance(e, OSError):
@@ -213,6 +220,7 @@ class JobSpec:
     sha256: str = ""   # bitiste dogrulanir
     md5: str = ""
     checksums: dict = field(default_factory=dict)  # digerleri: sha1, sha512...
+    merkle: str = ""   # .ferdim-merkle bildirimi: URL ya da yerel yol
 
     def wanted(self) -> dict:
         """{algoritma: beklenen ozet} - acikca istenen saglamalar."""
@@ -325,6 +333,8 @@ class DownloadJob:
         self._srcs: list[_Src] = []
         self._vsrc = ""            # ETag/Last-Modified hangi kaynaktan geldi
         self._sidecar: dict = {}   # otomatik bulunan saglama degerleri
+        self._merkle = None        # cdc.Manifest: parca bazli dogrulama
+        self._merkle_tries = 0     # yapilan parca onarim turu
         self._sc_lock = threading.Lock()   # yan dosya <-> bitis el skmasmasi
         self._finalized = threading.Event()
         self._dir: Path | None = None    # hedef klasor: ilk erisimde sabitlenir
@@ -445,6 +455,7 @@ class DownloadJob:
                 "segments_effective": self._allowed,
                 "adaptive": self.extra.get("adaptive"),
                 "checksum": self.extra.get("checksum", ""),
+                "merkle": self.extra.get("merkle", ""),
                 "verified": list(self.extra.get("verified", [])),
                 "mirrors": len(self.spec.mirrors or []),
                 "mirror_health": [
@@ -476,6 +487,7 @@ class DownloadJob:
             self._stop.clear()
             self.error = ""
             self.error_code = ""
+            self._merkle_tries = 0      # elle yeniden deneme yeni butce verir
             self.state = JobState.CONNECTING
             self._reset_sources()
         self._changed()
@@ -648,6 +660,7 @@ class DownloadJob:
             self._stall = max(5, min(120, int(self.cfg.get("stall_timeout", 20))))
         except (TypeError, ValueError):
             self._stall = 20
+        self._load_merkle(opt)
         self._start_sidecar(opt)
 
     def _fresh_start(self, p: httpcli.ProbeResult):
@@ -697,7 +710,11 @@ class DownloadJob:
         self.done = part if size < 0 else min(part, size)
 
     # ---------------------------------------------------------------- workers
-    def _spawn(self):
+    def _start_workers(self):
+        """Isci havuzunu (yeniden) kurar; monitor'e dokunmaz.
+
+        Parca onarimi ayni monitor dongusunde yeni araliklarla cagirir:
+        ikinci bir monitor baslatmak bitisi iki kez tetiklerdi."""
         n = max(1, min(int(self.spec.segments), 32))
         with self._lock:
             self._spawned_n = n
@@ -709,6 +726,9 @@ class DownloadJob:
                                  name=f"ferdim-{self.id}-{i}")
             t.start()
             self._threads.append(t)
+
+    def _spawn(self):
+        self._start_workers()
         # monitor EN SON yayinlanir: panelde gorunen durum ile join edilecek
         # halka ayni kusaga ait olsun (pause/cancel _start_done'dan sonra
         # okur, o yuzden atama sirasi onemli).
@@ -1562,24 +1582,51 @@ class DownloadJob:
         return (0.0, False)
 
     # -------------------------------------------------------- saglama (yan dosya)
+    def _load_merkle(self, opt) -> None:
+        """Acikca verilen merkle bildirimini cozer (URL ya da yerel yol).
+
+        Sessizce yok sayilmaz: kullanici parca dogrulamasi istedi, bildirim
+        okunamiyorsa is merkle_manifest koduyla biter."""
+        want = str(self.spec.merkle or "").strip()
+        if not want:
+            return
+        try:
+            if want.startswith(("http://", "https://")):
+                text = httpcli.fetch_small(
+                    want, opt, timeout=min(max(int(opt.timeout), 2), 8),
+                    limit=cdc.MAX_MANIFEST)
+            else:
+                text = Path(want).expanduser().read_text("utf-8", "replace")
+            self._merkle = cdc.Manifest.parse(text)
+        except Exception as e:
+            raise MerkleError(f"merkle bildirimi okunamadi: {e}") from e
+
     def _start_sidecar(self, opt):
-        """Yan dosya saglamasi: <url>.sha256 / .md5 / .sha512 / .sha1 arka
-        planda aranir; bulunursa indirme bitince otomatik dogrulanir.
-        Acikca verilmis saglamalar eksikse calisir; isi asla yavaslutmaz."""
+        """Yan dosya saglamasi: <url>.ferdim-merkle ve <url>.sha256 / .md5 /
+        .sha512 / .sha1 arka planda aranir; bulunanla indirme bitince
+        dogrulanir ve merkle bildirimi varsa yalnizca bozuk parcalar yeniden
+        iner. Acikca verilmis saglamalar eksikse calisir; isi yavaslatmaz."""
         self._sidecar = {}
         self._sidecar_t = None
-        if not self.cfg.get("checksum_sidecar", True) or self._stop.is_set():
+        if self._stop.is_set():
             return
-        if all(a in self.spec.wanted() for a in SIDECAR_ALGOS):
+        on = bool(self.cfg.get("checksum_sidecar", True))
+        algos = on and not all(a in self.spec.wanted() for a in SIDECAR_ALGOS)
+        merkle = on and not self.spec.merkle and self._merkle is None
+        if not algos and not merkle:
             return
         self._sidecar_t = threading.Thread(
-            target=self._sidecar_loop, args=(opt,), daemon=True,
+            target=self._sidecar_loop, args=(opt, algos, merkle), daemon=True,
             name=f"ferdim-{self.id}-sidecar")
         self._sidecar_t.start()
 
-    def _sidecar_loop(self, opt):
+    def _sidecar_loop(self, opt, algos: bool = True, merkle: bool = True):
         name = self.final_filename or util.filename_from_url(self.url)
         explicit = self.spec.wanted()
+        if merkle:
+            self._merkle_sidecar(opt)
+        if not algos:
+            return
         for algo in SIDECAR_ALGOS:           # en gucluden zayifa
             if algo in explicit or self._stop.is_set():
                 continue
@@ -1598,6 +1645,24 @@ class DownloadJob:
                     if late:
                         self._verify_late({algo: digest})   # geciken yan dosya
                     return                 # en guclu bulunani yeter
+
+    def _merkle_sidecar(self, opt) -> None:
+        """Yayincinin dosya yanina koydugu `.ferdim-merkle` bildirimini arar.
+        Bulunamaz/bozuksa yalnizca parca onarimi yapilmaz; indirme etkilenmez.
+        Is bittikten sonra bulunan bildirim onarim penceresi kapandigi icin
+        yok sayilir (gec gelen yan dosya dosyayi hatali yapmaz)."""
+        try:
+            text = httpcli.fetch_small(
+                util.url_sibling(self.url, cdc.SUFFIX), opt,
+                timeout=min(max(int(opt.timeout), 2), 8),
+                limit=cdc.MAX_MANIFEST)
+            man = cdc.Manifest.parse(text)
+        except Exception:
+            return
+        with self._sc_lock:
+            if self._finalized.is_set():
+                return
+            self._merkle = man
 
     # --------------------------------------------------------------- monitor
     def _monitor_loop(self):
@@ -1642,7 +1707,8 @@ class DownloadJob:
                 self._do_restart()
                 return
             if not alive and empty:
-                self._finish()
+                if self._finish():
+                    continue        # onarim araliklari kuyruga girdi
                 return
 
     def _run_hls(self):
@@ -1820,12 +1886,59 @@ class DownloadJob:
         self._changed()
         self._spawn()
 
-    def _finish(self):
+    def _finish(self) -> bool:
+        """Bitirir. True: merkle onarim araliklari kuyruga girdi (monitor
+        dongusu devam eder, is DONE sayilmaz)."""
         with self._lock:
             if self.total >= 0 and self.done < self.total:
                 self._fail("eksik veri", "size_mismatch")
-                return
+                return False
+        if self._merkle_repair():
+            return True
         self._finalize_file()
+        return False
+
+    def _merkle_repair(self) -> bool:
+        """Merkle bildirimi varsa YALNIZCA bozuk parcalari yeniden indirir.
+
+        Araliklar mevcut kuyruk mekanizmasiyla iner: If-Range dogrulayicisi
+        korunur, kaynak degistiyse normal restart yolu devreye girer. Onarim
+        turu MERKLE_REPAIR_MAX ile sinirlidir; asilirsa is bitis
+        dogrulamasinda merkle_mismatch ile hata olur (dosya silinmez)."""
+        man = self._merkle
+        if man is None or self.kind != "http" or self.extra.get("no_ranges"):
+            return False
+        t = getattr(self, "_sidecar_t", None)
+        if t is not None and t.is_alive():
+            # merkle yan dosyasi henuz araniyor olabilir: bitis dogrulamasi
+            # nasil bekliyorsa onarim karari da ayni pencereyi bekler
+            t.join(timeout=SIDECAR_WAIT)
+        if self._fd is None or not self.part_path.exists():
+            return False
+        size_ok, bad = cdc.verify_file(self.part_path, man)
+        if not size_ok:
+            return False              # boyut: aralikla onarilamaz
+        if not bad:
+            if self._merkle_tries:
+                self.extra["merkle"] = "repaired"
+            else:
+                self.extra["merkle"] = "ok"
+            return False
+        if self._merkle_tries >= MERKLE_REPAIR_MAX:
+            return False              # bitis dogrulamasi hatayi yazar
+        self._merkle_tries += 1
+        need = sum(ln for _, ln in bad)
+        self.extra["merkle"] = "repairing"
+        self.extra["merkle_repaired_bytes"] = int(
+            self.extra.get("merkle_repaired_bytes", 0)) + need
+        with self._lock:
+            self._pending = [(off, off + ln - 1) for off, ln in bad]
+            self._inflight.clear()
+            self.done = max(0, self.done - need)
+        self.state = JobState.DOWNLOADING
+        self._changed()
+        self._start_workers()
+        return True
 
     def _finalize_file(self):
         try:
@@ -1858,6 +1971,8 @@ class DownloadJob:
                 found = dict(self._sidecar)
                 self._finalized.set()
             self._verify(dest, found)
+            if self.state != JobState.ERROR:
+                self._verify_merkle(dest)
             self.extra.pop("verifying", None)
             if self.state != JobState.ERROR:
                 self.state = JobState.DONE
@@ -1898,6 +2013,34 @@ class DownloadJob:
             self.extra["checksum_note"] = bad_found[0]
         else:
             self.extra["checksum"] = "ok"
+
+    def _verify_merkle(self, dest: Path) -> None:
+        """Parca bazli (Merkle) dogrulama: bozuk parca varsa is HATA olur ve
+        hata hangi bayt araliklarinin bozuk oldugunu soyler. Dosya silinmez;
+        kullanici `ferdim merkle update` ile yalnizca o parcalari onarabilir."""
+        man = self._merkle
+        if man is None:
+            return
+        size_ok, bad = cdc.verify_file(dest, man)
+        if size_ok and not bad:
+            self.extra.setdefault("merkle", "ok")
+            self.extra["verified"] = sorted(
+                set(self.extra.get("verified", [])) | {"merkle"})
+            return
+        self.extra["merkle"] = "mismatch"
+        self.state = JobState.ERROR
+        self.error_code = "merkle_mismatch"
+        if not size_ok:
+            try:
+                got = dest.stat().st_size
+            except OSError:
+                got = -1
+            self.error = (f"merkle boyut uyusmazi: beklenen {man.size}, "
+                          f"gelen {got}")
+        else:
+            off, ln = bad[0]
+            self.error = (f"merkle uyusmazi: {len(bad)} bozuk parca, "
+                          f"ilk {off}-{off + ln - 1}")
 
     def _verify_late(self, found: dict) -> None:
         """Is bittikten sonra bulunan yan dosya: dosya yerinde, yalnizca

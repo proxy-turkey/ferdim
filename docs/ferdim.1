@@ -54,6 +54,9 @@ in one pass; an invalid value is rejected),
 .BI \-\-checksum " ALGO:HEX"
 any supported digest (sha256, sha512, md5, sha1); the algorithm may be
 omitted when it is unambiguous from the digest length,
+.BI \-\-merkle " URL|FILE"
+per-chunk integrity manifest (\fB.ferdim-merkle\fR, see \fBmerkle\fR below);
+only the byte ranges of chunks that fail verification are fetched again,
 .BI \-\-limit " RATE"
 per-job speed limit (e.g. 2MB; KB, MB and GB are 1024-based),
 .B \-k
@@ -106,6 +109,25 @@ capacity) for a few seconds, every job gives up half of its connections (at
 least one stays) and the governor stops probing upwards; after ten quiet
 seconds the cap is released and links are rebuilt. The footer of the web UI
 shows the state.
+.TP
+.BI merkle " make FILE"
+Write \fIFILE.ferdim-merkle\fR: content-defined (FastCDC, 256 KiB / 1 MiB /
+4 MiB) chunk offsets, a SHA-256 per chunk and the Merkle root over the
+chunk hashes. A publisher can host the manifest next to the file like a
+\&.sha256 sidecar; a downloader picks up \fI<url>.ferdim-merkle\fR
+automatically.
+.TP
+.BI merkle " verify FILE [MANIFEST]"
+Re-hash the chunks listed in the manifest (default \fIFILE.ferdim-merkle\fR)
+and report either the matching root or the byte ranges of the corrupted
+chunks. Verification reads the file once; chunking is not re-run.
+.TP
+.BI merkle " update FILE URL \-\-manifest " MANIFEST
+Build the new version of \fIURL\fR by keeping every chunk whose bytes already
+exist in \fIFILE\fR (content-defined boundaries make this robust to
+insertions) and fetching only the missing byte ranges with HTTP Range. The
+result is verified chunk by chunk and only then moved over the target
+(\fB\-o\fR picks another target).
 .TP
 .BI config " [\-\-set JSON]"
 Show or change settings: segments, concurrency, scheduler window and
