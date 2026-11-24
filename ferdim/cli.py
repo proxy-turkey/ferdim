@@ -227,6 +227,59 @@ def cmd_history(a, env):
     return 0
 
 
+def cmd_archive(a, env):
+    """Arsiv komutlari: listele, secmeli cikar, yarim kalan cikarmayi onar."""
+    with _client(env) as c:
+        if a.action == "list":
+            r = c.request("archive-list", id=a.id, nested=bool(a.nested))
+            if not r.get("ok"):
+                print(_("cli_error") + ":", r.get("error", ""), file=sys.stderr)
+                return 1
+            for e in r.get("entries") or []:
+                mark = "*" if e.get("kind") != "file" else " "
+                print(f"{mark} {util.human_size(e.get('size') or 0):>10}  "
+                      f"{e.get('path', '')}")
+            if r.get("note"):
+                print(r["note"])
+            return 0
+        if a.action == "extract":
+            r = c.request("archive-extract", id=a.id, members=a.members,
+                          dest=a.dest or "")
+        else:
+            r = c.request("archive-repair", id=a.id, dest=a.dest or "")
+        if not r.get("ok"):
+            if r.get("code") == "no_manifest":
+                print(_("zip_nomf"), file=sys.stderr)
+            else:
+                print(_("cli_error") + ":", r.get("error", ""), file=sys.stderr)
+            return 1
+        while True:
+            time.sleep(0.3)
+            st = c.request("archive-status", task=r.get("task", ""))
+            if not st.get("ok"):
+                print(_("cli_error") + ":", st.get("error", ""), file=sys.stderr)
+                return 1
+            if st.get("state") == "running":
+                if st.get("total"):
+                    sys.stdout.write("\r" + _("zip_running", done=st.get("done", 0),
+                                              total=st.get("total", 0)) + "   ")
+                    sys.stdout.flush()
+                continue
+            sys.stdout.write("\r" + " " * 48 + "\r")
+            res = st.get("result") or {}
+            if st.get("state") != "done":
+                errs = res.get("errors") or []
+                msg = st.get("error") or (errs[0] if errs else "")
+                print(_("zip_failed", e=msg), file=sys.stderr)
+                return 1
+            print(_("zip_repaired" if res.get("repair") else "zip_extracted",
+                    n=res.get("extracted", 0), dest=res.get("dest", "")))
+            errs = res.get("errors") or []
+            if errs:
+                print(_("zip_errors", n=len(errs), e=errs[0]))
+            return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ferdim",
@@ -310,6 +363,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--older-than", type=int, metavar="DAYS",
                     help="--clear ile: yalniz bu gunden eski kayitlar")
     sp.set_defaults(fn=cmd_history)
+
+    sp = sub.add_parser("archive",
+                        help="arsiv icerigi: listele, cikar, onar")
+    asp = sp.add_subparsers(dest="action", required=True)
+    for act, hlp in (("list", "icerigi listele"),
+                     ("extract", "secilenleri cikar"),
+                     ("repair", "yarim kalan cikarmayi onar")):
+        one = asp.add_parser(act, help=hlp)
+        one.add_argument("id", help="is kimligi")
+        one.add_argument("--dest", help="hedef dizin (varsayilan: arsiv yaninda)")
+        if act == "list":
+            one.add_argument("--nested", action="store_true",
+                             help="ic arsivleri de listele")
+        elif act == "extract":
+            one.add_argument("members", nargs="*",
+                             help="uye yollari (bos = tumu)")
+        one.set_defaults(fn=cmd_archive)
 
     sp = sub.add_parser("daemon", help="arka plan servisini on planda calistir")
     sp.set_defaults(fn=cmd_daemon)

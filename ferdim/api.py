@@ -214,6 +214,40 @@ def _add_local_file(ctx, path) -> dict:
     return {"ok": True, "ids": ids, "count": len(ids)}
 
 
+def _archive_cmd(qm, cmd: str, params: dict) -> dict:
+    """Arsiv komutlari: listeleme, secmeli cikarma, onarim ve gorev durumu.
+    Cikarma arka planda calisir; istemci 'archive-status' ile izler."""
+    from . import archive
+    if cmd == "archive-status":
+        return archive.task_status(str(params.get("task") or ""))
+    job = qm.get(str(params.get("id") or ""))
+    if not job or job.state != "done":
+        return {"ok": False, "error": "is yok"}
+    path = job.final_path
+    if cmd == "archive-list":
+        try:
+            info = archive.describe(path, nested=bool(params.get("nested")))
+        except archive.ArchiveError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "filename": job.final_filename,
+                "format": info["format"], "entries": info["entries"],
+                "note": info["note"]}
+    dest = archive.default_dest(path, params.get("dest"))
+    if cmd == "archive-repair":
+        if not archive.has_manifest(dest):
+            return {"ok": False, "code": "no_manifest",
+                    "error": "cikarma kaydi yok"}
+        snap = archive.start_extract(path, [], dest, repair=True)
+        return {"ok": True, "task": snap["id"], "dest": snap["dest"],
+                "state": snap["state"]}
+    members = params.get("members") or []
+    if not isinstance(members, list):
+        return {"ok": False, "error": "gecersiz uye listesi"}
+    snap = archive.start_extract(path, [str(m) for m in members], dest)
+    return {"ok": True, "task": snap["id"], "dest": snap["dest"],
+            "state": snap["state"]}
+
+
 def handle(ctx, cmd: str, params: dict) -> dict:
     """ctx: {qm, env, cfg, set_cfg} sozlugu; yanit sozlugu dondurur."""
     qm, env, cfg = ctx["qm"], ctx["env"], ctx["cfg"]
@@ -237,6 +271,9 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         return {"ok": True, "turbo": state}
     if cmd == "stats" or cmd == "list" or cmd == "jobs":
         return {"ok": True, **qm.stats()}
+    if cmd in ("archive-list", "archive-extract", "archive-repair",
+               "archive-status"):
+        return _archive_cmd(qm, cmd, params)
     if cmd == "zip-preview":
         job = qm.get(params.get("id", ""))
         if not job or job.state != "done":

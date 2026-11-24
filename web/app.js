@@ -11,6 +11,7 @@ const ACTIONS = [["resume", "act_resume", "▶"], ["pause", "act_pause", "⏸"],
                  ["restart", "act_restart", "↻"], ["zip", "zip_title", "📦"],
                  ["remove", "act_remove", "🗑"]];
 const DIGEST_LEN = { sha256: 64, sha512: 128, md5: 32, sha1: 40 };
+const ARCH_RE = /\.(zip|tar|tgz|tbz2|txz|tar\.(gz|xz|bz2|zst))$/i;
 const HIST_MAX = 240;       // 500 ms tarama -> 2 dakikalik grafik penceresi
 const HIST_SEC = 120;       // HIST_MAX * 0.5 sn
 
@@ -338,7 +339,7 @@ function updateRow(r, j) {
     !["paused", "error", "queued", "canceled"].includes(j.state);
   r.btn.pause.hidden = !playing;
   r.btn.zip.hidden =
-    !(j.state === "done" && /\.zip$/i.test(j.filename || ""));
+    !(j.state === "done" && ARCH_RE.test(j.filename || ""));
 }
 
 /* anahtarli guncelleme: satirlar yerinde degisir, klavye odagi korunur */
@@ -434,24 +435,94 @@ async function poll() {
   render(); renderStatus(); announce(); updateGraphs();
 }
 
+/* --------------------------------------------------------------- arsiv */
+/* Panel: ic ice listeleme, secmeli cikarma ve onarim. Ilerleme
+ * archive-status yoklamasiyla gelir; tum metin textContent ile yazilir. */
+let zipJob = "";
+let zipTask = 0;
+
+function zipStatus(text) {
+  const n = $("#zipStatus");
+  n.textContent = text;
+  n.hidden = !text;
+}
+
+function zipPoll() {
+  if (!zipTask) return;
+  const task = zipTask;
+  api("/api/archive-status", { task }).then((s) => {
+    if (!zipTask || zipTask !== task) return;
+    if (!s.ok) {
+      zipTask = 0;
+      zipStatus(trf("zip_failed", { e: s.error || "" }));
+      return;
+    }
+    if (s.state === "running") {
+      zipStatus(trf("zip_running", { done: s.done || 0, total: s.total || 0 }));
+      setTimeout(zipPoll, 400);
+      return;
+    }
+    zipTask = 0;
+    const res = s.result || {};
+    const errs = res.errors || [];
+    if (s.state === "done" && res.ok) {
+      const key = res.repair ? "zip_repaired" : "zip_extracted";
+      let text = trf(key, { n: res.extracted || 0, dest: res.dest || "" });
+      if (errs.length)
+        text += " — " + trf("zip_errors", { n: errs.length, e: errs[0] });
+      zipStatus(text);
+    } else {
+      zipStatus(trf("zip_failed", { e: s.error || (errs[0] || "") }));
+    }
+  }).catch(() => { zipTask = 0; });
+}
+
+async function zipExtract() {
+  const members = Array.from(
+    document.querySelectorAll("#zipList input.zsel:checked")).map((n) => n.value);
+  if (!members.length) { zipStatus(tr("zip_sel_none")); return; }
+  const r = await api("/api/archive-extract", { id: zipJob, members });
+  if (!r.ok) { zipStatus(trf("zip_failed", { e: r.error || "" })); return; }
+  zipTask = r.task;
+  zipPoll();
+}
+
+async function zipRepair() {
+  const r = await api("/api/archive-repair", { id: zipJob });
+  if (!r.ok) {
+    zipStatus(r.code === "no_manifest" ? tr("zip_nomf")
+      : trf("zip_failed", { e: r.error || "" }));
+    return;
+  }
+  zipTask = r.task;
+  zipPoll();
+}
+
 /* ----------------------------------------------------------------- eylemler */
 async function act(kind, id) {
   if (kind === "remove") {
     if (!confirm(tr("confirm_remove"))) return;
     await api("/api/remove", { id, delete_files: true });
   } else if (kind === "zip") {
-    const r = await api("/api/zip-preview", { id });
+    const r = await api("/api/archive-list", { id, nested: true });
     if (!r.ok) { alert(tr("zip_title") + ": " + (r.error || "")); return; }
+    zipJob = id; zipTask = 0;
+    zipStatus("");
     const list = $("#zipList");
     list.replaceChildren();
-    $("#zipTitle").textContent = `${tr("zip_title")} — ${r.filename} (${
-      r.entries.length}${r.note || ""})`;
-    for (const [name, size] of r.entries.slice(0, 400)) {
-      list.append(dom("div", { class: "ziprow", role: "listitem" },
-        dom("span", { class: "n", text: name }),
-        dom("span", { class: "s", text: human(size) })));
+    const files = (r.entries || []).filter((e) => e.kind === "file");
+    $("#zipTitle").textContent =
+      `${tr("zip_title")} — ${r.filename} (${files.length}${r.note || ""})`;
+    for (const e of files.slice(0, 400)) {
+      const box = dom("input", { type: "checkbox", class: "zsel",
+        value: e.key, "aria-label": tr("zip_select") + ": " + e.path });
+      list.append(dom("div", {
+        class: "ziprow" + (e.depth > 1 ? " nested" : ""), role: "listitem" },
+        box,
+        dom("span", { class: "n", text: e.path }),
+        dom("span", { class: "s", text: human(e.size) })));
     }
-    if (!r.entries.length)
+    if (!files.length)
       list.append(dom("div", { class: "dim", text: tr("zip_empty") }));
     $("#zipDlg").showModal();
     return;
@@ -460,7 +531,9 @@ async function act(kind, id) {
   }
   poll();
 }
-$("#zipClose").onclick = () => $("#zipDlg").close();
+$("#zipClose").onclick = () => { zipTask = 0; $("#zipDlg").close(); };
+$("#zipExtract").onclick = zipExtract;
+$("#zipRepair").onclick = zipRepair;
 
 /* --------------------------------------------------------------- gecmis */
 /* Sunucudaki SQLite gecmisi: arama, istatistik ve yeniden indirme. Satirlar

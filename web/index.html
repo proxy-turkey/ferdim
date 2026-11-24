@@ -187,9 +187,12 @@
 
 <dialog id="zipDlg" aria-labelledby="zipTitle">
   <h2 id="zipTitle" data-i18n="zip_title">Arşiv içeriği</h2>
-  <div id="zipList" class="ziplist" role="list"></div>
+  <div id="zipList" class="ziplist" role="list" data-i18n-aria="zip_title"></div>
+  <p id="zipStatus" class="dim" role="status" aria-live="polite" hidden></p>
   <div class="dlg-actions">
-    <button type="button" class="btn primary" id="zipClose" data-i18n="btn_close">Kapat</button>
+    <button type="button" class="btn ghost" id="zipRepair" data-i18n="zip_repair">Çıkarmayı onar</button>
+    <button type="button" class="btn ghost" id="zipClose" data-i18n="btn_close">Kapat</button>
+    <button type="button" class="btn primary" id="zipExtract" data-i18n="zip_extract">Seçilenleri çıkar</button>
   </div>
 </dialog>
 
