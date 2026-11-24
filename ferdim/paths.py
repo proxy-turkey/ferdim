@@ -56,6 +56,16 @@ DEFAULTS = {
     # eslesmezse azami guc. Elle verilen limit plani ezer ('limit plan').
     "speed_plan": [],
     "speed_plan_manual": False,
+    # --- tikaniklik / LAN esbaz onbellegi (2.x) ---
+    # Cekirdek TCP_INFO (RTT, yeniden iletim) governor'a EK tavan sinyali
+    # verir; kapatmak eski davranisi birebir korur.
+    "tcp_info": True,
+    # Esbaz onbellegi istege baglidir: acikken beacon duyurulur ve parca
+    # sunulur. Beacon'lar hangi Merkle koklerine sahip oldugumuzu LAN'a
+    # bildirir; bu yuzden varsayilan kapalidir.
+    "peer_cache": False,
+    "peer_port": 8379,
+    "peer_dirs": [],               # bos = indirme klasoru taranir
 }
 
 

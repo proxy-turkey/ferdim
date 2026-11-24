@@ -546,6 +546,17 @@ S = {
         "tr": "Denetim yeniden hız planında.",
         "es": "El plan de velocidad vuelve a mandar.",
         "ru": "Управление снова у плана скорости."},
+    # ---- 2.x peer/tcpinfo
+    "congestion_limit": {
+        "en": "{n} links (network congestion)",
+        "tr": "{n} bağlantı (ağ tıkanıklığı)",
+        "es": "{n} enlaces (congestión de red)",
+        "ru": "{n} соединений (перегрузка сети)"},
+    "peer_cache": {
+        "en": "LAN peer cache",
+        "tr": "LAN eşbaz önbelleği",
+        "es": "Caché de pares en LAN",
+        "ru": "Кэш узлов в локальной сети"},
 }
 
 
