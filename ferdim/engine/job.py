@@ -2745,6 +2745,12 @@ class DownloadJob:
         with self._lock:
             if self.state == JobState.CANCELED:
                 return
+        # once devam noktasi: ERROR goren (arayuz, testler) noktayi diskte
+        # bulmali; asagidaki ikinci yazim son durumu tazeler
+        self._checkpoint(force=True)
+        with self._lock:
+            if self.state == JobState.CANCELED:
+                return
             self.error = msg
             self.error_code = code
             self.state = JobState.ERROR
