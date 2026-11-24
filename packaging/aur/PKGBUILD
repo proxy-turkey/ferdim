@@ -27,7 +27,7 @@ package() {
   local share="$pkgdir/usr/share/$pkgname"
 
   install -d "$share"
-  cp -a ferdim web "$share/"
+  cp -a ferdim web gnome-shell-extension "$share/"
   find "$share" -name '__pycache__' -type d -prune -exec rm -rf {} +
 
   install -Dm755 bin/ferdim     "$pkgdir/usr/bin/ferdim"
@@ -68,5 +68,7 @@ package() {
 EOF
 
   (cd extension && zip -qr "$share/$pkgname-extension.zip" .)
+  install -Dm644 gnome-shell-extension/INSTALL.md \
+    "$pkgdir/usr/share/doc/$pkgname/gnome-shell-extension-INSTALL.md"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

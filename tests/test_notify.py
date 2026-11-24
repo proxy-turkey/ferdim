@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import socket
 import subprocess
 import threading
 import unittest
@@ -16,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 from ferdim.notify import Notifier, _compose
 from ferdim import notify as notify_mod
 from ferdim.api import _sanitize_config
+from tests.helpers import tmp_root
 
 
 def _snap(jid="j1", state="done", chk="", error="", code="",
@@ -78,17 +81,67 @@ class NotifyComposeTests(unittest.TestCase):
 
 class NotifyTransportTests(unittest.TestCase):
     def test_missing_command_is_not_an_error(self):
-        with mock.patch("ferdim.notify.subprocess.run",
-                        side_effect=FileNotFoundError):
-            self.assertFalse(notify_mod._run(["gdbus"]))
-        with mock.patch("ferdim.notify.subprocess.run",
-                        side_effect=subprocess.TimeoutExpired("x", 1)):
-            self.assertFalse(notify_mod._run(["gdbus"]))
+        with mock.patch("ferdim.notify._child_env", return_value={}):
+            with mock.patch("ferdim.notify.subprocess.run",
+                            side_effect=FileNotFoundError):
+                self.assertFalse(notify_mod._run(["gdbus"]))
+            with mock.patch("ferdim.notify.subprocess.run",
+                            side_effect=subprocess.TimeoutExpired("x", 1)):
+                self.assertFalse(notify_mod._run(["gdbus"]))
 
     def test_successful_command_returns_true(self):
         done = subprocess.CompletedProcess(["x"], 0)
-        with mock.patch("ferdim.notify.subprocess.run", return_value=done):
-            self.assertTrue(notify_mod._run(["gdbus"]))
+        with mock.patch("ferdim.notify._child_env", return_value={}):
+            with mock.patch("ferdim.notify.subprocess.run",
+                            return_value=done) as run:
+                self.assertTrue(notify_mod._run(["gdbus"]))
+        self.assertIn("env", run.call_args.kwargs)
+
+    def test_freedesktop_quotes_every_string_argument(self):
+        run = FakeRun()
+        notify_mod._freedesktop(run, "FerDim finished", "file name (2 MB)")
+        args = run.cmds[0]
+        tail = args[args.index("org.freedesktop.Notifications.Notify") + 1:]
+        self.assertEqual(tail[0], "'FerDim'")
+        self.assertEqual(tail[1], "uint32 0")
+        self.assertEqual(tail[2], "'ferdim'")
+        self.assertEqual(tail[3], "'FerDim finished'")
+        self.assertEqual(tail[4], "'file name (2 MB)'")
+        self.assertEqual(tail[5:], ["@as []", "@a{sv} {}", "int32 5000"])
+
+    def test_portal_payload_is_gvariant_quoted(self):
+        run = FakeRun()
+        notify_mod._portal(run, "FerDim's job", "line 1")
+        payload = run.cmds[0][-1]
+        self.assertIn("<'FerDim\\'s job'>", payload)
+        self.assertIn("<'line 1'>", payload)
+
+    def test_runtime_dir_bus_socket_is_accepted(self):
+        root = tmp_root(self, "ferdim-notify-")
+        bus = root / "bus"
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(str(bus))
+        self.addCleanup(sock.close)
+        with mock.patch.dict(os.environ,
+                             {"DBUS_SESSION_BUS_ADDRESS": "",
+                              "XDG_RUNTIME_DIR": str(root)}):
+            self.assertTrue(notify_mod._bus_available())
+            env = notify_mod._child_env()
+        self.assertEqual(env["DBUS_SESSION_BUS_ADDRESS"],
+                         "unix:path=" + str(bus))
+
+    @unittest.skipUnless(shutil.which("gdbus") and
+                         shutil.which("dbus-run-session"),
+                         "gdbus/dbus-run-session yok")
+    def test_gdbus_parses_freedesktop_arguments(self):
+        run = FakeRun()
+        notify_mod._freedesktop(run, "FerDim finished",
+                                "dosya adi (2.0 MB) — tamam")
+        proc = subprocess.run(["dbus-run-session", "--"] + run.cmds[0],
+                              capture_output=True, text=True, timeout=30)
+        output = (proc.stdout + proc.stderr).lower()
+        self.assertNotIn("error parsing", output)
+        self.assertNotIn("cannot parse", output)
 
 
 class NotifierTests(unittest.TestCase):
@@ -189,10 +242,24 @@ class NotifierTests(unittest.TestCase):
         run = FakeRun()
         n = Notifier(_cfg(), run=run)
         self.addCleanup(n.stop)
-        with mock.patch.dict(os.environ, {"DBUS_SESSION_BUS_ADDRESS": ""}):
+        root = tmp_root(self, "ferdim-notify-")
+        with mock.patch.dict(os.environ,
+                             {"DBUS_SESSION_BUS_ADDRESS": "",
+                              "XDG_RUNTIME_DIR": str(root)}):
             n.on_job(_snap(state="queued"))
             n.on_job(_snap(state="done"))
             n._drain()
+        self.assertEqual(run.cmds, [])
+
+    def test_missing_bus_logs_once(self):
+        run = FakeRun()
+        n = self._notifier(run, bus=False)
+        with mock.patch.object(notify_mod.log, "info") as info:
+            for jid in ("a", "b"):
+                n.on_job(_snap(jid=jid, state="queued"))
+                n.on_job(_snap(jid=jid, state="done"))
+                n._drain()
+        self.assertEqual(info.call_count, 1)
         self.assertEqual(run.cmds, [])
 
     def test_background_worker_delivers(self):

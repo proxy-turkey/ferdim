@@ -45,7 +45,15 @@ class FerDimIndicator extends PanelMenu.Button {
         this._proxy = null;
         this._signature = '';
         this._jobs = [];
+        this._menuDirty = false;
         this._pollId = 0;
+
+        this.menu.connect('open-state-changed', (_menu, open) => {
+            if (!open && this._menuDirty) {
+                this._menuDirty = false;
+                this._rebuildMenu();
+            }
+        });
 
         try {
             this._proxy = Gio.DBusProxy.new_for_bus_sync(
@@ -113,11 +121,14 @@ class FerDimIndicator extends PanelMenu.Button {
             : '';
 
         const signature = JSON.stringify(jobs.map(j =>
-            [j.id, j.state, j.filename, j.speed]));
+            [j.id, j.state, j.filename]));
         if (signature !== this._signature) {
             this._signature = signature;
             this._jobs = jobs;
-            this._rebuildMenu();
+            if (this.menu.isOpen)
+                this._menuDirty = true;
+            else
+                this._rebuildMenu();
         }
     }
 

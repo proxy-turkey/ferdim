@@ -4,11 +4,14 @@ Kuyruk dinleyicisi olarak calisir; isler 'done' ya da 'error' durumuna
 ulasinca (saglama sonucuyla birlikte) arka planda bildirim gonderir.
 Bildirim gonderimi kuyrugu asla bloklamaz: olaylar kuyruga yazilir,
 tek bir isci ipligi bunlari birlestirip gonderir. Hicbir tasiyici yoksa
-(oturum veriyolu yok, komutlar kurulu degil) sessizce no-op olur.
+(oturum veriyolu yok, komutlar kurulu degil) sessizce no-op olur; yalnizca
+gunluge bir kez bilgi satiri yazilir.
 """
 from __future__ import annotations
 
+import logging
 import os
+import stat
 import subprocess
 import threading
 import time
@@ -17,17 +20,51 @@ from . import util
 from .i18n import detect_lang, error_text, t
 
 APP_NAME = "FerDim"
+log = logging.getLogger("ferdim.notify")
 
 # Portal -> freedesktop -> notify-send. Portal bir masaustu kabugu
 # tarafindan sunuluyorsa (sandbox dahil) tercih edilir.
 _BACKENDS = ("portal", "freedesktop", "notify-send")
 
 
+def _bus_address() -> str:
+    """Oturum veriyolu adresi; env yoksa XDG_RUNTIME_DIR/bus soketi."""
+    addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+    if addr:
+        return addr
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        path = os.path.join(runtime, "bus")
+        try:
+            if stat.S_ISSOCK(os.stat(path).st_mode):
+                return "unix:path=" + path
+        except OSError:
+            pass
+    return ""
+
+
+def _bus_available() -> bool:
+    return bool(_bus_address())
+
+
+def _child_env() -> dict | None:
+    """Alt komutlar icin ortam; DBUS adresi yoksa ve bulunamadiysa None."""
+    addr = _bus_address()
+    if not addr:
+        return None
+    env = dict(os.environ)
+    env["DBUS_SESSION_BUS_ADDRESS"] = addr
+    return env
+
+
 def _run(cmd: list[str]) -> bool:
     """Komutu calistirir; basarili (rc=0) mi? Hata/eksik komut = False."""
+    env = _child_env()
+    if env is None:
+        return False
     try:
         p = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=6.0)
+                           stderr=subprocess.DEVNULL, timeout=6.0, env=env)
         return p.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
@@ -59,7 +96,7 @@ def _freedesktop(run, title: str, body: str) -> bool:
         "--dest", "org.freedesktop.Notifications",
         "--object-path", "/org/freedesktop/Notifications",
         "--method", "org.freedesktop.Notifications.Notify",
-        APP_NAME, "uint32 0", "ferdim", title, body,
+        _gv(APP_NAME), "uint32 0", _gv("ferdim"), _gv(title), _gv(body),
         "@as []", "@a{sv} {}", "int32 5000",
     ])
 
@@ -67,10 +104,6 @@ def _freedesktop(run, title: str, body: str) -> bool:
 def _notify_send(run, title: str, body: str) -> bool:
     return run(["notify-send", "--app-name=" + APP_NAME, "--icon=ferdim",
                 title, body])
-
-
-def _bus_available() -> bool:
-    return bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS"))
 
 
 def _compose(events: list[dict], lang: str) -> tuple[str, str]:
@@ -126,6 +159,8 @@ class Notifier:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._qm = None
+        self._no_bus_logged = False
+        self._no_backend_logged = False
 
     # -------------------------------------------------------------- yasam
     def start(self, qm=None) -> "Notifier":
@@ -232,10 +267,20 @@ class Notifier:
 
     def _deliver(self, title: str, body: str) -> bool:
         if not self._bus():
+            if not self._no_bus_logged:
+                log.info("masaustu bildirimi yok: DBUS_SESSION_BUS_ADDRESS "
+                         "ya da XDG_RUNTIME_DIR/bus bulunamadi")
+                self._no_bus_logged = True
             return False
+        self._no_bus_logged = False
         for backend in _BACKENDS:
             fn = {"portal": _portal, "freedesktop": _freedesktop,
                   "notify-send": _notify_send}[backend]
             if fn(self._run, title, body):
+                self._no_backend_logged = False
                 return True
+        if not self._no_backend_logged:
+            log.info("masaustu bildirimi gonderilemedi: portal/"
+                     "org.freedesktop.Notifications/notify-send erisilemedi")
+            self._no_backend_logged = True
         return False

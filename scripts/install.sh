@@ -8,6 +8,9 @@ LIB="$HOME/.local/lib/ferdim"
 BIN="$HOME/.local/bin"
 ICONS="$HOME/.local/share/icons/hicolor/scalable/apps"
 APPS="$HOME/.local/share/applications"
+DBUS_IFACE="$HOME/.local/share/dbus-1/interfaces"
+DBUS_SERVICES="$HOME/.local/share/dbus-1/services"
+GNOME_EXT="$HOME/.local/share/gnome-shell/extensions/ferdim@proxy-turkey.github.io"
 EXT_ID="ferdim@ferdim.app"
 
 msg() { printf '\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -17,7 +20,9 @@ uninstall() {
   rm -rf "$LIB"
   rm -f "$BIN/ferdim" "$BIN/ferdim-nm" "$BIN/ferdim-gui" "$BIN/ferdim-dbus"
   rm -f "$ICONS/ferdim.svg" "$APPS/ferdim.desktop"
-  rm -f "$HOME/.local/share/dbus-1/services/org.ferdim.Daemon.service"
+  rm -f "$DBUS_IFACE/org.ferdim.Daemon1.xml"
+  rm -f "$DBUS_SERVICES/org.ferdim.Daemon.service"
+  rm -rf "$GNOME_EXT"
   rm -f "$HOME/.mozilla/native-messaging-hosts/ferdim.json"
   rm -f "$HOME/.var/app/org.mozilla.firefox/.mozilla/native-messaging-hosts/ferdim.json"
   rm -f "$HOME/.librewolf/native-messaging-hosts/ferdim.json"
@@ -49,10 +54,25 @@ install -m 755 "$SRC/bin/ferdim-nm" "$BIN/ferdim-nm"
 install -m 755 "$SRC/bin/ferdim-gui" "$BIN/ferdim-gui"
 install -m 755 "$SRC/bin/ferdim-dbus" "$BIN/ferdim-dbus"
 
-# D-Bus koprusu: oturum veri yolu etkinlestirmesi (istek uzerine baslar)
-mkdir -p "$HOME/.local/share/dbus-1/services"
+# D-Bus koprusu: arayuz XML'i + oturum veri yolu etkinlestirmesi
+# (istek uzerine baslar). XML hem standart yola hem de paket yanina
+# kurulur; dbusbridge ayrica gomulu kopyayla da calisir.
+mkdir -p "$DBUS_IFACE" "$DBUS_SERVICES"
+install -m 644 "$SRC/data/org.ferdim.Daemon1.xml" \
+  "$DBUS_IFACE/org.ferdim.Daemon1.xml"
 sed "s|@BIN@|$BIN/ferdim-dbus|g" "$SRC/data/org.ferdim.Daemon.service" \
-  > "$HOME/.local/share/dbus-1/services/org.ferdim.Daemon.service"
+  > "$DBUS_SERVICES/org.ferdim.Daemon.service"
+
+# GNOME Shell eklentisi (yalnizca kabuk kuruluysa; kullanici seviyesi)
+if command -v gnome-shell >/dev/null; then
+  msg "GNOME Shell eklentisi -> $GNOME_EXT"
+  rm -rf "$GNOME_EXT"
+  mkdir -p "$GNOME_EXT"
+  install -m 644 \
+    "$SRC/gnome-shell-extension/ferdim@proxy-turkey.github.io/metadata.json" \
+    "$SRC/gnome-shell-extension/ferdim@proxy-turkey.github.io/extension.js" \
+    "$GNOME_EXT/"
+fi
 
 msg "Masaustu entegrasyonu"
 install -m 644 "$SRC/scripts/icons/ferdim.svg" "$ICONS/ferdim.svg"
@@ -96,6 +116,12 @@ echo "  Servis       : systemctl --user enable --now ferdim"
 echo "                 (veya elle: ferdim daemon)"
 echo "  Web arayuzu  : ferdim web      (http://127.0.0.1:8378)"
 echo "  GTK arayuzu  : $BIN/ferdim-gui  (python3-gobject gerekir)"
+if [ -d "$GNOME_EXT" ]; then
+  echo "  GNOME eklentisi: gnome-extensions enable ferdim@proxy-turkey.github.io"
+else
+  echo "  GNOME eklentisi: gnome-shell yok; kurulum icin"
+  echo "                   gnome-shell-extension/INSTALL.md"
+fi
 echo
 echo "Firefox eklentisi:"
 echo "  1) Firefox'ta about:debugging#/runtime/this-firefox acin"
