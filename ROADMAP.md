@@ -148,6 +148,68 @@ Every item here closes a gap that 1.6 shipped knowingly.
 - [x] Congestion awareness: read the kernel's TCP info (RTT, retransmits)
       per link to steer the governor, not only throughput.
 
+## 1.9 — everyday safety
+
+Planned after 1.7.0. Each item closes a gap found in the current code.
+
+- [ ] Disk-space preflight for downloads: check free space against the
+      announced size before allocating, pause the queue (not fail jobs) on
+      `ENOSPC` or below a configurable floor, resume when space returns.
+      Today only archive extraction checks free space.
+- [ ] Duplicate detection before queuing: same URL, same final file
+      path, or same checksum / Merkle root as a finished job ⇒ ask (UIs)
+      or refuse with a code (API), with an explicit "download again".
+- [ ] `~/.netrc` credentials for HTTP and FTP (stdlib `netrc`), used only
+      for the matching host and never forwarded to mirrors on other
+      origins.
+- [ ] Post-download actions per category: open folder, extract archive,
+      or run a user command as an argv list (no shell), with the job's
+      path passed as an argument, after verification only.
+- [ ] Bulk actions in the web UI and GTK app: multi-select pause, resume,
+      remove, move to category; drag-and-drop of URLs and
+      `.metalink` / `.meta4` files onto the window.
+- [ ] Shell completions (bash, zsh, fish) generated from the CLI parser
+      and shipped in every package.
+- [ ] Settings and queue export / import (one JSON file, secrets
+      excluded) for moving to a new machine.
+
+## 1.10 — hardening and supply chain
+
+- [ ] systemd user-unit hardening (`NoNewPrivileges`, `ProtectSystem`,
+      `PrivateTmp`, `RestrictAddressFamilies`, `SystemCallFilter`, …),
+      checked with `systemd-analyze security --user` in CI and kept
+      compatible with the download folder and peer cache.
+- [ ] Fault-injection test proxy in CI: connection resets, truncated
+      bodies, slow drip, wrong `Content-Range`, flapping `ETag`, 429
+      storms — every job must end `done` with a verified file or a clear
+      error code, never a silent corruption.
+- [ ] Nightly soak run: hours of randomized jobs against the fault proxy
+      with pause / resume / restart of the daemon, checking file hashes
+      and that memory and thread counts stay flat.
+- [ ] Release integrity: `SHA256SUMS` plus a detached signature and an
+      SPDX SBOM attached to every GitHub release; reproducible SRPM/RPM
+      (`SOURCE_DATE_EPOCH`) verified by a second build in CI.
+- [ ] Debian / Ubuntu packages built on OBS next to the openSUSE ones,
+      with the same `%check`-style test run.
+- [ ] RTL readiness in the web UI, GTK app and extension (`dir="rtl"`
+      layout tests with a pseudo-locale) so the Arabic locale only needs
+      translated strings when it arrives.
+
+## 2.x — research (next)
+
+- [ ] Delta updates: given an older local copy and the new version's
+      `.ferdim-merkle`, fetch only the changed chunks and rebuild the new
+      file, verified against the new root.
+- [ ] Authenticated LAN peer cache: an optional shared group secret
+      (TLS-PSK or HMAC on beacons and chunk requests) so only trusted
+      machines take part.
+- [ ] Multi-interface downloads (opt-in): spread links over several
+      uplinks (e.g. Ethernet + Wi-Fi) by binding sockets per interface,
+      with the governor tuning each path separately.
+- [ ] Governor replay: record anonymized throughput traces and replay
+      them offline, so tuning changes are measured against real lines
+      before they ship.
+
 ## Explicitly not planned
 
 - DRM-protected streams and live (non-VOD) HLS.
