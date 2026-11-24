@@ -54,6 +54,10 @@ $("#turboBtn").onclick = async () => {
   renderTurbo(!!(r2 && r2.turbo));
 };
 
+const KIND_ICON = {
+  audio: "🎵", archive: "📦", file: "📄", hls: "🎬", dash: "🎬", video: "🎬",
+};
+
 function renderMedia(items) {
   const list = $("#mediaList");
   list.innerHTML = "";
@@ -70,12 +74,12 @@ function renderMedia(items) {
       </div>
       <button class="copy">⧉</button>
       <button class="primary"></button>`;
-    el.querySelector(".ico").textContent = it.kind === "audio" ? "🎵" : "🎬";
+    el.querySelector(".ico").textContent = KIND_ICON[it.kind] || "🎬";
     const n = el.querySelector(".n");
     n.textContent = it.filename || it.url;
     n.title = it.url;
     el.querySelector(".s").textContent =
-      `${humanSize(it.size) || "?"} · ${it.mime.split(";")[0]}`;
+      `${humanSize(it.size) || "?"} · ${(it.mime || "").split(";")[0]}`;
     el.querySelector(".copy").title = _("btnCopy");
     el.querySelector(".primary").textContent = _("btnDownload");
     el.querySelector(".primary").onclick = () => {

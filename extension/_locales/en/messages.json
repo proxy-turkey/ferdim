@@ -31,7 +31,7 @@
   "takeoverOff": {"message": "Off (context menu only)"},
   "minTakeover": {"message": "Skip files smaller than (MB, 0 = all)"},
   "secMedia": {"message": "Video / media catching"},
-  "minMedia": {"message": "Catch media larger than (MB)"},
+  "minMedia": {"message": "Catch media or files larger than (MB)"},
   "includeAudio": {"message": "Also catch audio files"},
   "badge": {"message": "Show count badge on the toolbar"},
   "overlayButton": {"message": "Show a floating “Download with FerDim” button on pages"},
