@@ -420,6 +420,79 @@ def cmd_publish(a, env):
     return 0
 
 
+def _plan_limit_text(n) -> str:
+    """Plan limiti metni: '0'/yok = sinirsiz, aksi halde 1024 tabanli gosterim."""
+    return util.human_size(n) + "/sn" if n else _("plan_unlimited")
+
+
+def _plan_rule_text(rule: dict) -> str:
+    days = rule.get("days") or _("plan_every_day")
+    hours = (f"{rule.get('from', '')}-{rule.get('to', '')}"
+             if rule.get("from") or rule.get("to") else _("plan_all_day"))
+    limit = rule.get("limit")
+    text = _("plan_unlimited") if not limit or str(limit) == "0" \
+        else str(limit) + "/sn"
+    return _("plan_rule", days=days, hours=hours, limit=text)
+
+
+def cmd_speedplan(a, env):
+    """Saat bazli hiz plani: goster / JSON ile kur / sil / denetimi geri al."""
+    action = a.action or "show"
+    with _client(env) as c:
+        if action == "set":
+            if not a.json_plan:
+                print(_("cli_error") + ": " + _("plan_bad"), file=sys.stderr)
+                return 2
+            try:
+                plan = json.loads(a.json_plan)
+            except ValueError as e:
+                print(_("cli_error") + ": " + _("plan_bad") + f" ({e})",
+                      file=sys.stderr)
+                return 2
+            r = c.request("speedplan", action="set", plan=plan)
+        elif action in ("clear", "resume"):
+            r = c.request("speedplan", action=action)
+        else:
+            r = c.request("speedplan")
+    if not r.get("ok"):
+        print(_("cli_error") + ":", r.get("error", ""), file=sys.stderr)
+        return 1
+    plan = r.get("plan") or []
+    active = r.get("active_rule") or {}
+    print(_("plan_title") + ":")
+    if not plan:
+        print("  " + _("plan_state_none"))
+    for i, rule in enumerate(plan):
+        mark = "  * " if active.get("index") == i else "    "
+        print(mark + _plan_rule_text(rule))
+    if r.get("manual"):
+        print("  " + _("plan_state_manual"))
+    elif plan:
+        if active:
+            print("  " + _("plan_state_active",
+                           limit=_plan_limit_text(active.get("limit"))))
+        else:
+            print("  " + _("plan_state_off"))
+    if action == "clear":
+        print(_("plan_cleared"))
+    elif action == "resume":
+        print(_("plan_resumed"))
+    elif action == "set":
+        print(_("plan_saved"))
+    return 0
+
+
+def cmd_metrics(a, env):
+    """Prometheus metin bicimini yazdir (daemon ayni metni /metrics'te sunar)."""
+    with _client(env) as c:
+        r = c.request("metrics")
+    if not r.get("ok"):
+        print(_("cli_error") + ":", r.get("error", ""), file=sys.stderr)
+        return 1
+    sys.stdout.write(r.get("text") or "")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ferdim",
@@ -582,6 +655,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force", action="store_true",
                     help="guncel olsa da bildirimleri yeniden uret")
     sp.set_defaults(fn=cmd_publish)
+
+    # --- 1.8: saat bazli hiz plani + Prometheus metrikleri ---
+    sp = sub.add_parser("speedplan",
+                        help="saat bazli hiz plani (goster/set/clear/resume)")
+    sp.add_argument("action", nargs="?", default="show",
+                    choices=["show", "set", "clear", "resume"],
+                    help="JSON kur, plani sil ya da denetimi plana geri ver")
+    sp.add_argument("json_plan", nargs="?", metavar="JSON",
+                    help='kural listesi, orn '
+                         '\'[{"days":"mon-fri","from":"09:00",'
+                         '"to":"18:00","limit":"2MB"}]\'')
+    sp.set_defaults(fn=cmd_speedplan)
+
+    sp = sub.add_parser("metrics",
+                        help="Prometheus metin bicimini yazdir")
+    sp.set_defaults(fn=cmd_metrics)
     return p
 
 

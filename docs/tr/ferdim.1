@@ -92,7 +92,37 @@ siler.
 .BI limit " HIZ"
 Genel hız sınırı (\fB0\fR sınırı kaldırır). KB, MB ve GB 1024 tabanlıdır.
 Turbo modu açıkken sınır belirlemek turbo modundan çıkar; böylece uygulanan
-sınır ile turbo durumu asla çelişmez.
+sınır ile turbo durumu asla çelişmez. Elle verilen sınır, \fBlimit plan\fR
+denetimi geri verene kadar hız planını da ezer.
+.TP
+.BI speedplan " [show|set JSON|clear|resume]"
+Zamanlama pencerelerinin üzerine saat bazlı hız profili; örneğin çalışma
+saatlerinde 2 MB/sn, gece azami güç. Kurallar bir JSON listesidir:
+\fB[{"days":"mon-fri","from":"09:00","to":"18:00","limit":"2MB"}]\fR.
+\fIdays\fR gün adları ya da aralıklarıdır (mon-fri, sat-sun, mon,wed; boş
+veya * = her gün), \fIfrom\fR/\fIto\fR HH:MM biçimindedir ve gece yarısını
+aşabilir, \fIlimit\fR 1024 tabanlıdır ("0" veya "" = sınırsız). İlk eşleşen
+kural kazanır; hiçbir kural eşleşmezse plan sınır koymaz, yani azami güç
+için ayrıca kural gerekmez. Kuyruk etkin kuralı yarım saniyede bir uygular;
+sınır geçişi işleri yeniden başlatmadan yürürlüğe girer. Elle verilen sınır
+(\fBlimit\fR ya da web hız seçicisi), \fBspeedplan resume\fR (veya
+\fBlimit plan\fR) denetimi geri verene kadar planı ezer;
+\fBspeedplan clear\fR planı siler ve ondan önce yürürlükte olan sınırı geri
+yükler. Plan sınırı etkinken turbo modundan çıkılır; böylece sınır ile turbo
+durumu asla çelişmez. Web ayarları kuralları okunabilir satırlar olarak
+gösterir ve JSON olarak düzenletir.
+.TP
+.BI metrics
+Yerel izleme için Prometheus metin biçimini (0.0.4) yazdırır: indirilen
+bayt, son duruma ulaşan işler, açık bağlantılar, sunucu başına yeniden
+denemeler ve HTTP 429/503 limit yanıtları, toplam hız, güncel kuyruk
+durumları, birlikte yaşam basıncı ve sürüm bilgisi. Arka plan servisi aynı
+metni yerel HTTP portunda \fB/metrics\fR yolunda sunar ve her zamanki token
+başlığını ister:
+\fBcurl \-H "X\-FerDim\-Token: $(cat ~/.local/state/ferdim/token)"
+http://127.0.0.1:8378/metrics\fR. Sorgu dizesinde token kabul edilmez;
+sunucu etiketleri yalnızca sunucu adıdır (kimlik bilgisi veya yol yok) ve en
+çok 200 sunucu ayrı verilir, geri kalanı \fBother\fR altında toplanır.
 .TP
 .BI turbo " on|off|status"
 Maksimum güç varsayılanlarını açar veya kapatır (32 bağlantı, sınırsız
@@ -156,7 +186,8 @@ keep), otomatik yan dosya doğrulaması (\fIchecksum_sidecar\fR), masaüstü
 bildirimleri (\fInotify\fR, varsayılan açık; \fInotify_errors_only\fR
 yalnızca hataları bildirir), yeniden
 denemeler ve zaman aşımları (\fItimeout\fR, \fIstall_timeout\fR), birlikte
-yaşam modu (\fIcoexist\fR, \fIcoexist_threshold\fR) ve indirme
+yaşam modu (\fIcoexist\fR, \fIcoexist_threshold\fR), saat bazlı hız planı
+(\fIspeed_plan\fR, \fIspeed_plan_manual\fR) ve indirme
 geçmişinin saklanma süresi (\fIhistory_days\fR, varsayılan 365 gün,
 \fB0\fR sonsuza kadar saklar).
 .TP

@@ -473,6 +473,65 @@ S = {
         "tr": "{n} sağlama uyarısı",
         "es": "{n} con aviso de suma",
         "ru": "{n} с предупреждением о сумме"},
+    # ---- 1.8 speed/metrics
+    "plan_title": {
+        "en": "Speed plan", "tr": "Hız planı",
+        "es": "Plan de velocidad", "ru": "План скорости"},
+    "plan_json": {
+        "en": "Plan (JSON list of rules)",
+        "tr": "Plan (JSON kural listesi)",
+        "es": "Plan (lista JSON de reglas)",
+        "ru": "План (список правил JSON)"},
+    "plan_rule": {
+        "en": "{days} · {hours} · {limit}",
+        "tr": "{days} · {hours} · {limit}",
+        "es": "{days} · {hours} · {limit}",
+        "ru": "{days} · {hours} · {limit}"},
+    "plan_every_day": {
+        "en": "every day", "tr": "her gün",
+        "es": "todos los días", "ru": "каждый день"},
+    "plan_all_day": {
+        "en": "all day", "tr": "tüm gün",
+        "es": "todo el día", "ru": "весь день"},
+    "plan_unlimited": {
+        "en": "unlimited", "tr": "sınırsız",
+        "es": "sin límite", "ru": "без лимита"},
+    "plan_state_active": {
+        "en": "Active now: {limit}", "tr": "Şu an etkin: {limit}",
+        "es": "Activo ahora: {limit}", "ru": "Сейчас действует: {limit}"},
+    "plan_state_off": {
+        "en": "No rule matches now — maximum power.",
+        "tr": "Şu an hiçbir kural eşleşmiyor — azami güç.",
+        "es": "Ninguna regla coincide ahora — potencia máxima.",
+        "ru": "Сейчас ни одно правило не подходит — полная мощность."},
+    "plan_state_manual": {
+        "en": "Manual limit override: the plan is paused until "
+              "'ferdim speedplan resume' (or 'ferdim limit plan').",
+        "tr": "Elle verilen limit planı eziyor: 'ferdim speedplan resume' "
+              "(ya da 'ferdim limit plan') denetimi plana bırakır.",
+        "es": "Límite manual: el plan está en pausa hasta "
+              "'ferdim speedplan resume' (o 'ferdim limit plan').",
+        "ru": "Ручной лимит: план приостановлен до "
+              "'ferdim speedplan resume' (или 'ferdim limit plan')."},
+    "plan_state_none": {
+        "en": "No speed plan.", "tr": "Hız planı yok.",
+        "es": "No hay plan de velocidad.", "ru": "Плана скорости нет."},
+    "plan_bad": {
+        "en": "Invalid plan JSON: expected a list of rule objects.",
+        "tr": "Geçersiz plan JSON: kural nesnelerinden oluşan liste bekleniyor.",
+        "es": "JSON de plan inválido: se espera una lista de reglas.",
+        "ru": "Неверный JSON плана: ожидается список правил."},
+    "plan_saved": {
+        "en": "Speed plan saved.", "tr": "Hız planı kaydedildi.",
+        "es": "Plan de velocidad guardado.", "ru": "План скорости сохранён."},
+    "plan_cleared": {
+        "en": "Speed plan cleared.", "tr": "Hız planı silindi.",
+        "es": "Plan de velocidad eliminado.", "ru": "План скорости удалён."},
+    "plan_resumed": {
+        "en": "The speed plan is in control again.",
+        "tr": "Denetim yeniden hız planında.",
+        "es": "El plan de velocidad vuelve a mandar.",
+        "ru": "Управление снова у плана скорости."},
 }
 
 

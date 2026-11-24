@@ -21,6 +21,14 @@ class QueueManager:
         self.jobs: list[DownloadJob] = []
         from ..ratelimit import TokenBucket
         self.bucket = TokenBucket(cfg.get("speed_limit", 0))
+        # Prometheus ornekleyicisi: /metrics ucu bunu okur
+        from ..metrics import Collector
+        self.metrics = Collector()
+        self._plan_saved: int | None = None   # plandan onceki kullanici limiti
+        # plan degisikligi ile tick'in eski plani yeniden uygulamasi
+        # yarisamaz (RLock: set_speed_plan tick'i kendisi cagirir)
+        self._plan_lock = threading.RLock()
+
         self._lock = threading.RLock()
         self._listeners: list = []       # degisiklik bildirimi (soket push)
         self._running = False
@@ -185,6 +193,7 @@ class QueueManager:
         with self._lock:
             running = [j for j in self.jobs if j.state in STATES_RUNNING]
             queued = [j for j in self.jobs if j.state == JobState.QUEUED]
+        self._speed_plan_tick()
         limit = int(self.cfg.get("max_concurrent", 3))
         started = False
         if self._schedule_active():
@@ -208,6 +217,11 @@ class QueueManager:
         for j in self.jobs:
             j.update_speed()
         self._coexist_tick(running)
+        with self._lock:
+            jobs = list(self.jobs)
+        self.metrics.observe(
+            jobs, coexist_active=bool(self.cfg.get("coexist")
+                                      and self.coexist.active))
         # durum degisimlerini kalici kaydet (biten/iptal edilen isler)
         sig = [(j.id, j.state) for j in self.jobs]
         if sig != getattr(self, "_last_sig", None):
@@ -299,6 +313,64 @@ class QueueManager:
             for j in self.jobs:
                 if j.spec.limit == 0:
                     j._bucket.set_rate(int(bytes_per_sec))
+
+    # -------------------------------------------------- saat plani (1.8)
+    def plan_status(self) -> dict:
+        """Etkin plan kurali, limiti (bayt/sn) ve elle ezme durumu."""
+        plan = self.cfg.get("speed_plan")
+        plan = plan if isinstance(plan, list) else []
+        rule = util.speed_plan_rule(plan)
+        active = None
+        if rule is not None:
+            active = {**rule, "limit": util.parse_size(rule.get("limit")),
+                      "index": next((i for i, r in enumerate(plan)
+                                     if r is rule), -1)}
+        return {
+            "enabled": util.speed_plan_limit(plan) is not None,
+            # elle verilen limit plani ezer; 'limit plan' denetimi geri verir
+            "manual": bool(self.cfg.get("speed_plan_manual")),
+            "active_rule": active,
+            "limit": active["limit"] if active else 0,
+        }
+
+    def set_speed_plan(self, plan, manual: bool | None = None) -> dict:
+        """Plani degistirir ve hemen uygular. manual None: dokunma;
+        True/False: elle ezme durumunu ayarla (resume False gonderir).
+
+        Plan kilidi, arka plan tick'inin eski plani temizlikten sonra
+        yeniden uygulamasini engeller."""
+        with self._plan_lock:
+            self.cfg["speed_plan"] = util.sanitize_speed_plan(plan)
+            if manual is not None:
+                self.cfg["speed_plan_manual"] = bool(manual)
+            if not self.cfg["speed_plan"] and self._plan_saved is not None:
+                # plan kalkti: plandan onceki kullanici limiti geri gelir
+                saved, self._plan_saved = self._plan_saved, None
+                self.set_speed_limit(saved)
+            self.env.save_config(self.cfg)
+            self._speed_plan_tick()
+        self._notify()
+        return self.plan_status()
+
+    def _speed_plan_tick(self):
+        """Etkin kuralin limitini her tick uygular; elle verilen limit
+        (limit komutu) plani ezer ve kullanici denetimi geri alana kadar
+        tick hicbir seye dokunmaz."""
+        changed = False
+        with self._plan_lock:
+            limit = util.speed_plan_limit(self.cfg.get("speed_plan"))
+            if limit is None or self.cfg.get("speed_plan_manual"):
+                return
+            if self._plan_saved is None:
+                self._plan_saved = int(self.cfg.get("speed_limit") or 0)
+            if limit > 0 and self.cfg.get("turbo_mode"):
+                # turbo "limitsiz" demek: plan limitiyle celismesin
+                self.set_turbo(False)
+            if int(self.cfg.get("speed_limit") or 0) != limit:
+                self.set_speed_limit(limit)
+                changed = True
+        if changed:
+            self._notify()
 
     # ------------------------------------------------------------------ turbo
     def set_turbo(self, on: bool) -> bool:
@@ -434,6 +506,7 @@ class QueueManager:
             "active": sum(1 for j in jobs if j["state"] in
                           (JobState.CONNECTING, JobState.DOWNLOADING)),
             "speed_limit": self.cfg.get("speed_limit", 0),
+            "speed_plan": self.plan_status(),
             "max_concurrent": self.cfg.get("max_concurrent", 3),
             # dizin acilamiyorsa (kaldirilmis disk) istatistik kirilmasin
             "download_dir": self._download_dir_text(),

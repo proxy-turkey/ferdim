@@ -353,6 +353,8 @@ class DownloadJob:
         self._reported_done = 0    # ayni baytlar iki kez bildirilmez
         self._throttle_seen = False
         self._safe_links = 0       # 429/503 sonrasi sunucunun kabul ettigi sayi
+        # metrics ucu: tur -> {ana makine: sayac} (kimlik bilgisi yok)
+        self.stats_counters = {"retries": {}, "throttles": {}}
         # gecikme sinyali (birlikte yasam): aralik isteklerinin TTFB'si
         self._lat = LatencySignal()
         self._reset_sources()
@@ -995,6 +997,13 @@ class DownloadJob:
         s.cur = 0.0
         self.extra["sources_dead"] = sum(1 for x in self._srcs if x.dead)
 
+    def _bump(self, kind: str, s: "_Src | None" = None) -> None:
+        """Prometheus sayaci: tur basina ana makine (kilit cagiranda)."""
+        host = host_key(s.url) if s is not None else self._host
+        d = self.stats_counters.setdefault(kind, {})
+        key = host or "?"
+        d[key] = d.get(key, 0) + 1
+
     def _src_fail(self, s: _Src, kind: str, cooldown: bool = True,
                   code: str = "") -> None:
         """Kaynak basarisizligi: secim agirligi yariya iner, ardisik
@@ -1004,6 +1013,7 @@ class DownloadJob:
         with self._cond:
             s.streak += 1
             s.fails += 1
+            self._bump("retries", s)
             s.ema *= 0.5
             s.cur = 0.0
             s.reason = kind
@@ -1038,6 +1048,8 @@ class DownloadJob:
             s.cur = 0.0
             s.reason = reason
             s.code = "rate_limited"
+            if reason.startswith("HTTP "):
+                self._bump("throttles", s)      # 429/503
             if count:
                 s.streak += 1
                 s.fails += 1
@@ -1066,13 +1078,14 @@ class DownloadJob:
                 s.ema = (s.ema * s.mass + inst * nbytes) / (s.mass + nbytes)
             s.mass = min((s.mass + nbytes) * 0.9, 128 << 20)
 
-    def _note_limit(self):
+    def _note_limit(self, s: "_Src | None" = None):
         """Is genelinde limit sayaci. 1 MB'dan fazla ilerleme varsa sifirlanir:
         ilerleyen is hicbir zaman limit yuzunden basarisiz sayilmaz."""
         if self.done - self._limit_mark > (1 << 20):
             self._limit_mark = self.done
             self._limit_events = 0
         self._limit_events += 1
+        self._bump("throttles", s)        # metrics: ana makine basina 429/503
         self._throttle_seen = True     # profilde "limitli sunucu" isareti
 
     def _dead_reason(self) -> str:
@@ -1451,7 +1464,7 @@ class DownloadJob:
                         self._demote(src, f"HTTP {err.code}", wait)
                         continue
                     limit_hits += 1
-                    self._note_limit()
+                    self._note_limit(src)
                     if limit_hits > 40 or self._limit_events > 200:
                         requeue()
                         self._fail(f"sunucu surekli limit donduruyor "

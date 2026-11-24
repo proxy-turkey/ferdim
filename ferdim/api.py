@@ -119,6 +119,12 @@ def _sanitize_config(cfg: dict, env=None) -> None:
             1.2, min(20.0, float(cfg.get("coexist_latency", 2.5))))
     except (TypeError, ValueError):
         cfg["coexist_latency"] = 2.5
+    # saat bazli hiz plani: bozuk kurallar atilir; elle ezme bayragi metin
+    # olarak da yazilmis olabilir ("false")
+    cfg["speed_plan"] = util.sanitize_speed_plan(cfg.get("speed_plan"))
+    spm = cfg.get("speed_plan_manual", False)
+    cfg["speed_plan_manual"] = spm if isinstance(spm, bool) else \
+        str(spm).strip().lower() not in ("", "0", "false", "no", "off")
     dirs = cfg.get("watch_dirs")
     cfg["watch_dirs"] = [d for d in dirs if isinstance(d, str) and d.strip()] \
         if isinstance(dirs, list) else []
@@ -419,6 +425,13 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         return {"ok": True, "hosts": rows, "count": len(rows)}
     if cmd == "limit":
         val = params.get("value", 0)
+        if isinstance(val, str) and val.strip().lower() == "plan":
+            # 'limit plan': denetim yeniden saat planina birakilir
+            cfg["speed_plan_manual"] = False
+            ctx["set_cfg"](cfg)
+            qm._speed_plan_tick()
+            return {"ok": True, "speed_limit": qm.cfg["speed_limit"],
+                    "speed_plan": qm.plan_status()}
         if isinstance(val, str):
             val = util.parse_size(val)
         val = int(val or 0)
@@ -427,7 +440,27 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         if val > 0 and cfg.get("turbo_mode"):
             qm.set_turbo(False)
         qm.set_speed_limit(val)
-        return {"ok": True, "speed_limit": qm.cfg["speed_limit"]}
+        # elle verilen limit plani ezer: kullanici acik secim yapti
+        cfg["speed_plan_manual"] = True
+        ctx["set_cfg"](cfg)
+        return {"ok": True, "speed_limit": qm.cfg["speed_limit"],
+                "speed_plan": qm.plan_status()}
+    if cmd == "speedplan":
+        action = str(params.get("action") or "show")
+        if action == "set":
+            status = qm.set_speed_plan(params.get("plan"))
+        elif action == "clear":
+            status = qm.set_speed_plan([])
+        elif action == "resume":       # elle ezmeyi birak: plan yeniden etkin
+            status = qm.set_speed_plan(cfg.get("speed_plan"), manual=False)
+        elif action == "show":
+            status = qm.plan_status()
+        else:
+            return {"ok": False, "error": "gecersiz islem"}
+        return {"ok": True, "plan": cfg.get("speed_plan") or [], **status}
+    if cmd == "metrics":
+        from . import metrics as _metrics
+        return {"ok": True, "text": _metrics.render(qm)}
     if cmd == "config-get":
         return {"ok": True, "config": cfg}
     if cmd == "config-set":
@@ -448,6 +481,8 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         ctx["set_cfg"](cfg)
         if "speed_limit" in new:
             qm.set_speed_limit(int(cfg.get("speed_limit") or 0))
+        if "speed_plan" in new or "speed_plan_manual" in new:
+            qm._speed_plan_tick()      # yeni plan hemen uygulanir
         out = {"ok": True, "config": cfg}
         if warning:
             out["warning"] = warning

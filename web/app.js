@@ -871,6 +871,37 @@ function readCatRows() {
   }
   return out;
 }
+/* ---- saat bazli hiz plani (1.8): okunabilir satirlar + JSON duzenleyici ---- */
+function planRuleText(rule) {
+  const days = rule.days ? String(rule.days) : tr("plan_every_day");
+  const hours = (rule.from || rule.to)
+    ? (rule.from || "00:00") + "–" + (rule.to || "24:00") : tr("plan_all_day");
+  const limit = rule.limit && String(rule.limit) !== "0"
+    ? String(rule.limit) : tr("plan_unlimited");
+  return trf("plan_rule", { days, hours, limit });
+}
+function buildPlanRows(plan) {
+  const box = $("#planRows"), state = $("#planState");
+  box.replaceChildren();
+  const sp = lastStats.speed_plan || {};
+  const active = sp.active_rule ? sp.active_rule.index : -1;
+  (plan || []).forEach((rule, i) => {
+    box.append(dom("div", {
+      class: i === active ? "planrow active" : "planrow",
+      "data-rule": String(i),
+      text: (i === active ? "● " : "○ ") + planRuleText(rule),
+    }));
+  });
+  if (!sp.enabled) state.textContent = tr("plan_state_none");
+  else if (sp.manual) state.textContent = tr("plan_state_manual");
+  else if (active >= 0)
+    state.textContent = trf("plan_state_active",
+      { limit: sp.limit ? rate(sp.limit) : tr("plan_unlimited") });
+  else state.textContent = tr("plan_state_off");
+  $("#setPlan").value = plan && plan.length
+    ? JSON.stringify(plan, null, 2) : "";
+  $("#planError").hidden = true;
+}
 $("#settingsBtn").onclick = async () => {
   const r = await api("/api/config");
   if (r && r.config) cfg = r.config;
@@ -884,6 +915,7 @@ $("#settingsBtn").onclick = async () => {
   $("#setSchedStart").value = hm(sch.start) || "02:00";
   $("#setSchedStop").value = hm(sch.stop) || "08:00";
   buildCatRows(sch.categories);
+  buildPlanRows(cfg.speed_plan);
   $("#setWatchDirs").value = (cfg.watch_dirs || []).join("\n");
   $("#setWatchDone").value = cfg.watch_done || "delete";
   $("#setSidecar").checked = !!cfg.checksum_sidecar;
@@ -900,6 +932,23 @@ $("#setSave").onclick = async () => {
     const v = parseInt($(id).value, 10);
     return Number.isNaN(v) ? fallback : Math.min(hi, Math.max(lo, v));
   };
+  // plan JSON'u kaydetmeden once dogrulanir: sunucu bozuk kurali atardi
+  const planRaw = $("#setPlan").value.trim();
+  let plan = [];
+  if (planRaw) {
+    try {
+      plan = JSON.parse(planRaw);
+      if (!Array.isArray(plan) ||
+          plan.some((x) => !x || typeof x !== "object")) throw new Error("plan");
+    } catch (e) {
+      const p = $("#planError");
+      p.textContent = tr("plan_bad");
+      p.hidden = false;
+      $("#setPlan").focus();
+      return;
+    }
+  }
+  $("#planError").hidden = true;
   const lang = $("#setLang").value;
   const r = await api("/api/config", { config: {
     download_dir: $("#setDir").value.trim() || null,
@@ -921,6 +970,7 @@ $("#setSave").onclick = async () => {
     timeout: num("#setTimeout", 5, 300, cfg.timeout ?? 30),
     stall_timeout: num("#setStall", 5, 120, cfg.stall_timeout ?? 20),
     history_days: num("#setHistDays", 0, 3650, cfg.history_days ?? 365),
+    speed_plan: plan,
   } });
   if (r && r.config) cfg = r.config;
   notice(r && r.warning === "download_dir" ? tr("warn_dir") : tr("saved"));

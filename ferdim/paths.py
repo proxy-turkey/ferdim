@@ -50,6 +50,12 @@ DEFAULTS = {
     # Kendi baglantilarimizin TTFB sismesi esigi: guncel EMA / taban
     # (1.2-20). Hat doymadan yavaslamayi yakalar.
     "coexist_latency": 2.5,
+    # --- saat bazli hiz plani (1.8) ---
+    # [{"days": "mon-fri", "from": "09:00", "to": "18:00", "limit": "2MB"}]
+    # Ilk eslesen kural kazanir; pencere gece yarisini asabilir; kural
+    # eslesmezse azami guc. Elle verilen limit plani ezer ('limit plan').
+    "speed_plan": [],
+    "speed_plan_manual": False,
 }
 
 
