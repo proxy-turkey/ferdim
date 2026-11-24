@@ -14,11 +14,19 @@ calistirma ayni baytlari uretir; statik site kopyalamasi bos diff verir.
 
 Kapsam bilincli olarak dar: alt dizinlere inilmez, sembolik baglar
 yayinlanmaz, kendi urettigimiz uzantilar girdi sayilmaz.
+
+Yazim yolu (cdc.write_atomic): gecici dosya O_EXCL ile hedef dizinde
+acilir, fsync edilir, sonra os.replace ile hedefin uzerine konur. Hedef
+adinda onceden kurulmus bir sembolik bag varsa izlenmez; bagin kendisi
+degistirilir. Paylasilan bir yayin dizinine kurulmus bag baska bir
+dosyayi (orn. ~/.bashrc) ezemez.
 """
 from __future__ import annotations
 
 import fnmatch
 import os
+import stat
+import sys
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -56,17 +64,26 @@ def _rfc3339(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
+def _regular(path: Path) -> bool:
+    """lstat: sembolik baglar (ve aygit/dizin) duzenli dosya sayilmaz."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
 def _write_if_changed(path: Path, text: str) -> bool:
     """Ayni icerik yeniden yazilmaz: mtime sabit kalir, tekrar calistirma
-    yayin dizinini degistirmez. Yazim `.part` + os.replace (atomik)."""
-    try:
-        if path.read_text("utf-8") == text:
-            return False
-    except OSError:
-        pass
-    tmp = path.with_name(path.name + ".part")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    yayin dizinini degistirmez. Yazim atomiktir (cdc.write_atomic):
+    hedefteki sembolik bag izlenmez, icerigi degil bagin kendisi
+    degistirilir. Bag duzenli dosya sayilmadigi icin her zaman yazilir."""
+    if _regular(path):
+        try:
+            if path.read_text("utf-8") == text:
+                return False
+        except (OSError, UnicodeDecodeError):
+            pass
+    cdc.write_atomic(path, text)
     return True
 
 
@@ -78,7 +95,7 @@ def _manifest(src: Path, man_path: Path, force: bool):
     her durumda yeniden uretir.
     """
     st = src.stat()
-    if not force and man_path.is_file():
+    if not force and _regular(man_path):
         try:
             if man_path.stat().st_mtime >= st.st_mtime:
                 man = cdc.read_manifest(man_path)
@@ -91,8 +108,16 @@ def _manifest(src: Path, man_path: Path, force: bool):
     return man, True
 
 
+def _unsafe_name(name: str) -> bool:
+    """Kontrol karakteri tasiyan ad XML 1.0'u ve `<ozet>  <ad>` satirini
+    bozar (satir enjeksiyonu): boyle dosyalar atlanir."""
+    return any(c < " " or c == "\x7f" for c in name)
+
+
 def _publishable(p: Path, pattern: str | None) -> bool:
-    if p.name.endswith(OWN_SUFFIXES) or not p.is_file():
+    if p.name.endswith(OWN_SUFFIXES) or p.name.startswith(cdc.TMP_PREFIX):
+        return False
+    if not _regular(p):          # sembolik bag: hedefi yayinlanmaz
         return False
     return pattern is None or fnmatch.fnmatchcase(p.name, pattern)
 
@@ -144,7 +169,8 @@ def publish(directory, base_url: str, mirrors=(), pattern: str | None = None,
     Donen sozluk: {"dir", "index", "files": [{"name", "size", "sha256",
     "merkle_path", "merkle_chunks", "merkle_root", "sha256_path",
     "meta4_path"}]}. Hata durumlari ValueError (kullanici girdisi) ya da
-    OSError (dosya sistemi)."""
+    OSError (dosya sistemi). Sembolik baglar yayinlanmaz; kontrol
+    karakteri tasiyan adlar atlanir ve stderr'e uyari yazilir."""
     root = Path(directory).expanduser()
     if not root.is_dir():
         raise ValueError(f"dizin yok: {directory}")
@@ -154,8 +180,17 @@ def publish(directory, base_url: str, mirrors=(), pattern: str | None = None,
     entries: list[Entry] = []
     files: list[dict] = []
     published = 0.0
-    for src in sorted((p for p in root.iterdir()
-                       if _publishable(p, pattern)), key=lambda p: p.name):
+    selected = []
+    for p in sorted(root.iterdir(), key=lambda q: q.name):
+        if not _publishable(p, pattern):
+            continue
+        if _unsafe_name(p.name):
+            # kontrol karakteri: gecersiz XML / enjekte edilmis sha256 satiri
+            print(f"uyari: dosya adinda kontrol karakteri var, atlandi: "
+                  f"{p.name!r}", file=sys.stderr)
+            continue
+        selected.append(p)
+    for src in selected:
         st = src.stat()
         name = src.name
         man = None

@@ -20,11 +20,13 @@ import hashlib
 import json
 import mmap
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 ALGO = "fastcdc-sha256"
 SUFFIX = ".ferdim-merkle"
+TMP_PREFIX = ".ferdim-"      # atomik yazimda gecici dosya oneki
 MIN_CHUNK = 256 << 10        # 256 KiB
 AVG_CHUNK = 1 << 20          # 1 MiB
 MAX_CHUNK = 4 << 20          # 4 MiB
@@ -364,10 +366,32 @@ def read_manifest(path) -> Manifest:
     return Manifest.parse(Path(path).read_text("utf-8", "replace"))
 
 
-def write_manifest(man: Manifest, path) -> Path:
+def write_atomic(path, text: str) -> Path:
+    """Metni atomik yazar: gecici dosya hedef dizinde O_EXCL ile acilir
+    (mkstemp, mevcut bir adi/sembolik bagi asla izlemez), fsync + 0644,
+    sonra os.replace hedefin uzerine koyar. replace bagin KENDISINI
+    degistirir: onceden kurulmus bir bag varsa gosterdigi dosya degismez."""
     p = Path(path)
-    p.write_text(man.dumps() + "\n", encoding="utf-8")
+    data = text.encode("utf-8")
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=TMP_PREFIX)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fchmod(f.fileno(), 0o644)
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return p
+
+
+def write_manifest(man: Manifest, path) -> Path:
+    return write_atomic(path, man.dumps() + "\n")
 
 
 def verify_file(path, man: Manifest, halt=None):

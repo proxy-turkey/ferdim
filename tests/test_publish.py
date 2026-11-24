@@ -256,6 +256,88 @@ class PublishTest(unittest.TestCase):
             publish.publish(self.root / "nope", base_url=BASE)
 
 
+class PublishSafetyTest(unittest.TestCase):
+    """Denetim bulgulari 6/7/16: yayin dizinine kurulmus sembolik baglar
+    izlenmez, bagli girdiler yayinlanmaz, kontrol karakterli adlar atlanir."""
+
+    def setUp(self):
+        self.root = tmp_root(self, "ferdim-publish-safe-")
+        self.dir = self.root / "site"
+        self.dir.mkdir()
+        self.art = self.dir / "alpha.bin"
+        self.art.write_bytes(b"alpha" * 100)
+        os.utime(self.art, (1_700_000_000, 1_700_000_000))
+        self.victim = self.root / "victim.txt"
+        self.victim.write_text("kiymetli veri\n", "utf-8")
+        self.written = ("alpha.bin" + cdc.SUFFIX, "alpha.bin.sha256",
+                        "alpha.bin.meta4", publish.INDEX_NAME)
+        self.stale = tuple(n + ".part" for n in self.written)
+
+    def test_planted_output_symlinks_are_not_written_through(self):
+        """Her tahmin edilebilir cikti adina bag kurulur: hedef dosya
+        degismez, yazilan cikti duzenli dosya olur. Eski `<ad>.part`
+        adlari artik kullanilmaz: oradaki baglar da hedeflerini korur."""
+        for name in self.written + self.stale:
+            with self.subTest(name=name):
+                os.symlink(self.victim, self.dir / name)
+        publish.publish(self.dir, base_url=BASE)
+        self.assertEqual(self.victim.read_text("utf-8"), "kiymetli veri\n",
+                         "bag hedefi ezilmemeli")
+        for name in self.written:
+            with self.subTest(name=name):
+                self.assertFalse((self.dir / name).is_symlink(), name)
+                self.assertTrue((self.dir / name).is_file(), name)
+        self.assertEqual(
+            (self.dir / "alpha.bin.sha256").read_text("utf-8").split("  ")[0],
+            hashlib.sha256(self.art.read_bytes()).hexdigest())
+        # ikinci calistirma da baglari hedefe yazmaz
+        publish.publish(self.dir, base_url=BASE)
+        self.assertEqual(self.victim.read_text("utf-8"), "kiymetli veri\n")
+
+    def test_symlinked_artefact_is_not_published(self):
+        os.symlink(self.victim, self.dir / "notes.md")
+        res = publish.publish(self.dir, base_url=BASE)
+        self.assertEqual([f["name"] for f in res["files"]], ["alpha.bin"])
+        self.assertEqual(self.victim.read_text("utf-8"), "kiymetli veri\n")
+        index = (self.dir / publish.INDEX_NAME).read_text("utf-8")
+        self.assertNotIn("notes.md", index)
+        for suffix in (cdc.SUFFIX, publish.SHA256_SUFFIX,
+                       publish.META4_SUFFIX):
+            self.assertFalse((self.dir / ("notes.md" + suffix)).exists(),
+                             suffix)
+
+    def test_control_char_names_are_skipped_with_a_warning(self):
+        bad = [self.dir / "inject\n$(rm -rf).bin", self.dir / "bell\x07.bin"]
+        for p in bad:
+            p.write_bytes(b"kotu")
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            res = publish.publish(self.dir, base_url=BASE)
+        self.assertEqual([f["name"] for f in res["files"]], ["alpha.bin"])
+        warn = err.getvalue()
+        self.assertEqual(warn.count("\n"), len(bad), "ad basina tek satir")
+        self.assertIn("kontrol karakteri", warn)
+        for p in bad:
+            with self.subTest(name=p.name):
+                self.assertIn(repr(p.name), warn)
+                for suffix in (cdc.SUFFIX, publish.SHA256_SUFFIX,
+                               publish.META4_SUFFIX):
+                    self.assertFalse((self.dir / (p.name + suffix)).exists())
+        index = self.dir / publish.INDEX_NAME
+        self.assertNotIn("inject", index.read_text("utf-8"))
+        ET.parse(index)                     # gecerli XML kaldi
+
+    def test_only_unpublishable_names_is_an_error(self):
+        site = self.root / "only-bad"
+        site.mkdir()
+        (site / "bad\nname.bin").write_bytes(b"x")
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            with self.assertRaises(ValueError):
+                publish.publish(site, base_url=BASE)
+        self.assertIn("kontrol karakteri", err.getvalue())
+
+
 class PublishCliTest(unittest.TestCase):
     def setUp(self):
         self.root = tmp_root(self, "ferdim-publish-cli-")

@@ -12,6 +12,7 @@ import hashlib
 import json
 import mmap
 import os
+import stat
 import sys
 import threading
 import time
@@ -327,6 +328,58 @@ class ChunkerStabilityTests(unittest.TestCase):
             self.assertEqual(list(cdc.chunk_ranges(mm, **SMALL)), want)
         self.assertEqual([h for _, _, h in cdc.chunk_hashes(p, **SMALL)],
                          [sha(data[s:e]) for s, e in want])
+
+
+class ManifestWriteTests(unittest.TestCase):
+    """Bildirim yazimi atomiktir (denetim bulgusu 6): tahmin edilebilir
+    `.part` adi kullanilmaz, hedefteki sembolik bag izlenmez."""
+
+    MAN = cdc.Manifest.of([(0, 5, sha(b"hello"))])
+
+    def test_50_symlinked_target_is_not_written_through(self):
+        root = tmp_root(self, "ferdim-cdc-atomic-")
+        victim = root / "victim.txt"
+        victim.write_text("kiymetli\n", "utf-8")
+        link = root / "x.ferdim-merkle"
+        os.symlink(victim, link)
+        out = cdc.write_manifest(self.MAN, link)
+        self.assertEqual(out, link)
+        self.assertEqual(victim.read_text("utf-8"), "kiymetli\n")
+        self.assertFalse(link.is_symlink(), "bag duzenli dosyayla degisir")
+        self.assertEqual(cdc.read_manifest(link), self.MAN)
+
+    def test_51_regular_target_is_replaced_with_0644(self):
+        root = tmp_root(self, "ferdim-cdc-atomic2-")
+        p = root / "y.ferdim-merkle"
+        p.write_text("eski\n", "utf-8")
+        cdc.write_manifest(self.MAN, p)
+        self.assertEqual(p.read_text("utf-8"), self.MAN.dumps() + "\n")
+        self.assertEqual(stat.S_IMODE(os.lstat(p).st_mode), 0o644)
+        self.assertEqual([q.name for q in root.iterdir()
+                          if q.name.startswith(cdc.TMP_PREFIX)], [],
+                         "gecici dosya kalmamali")
+
+    def test_52_planted_part_symlink_is_not_used(self):
+        root = tmp_root(self, "ferdim-cdc-atomic3-")
+        victim = root / "victim.txt"
+        victim.write_text("kiymetli\n", "utf-8")
+        os.symlink(victim, root / "z.ferdim-merkle.part")
+        cdc.write_manifest(self.MAN, root / "z.ferdim-merkle")
+        self.assertEqual(victim.read_text("utf-8"), "kiymetli\n")
+        self.assertEqual(cdc.read_manifest(root / "z.ferdim-merkle"),
+                         self.MAN)
+
+    def test_53_failed_replace_keeps_the_target(self):
+        root = tmp_root(self, "ferdim-cdc-atomic4-")
+        p = root / "w.ferdim-merkle"
+        p.write_text("eski\n", "utf-8")
+        with mock.patch.object(cdc.os, "replace",
+                               side_effect=OSError(28, "ENOSPC")):
+            with self.assertRaises(OSError):
+                cdc.write_manifest(self.MAN, p)
+        self.assertEqual(p.read_text("utf-8"), "eski\n")
+        self.assertEqual([q.name for q in root.iterdir()
+                          if q.name.startswith(cdc.TMP_PREFIX)], [])
 
 
 class CdcServer(BaseHTTPRequestHandler):

@@ -69,6 +69,26 @@ first run wrote. Subdirectories are not descended into: flatten the
 release directory, or run the command once per subdirectory with its own
 `--base-url`.
 
+## Safety on a shared release directory
+
+The directory is treated as untrusted input, because release trees are
+often shared or written by another account:
+
+* every output is written through a temporary file created with `O_EXCL`
+  in the *same* directory (`mkstemp`), fsynced, chmod `0644` and then
+  renamed onto the final name. The temporary name is unpredictable and
+  the rename replaces a symlink instead of writing through it, so a
+  planted `alpha.iso.sha256 -> ~/.bashrc` link (or the old predictable
+  `.part` names) can never clobber a file outside the release set;
+* symlinked artefacts are skipped — `notes -> ~/.ssh/id_ed25519` is not
+  hashed, listed, or given sidecars. Only regular files are published;
+* file names containing control characters (newline, tab, escape, DEL …)
+  are skipped with a warning on stderr: they cannot be represented in
+  valid XML and would inject a line into the coreutils `.sha256` format;
+* content that did not change is not rewritten, so the symlink handling
+  never churns an already-correct release tree.
+
+
 ## Verifying a published tree
 
 ```bash
