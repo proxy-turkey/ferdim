@@ -62,6 +62,18 @@ class QueueStartDispatchTests(unittest.TestCase):
         self.addCleanup(qm.shutdown)
         return qm
 
+    def _queue_quiet(self, **over) -> QueueManager:
+        """Arka plan donguleri kapali kuyruk (elle _tick() denetimi icin).
+
+        Kapanma (_running=False) ile kapatmak YENI davranisa gore dogru
+        degil: kapanistan sonra tick dagitim yapmaz. Testte yalniz tick
+        dongusunun kendisi devre disi birakilir."""
+        with mock.patch.object(QueueManager, "_tick_loop",
+                               lambda self: None), \
+                mock.patch.object(QueueManager, "_prober_loop",
+                                  lambda self: None):
+            return self._queue(**over)
+
     def _gate(self, match, fail_first=False):
         """Eslesen isin ILK hazirligini kapida tutar (ag gerekmez).
 
@@ -161,13 +173,9 @@ class QueueStartDispatchTests(unittest.TestCase):
     def test_03_tick_returns_before_prepare_finishes(self):
         """tick, hazirlik bitmeden donmeli (eski hata: ayni iplikte
         job.start() cagriliyordu)."""
-        qm = self._queue(max_concurrent=3)
+        qm = self._queue_quiet(max_concurrent=3)
         gate, entered = self._gate(lambda j: j.url == SLOW_URL,
                                    fail_first=True)
-        qm._running = False
-        for th in (qm._ticker, qm._prober):
-            if th is not None:
-                th.join(2.0)
         slow = qm.add(JobSpec(url=SLOW_URL, filename="q-tick-slow.bin",
                               segments=2))
         t0 = time.monotonic()
@@ -213,11 +221,7 @@ class QueueStartDispatchTests(unittest.TestCase):
         """Dagitimdan HEMEN sonra gelen duraklatma kaybolmamali: is
         'paused' kalir, dosya yazilmaz (start() 'queued' kontrolu ya da
         'connecting' katlamasi karari korur)."""
-        qm = self._queue(max_concurrent=2)
-        qm._running = False
-        for th in (qm._ticker, qm._prober):
-            if th is not None:
-                th.join(2.0)
+        qm = self._queue_quiet(max_concurrent=2)
         job = qm.add(JobSpec(url=f"{self.base}/tiny.bin",
                              filename="q-dispatch-pause.bin", segments=2))
         self.assertTrue(qm._start_async(job), "baslatma dagitilmadi")
@@ -228,6 +232,51 @@ class QueueStartDispatchTests(unittest.TestCase):
                         "yuva kaydi bosalmadi")
         self.assertIsNone(job._monitor, "isci havuzu kurulmamali")
         self.assertEqual(job.done, 0)
+        self.assertFalse(job.final_path.exists(), "dosya yazilmamali")
+
+    def test_06_tick_does_not_dispatch_after_shutdown(self):
+        """Kapanistan sonra tick yeni is dagitmaz: baslatma parcacigi
+        beklemedeyken cagrilan _tick isi indirmeye baslatmamali."""
+        qm = self._queue_quiet(max_concurrent=2)
+        qm.shutdown()                       # _running = False
+        job = qm.add(JobSpec(url=f"{self.base}/tiny.bin",
+                             filename="q-after-shutdown.bin", segments=2))
+        qm._tick()
+        self.assertEqual(job.state, JobState.QUEUED)
+        self.assertEqual(qm._starting, set())
+        self.assertFalse(job.final_path.exists(), "dosya yazilmamali")
+
+    def test_07_start_async_requires_queued_and_present(self):
+        """Dagitim yalniz kuyrukta DURAN is icin: duraklatilmis ya da
+        kaldirilmis is icin yuva ayrilmaz."""
+        qm = self._queue_quiet(max_concurrent=2)
+        paused = qm.add(JobSpec(url=SLOW_URL, filename="q-paused.bin"),
+                        paused=True)
+        self.assertFalse(qm._start_async(paused))
+        self.assertEqual(qm._starting, set())
+        self.assertIsNone(paused._monitor)
+        gone = qm.add(JobSpec(url=SLOW_URL, filename="q-gone.bin"))
+        self.assertTrue(qm.remove(gone.id))
+        self.assertFalse(qm._start_async(gone))
+        self.assertEqual(qm._starting, set())
+        self.assertIsNone(gone._monitor)
+
+    def test_08_remove_during_dispatch_window_cancels_start(self):
+        """Dagitim penceresinde silinen is baslatilmaz: kimlik _starting'den
+        dusurulur, is iptal edilir, isci havuzu ve dosya olusmaz."""
+        qm = self._queue_quiet(max_concurrent=2)
+        job = qm.add(JobSpec(url=f"{self.base}/tiny.bin",
+                             filename="q-dispatch-rm.bin", segments=2))
+        with qm._lock:
+            qm._starting.add(job.id)    # yuva ayrildi, parcacik henuz kosmuyor
+        self.assertTrue(qm.remove(job.id))
+        self.assertNotIn(job.id, qm._starting)
+        self.assertEqual(job.state, JobState.CANCELED)
+        self.assertIsNone(job._monitor)
+        qm._run_start(job)              # parcacik gec calissa da baslatmaz
+        self.assertEqual(job.state, JobState.CANCELED)
+        job.start(queued_only=True)     # kuyruk kontrolu de korur
+        self.assertEqual(job.state, JobState.CANCELED)
         self.assertFalse(job.final_path.exists(), "dosya yazilmamali")
 
 

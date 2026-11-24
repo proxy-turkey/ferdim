@@ -483,9 +483,7 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         val = params.get("value", 0)
         if isinstance(val, str) and val.strip().lower() == "plan":
             # 'limit plan': denetim yeniden saat planina birakilir
-            cfg["speed_plan_manual"] = False
-            ctx["set_cfg"](cfg)
-            qm._speed_plan_tick()
+            qm.set_speed_plan(cfg.get("speed_plan"), manual=False)
             return {"ok": True, "speed_limit": qm.cfg["speed_limit"],
                     "speed_plan": qm.plan_status()}
         if isinstance(val, str):
@@ -495,9 +493,8 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         # yoksa dugme TURBO ACIK gorunurken limit uygulanirdi
         if val > 0 and cfg.get("turbo_mode"):
             qm.set_turbo(False)
-        qm.set_speed_limit(val)
-        # elle verilen limit plani ezer: kullanici acik secim yapti
-        cfg["speed_plan_manual"] = True
+        # elle verilen limit plani ezer; plan silinirse bu deger geri gelir
+        qm.set_manual_limit(val)
         ctx["set_cfg"](cfg)
         return {"ok": True, "speed_limit": qm.cfg["speed_limit"],
                 "speed_plan": qm.plan_status()}
@@ -538,7 +535,11 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         if "speed_limit" in new:
             qm.set_speed_limit(int(cfg.get("speed_limit") or 0))
         if "speed_plan" in new or "speed_plan_manual" in new:
-            qm._speed_plan_tick()      # yeni plan hemen uygulanir
+            # plan degisikligi set_speed_plan ile ayni yoldan gecer: plan
+            # bosaltilinca onceki kullanici limiti geri yuklenir ve duzeltilmis
+            # deger diske yazilir (web ayarlari bu yolu kullanir)
+            qm.set_speed_plan(cfg.get("speed_plan"),
+                              manual=bool(cfg.get("speed_plan_manual")))
         out = {"ok": True, "config": cfg}
         if warning:
             out["warning"] = warning

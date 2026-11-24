@@ -74,6 +74,21 @@ class CollectorTests(unittest.TestCase):
         self.assertIn('ferdim_bytes_total{host="example.com"} 3010',
                       col.render())
 
+    def test_02b_restart_resets_the_baseline(self):
+        """job.done geri sararsa (yeniden baslatma / merkle onarimi) taban
+        duser: negatif delta yok, yeniden indirilen baytlar sayilir."""
+        col = metrics.Collector()
+        job = FakeJob("a", "example.com", done=3000)
+        col.observe([job])
+        job.done = 10                     # bastan indirme
+        col.observe([job])
+        self.assertIn('ferdim_bytes_total{host="example.com"} 3000',
+                      col.render())
+        job.done = 500
+        col.observe([job])                # 10 -> 500 yeniden indirildi
+        self.assertIn('ferdim_bytes_total{host="example.com"} 3490',
+                      col.render())
+
     def test_03_retry_and_throttle_deltas(self):
         col = metrics.Collector()
         job = FakeJob("a", "example.com", done=5)
@@ -118,6 +133,43 @@ class CollectorTests(unittest.TestCase):
         # collect: ornekleyici yoksa bos govde degil, gecerli metin
         self.assertIn("# TYPE ferdim_build_info",
                       metrics.render(object()))
+
+    def test_07_broken_job_does_not_abort_sampling(self):
+        """Bir isin okunamasi tick'in tamamini dusurmemeli."""
+        class Bad:
+            id = "a"
+            done = 50
+
+            @property
+            def state(self):
+                raise RuntimeError("bozuk is")
+
+        col = metrics.Collector()
+        col.observe([Bad(), FakeJob("b", "ok.example", done=100)])
+        text = col.render()
+        self.assertIn('ferdim_bytes_total{host="ok.example"} 100', text)
+        self.assertNotIn("bad.example", text)
+
+    def test_08_counters_snapshot_takes_job_lock(self):
+        """stats_counters is kilidi altinda kopyalanir (isciler ayni
+        sozlugu degistirir; gezinme RuntimeError firlatabilirdi)."""
+        class ProbeLock:
+            entered = 0
+
+            def __enter__(self):
+                ProbeLock.entered += 1
+
+            def __exit__(self, *exc):
+                return False
+
+        job = FakeJob("a", "example.com")
+        job._lock = ProbeLock()
+        job.stats_counters = {"retries": {"example.com": 3}, "throttles": {}}
+        col = metrics.Collector()
+        col.observe([job])
+        self.assertEqual(ProbeLock.entered, 1)
+        self.assertIn('ferdim_retries_total{host="example.com"} 3',
+                      col.render())
 
 
 class QueueWiringTests(unittest.TestCase):

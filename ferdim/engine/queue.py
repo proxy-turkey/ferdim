@@ -140,7 +140,13 @@ class QueueManager:
         job = self.get(job_id)
         if not job:
             return False
-        if job.state in STATES_RUNNING:
+        with self._lock:
+            # dagitimi verilmis ama henuz 'connecting' olmamis is de
+            # iptal edilir: aksi halde baslatma parcacigi kullanici
+            # kaldirdiktan sonra indirmeye baslardi
+            dispatching = job.id in self._starting
+            self._starting.discard(job.id)
+        if job.state in STATES_RUNNING or dispatching:
             job.cancel(delete_files)
         elif delete_files:
             try:
@@ -148,6 +154,8 @@ class QueueManager:
             except Exception:
                 pass
         with self._lock:
+            if job not in self.jobs:        # es zamanli iki remove
+                return False
             self.jobs.remove(job)
             self._hist_state.pop(job.id, None)
             self._save()
@@ -199,7 +207,9 @@ class QueueManager:
             queued = [j for j in self.jobs if j.state == JobState.QUEUED]
         self._speed_plan_tick()
         limit = int(self.cfg.get("max_concurrent", 3))
-        if self._schedule_active():
+        # kapanistan sonra yeni is dagitilmaz: baslatma parcaciklari
+        # beklemedeyken _tick elle cagrilirsa is baslamamali
+        if self._running and self._schedule_active():
             slots = max(0, limit - len(running))
             # kategori penceresi kapali olan isler siralarini bekler
             queued = [j for j in queued if self._in_job_window(j)]
@@ -238,8 +248,15 @@ class QueueManager:
         diger islerin baslamasini, hiz guncellemesini ve kaliciligi
         durdurmasina yol aciyordu. Yuva AYNI kilit altinda ayrilir: es
         zamanli tick'ler max_concurrent'i asamaz (start() durumu
-        'connecting' yapana kadar is _starting'de sayilir)."""
+        'connecting' yapana kadar is _starting'de sayilir).
+
+        Dagitim penceresi kilit altinda dogrulanir: is bu arada
+        kaldirildiysa ya da duraklatildiysa (artik KUYRUK'ta degilse)
+        baslatilmaz - aksi halde 'silinen' is indirmeye devam ederdi."""
         with self._lock:
+            if not any(j is job for j in self.jobs) \
+                    or job.state != JobState.QUEUED:
+                return False
             busy = len({j.id for j in self.jobs if j.state in STATES_RUNNING}
                        | self._starting)
             if busy >= int(self.cfg.get("max_concurrent", 3)):
@@ -256,6 +273,13 @@ class QueueManager:
 
     def _run_start(self, job):
         try:
+            # kilit altinda son kontrol: is kaldirildiysa/duraklatildiysa
+            # parcacik onu baslatmaz (remove(): _starting'den dusurur)
+            with self._lock:
+                if job.id not in self._starting \
+                        or not any(j is job for j in self.jobs) \
+                        or job.state != JobState.QUEUED:
+                    return
             job.start(queued_only=True)
         except Exception:
             pass
@@ -373,26 +397,48 @@ class QueueManager:
         True/False: elle ezme durumunu ayarla (resume False gonderir).
 
         Plan kilidi, arka plan tick'inin eski plani temizlikten sonra
-        yeniden uygulamasini engeller."""
+        yeniden uygulamasini engeller. Plan bosalinca (hangi yoldan
+        olursa olsun) onceki kullanici limiti geri yuklenir."""
         with self._plan_lock:
             self.cfg["speed_plan"] = util.sanitize_speed_plan(plan)
             if manual is not None:
                 self.cfg["speed_plan_manual"] = bool(manual)
-            if not self.cfg["speed_plan"] and self._plan_saved is not None:
-                # plan kalkti: plandan onceki kullanici limiti geri gelir
-                saved, self._plan_saved = self._plan_saved, None
-                self.set_speed_limit(saved)
+            self._plan_restore_locked()
             self.env.save_config(self.cfg)
             self._speed_plan_tick()
         self._notify()
         return self.plan_status()
 
+    def set_manual_limit(self, bytes_per_sec: int) -> None:
+        """Elle verilen limit (limit komutu): plani ezer ve plan silinirse
+        BU deger geri yuklenir (bayat plan-oncesi deger degil)."""
+        with self._plan_lock:
+            self.cfg["speed_plan_manual"] = True
+            self.set_speed_limit(int(bytes_per_sec))
+            # plan etkinken 'speedplan clear' kullanicinin son secimini korur
+            self._plan_saved = (int(bytes_per_sec)
+                                if util.speed_plan_limit(
+                                    self.cfg.get("speed_plan")) is not None
+                                else None)
+
+    def _plan_restore_locked(self) -> None:
+        """Plan bosaldiysa (config-set, set_speed_plan ya da dogrudan atama)
+        plandan onceki/elle verilen limiti geri yukler. Kilit cagiranda."""
+        if util.speed_plan_limit(self.cfg.get("speed_plan")) is not None:
+            return
+        saved, self._plan_saved = self._plan_saved, None
+        if saved is not None:
+            self.set_speed_limit(saved)
+
     def _speed_plan_tick(self):
         """Etkin kuralin limitini her tick uygular; elle verilen limit
         (limit komutu) plani ezer ve kullanici denetimi geri alana kadar
-        tick hicbir seye dokunmaz."""
+        tick hicbir seye dokunmaz. Plan bosaldiginda (hangi yoldan olursa
+        olsun) kayitli kullanici limiti geri yuklenir: aksi halde plan
+        limiti kalici olarak uygulanmis kalirdi."""
         changed = False
         with self._plan_lock:
+            self._plan_restore_locked()
             limit = util.speed_plan_limit(self.cfg.get("speed_plan"))
             if limit is None or self.cfg.get("speed_plan_manual"):
                 return

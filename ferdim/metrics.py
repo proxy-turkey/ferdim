@@ -54,32 +54,42 @@ class Collector:
 
     # ------------------------------------------------------------ ornekleme
     def observe(self, jobs, coexist_active: bool = False) -> None:
-        """Kuyruk tick'i: is nesnelerini okur, deltalari toplama ekler."""
+        """Kuyruk tick'i: is nesnelerini okur, deltalari toplama ekler.
+
+        Tek bir isin okunamasi (kilit/ozellik hatasi) tick'in tamamini
+        dusurmez: is atlanir, digerleri sayilir."""
         with self._lock:
             live: set[str] = set()
             states: dict[str, int] = {}
             links, speed = 0, 0.0
             for job in list(jobs):
-                jid = str(getattr(job, "id", "") or "")
-                if not jid:
+                try:
+                    jid = str(getattr(job, "id", "") or "")
+                    if not jid:
+                        continue
+                    live.add(jid)
+                    state = str(getattr(job, "state", "") or "")
+                    states[state] = states.get(state, 0) + 1
+                    if state in TERMINAL and self._states.get(jid) not in TERMINAL:
+                        self._jobs_total[state] = \
+                            self._jobs_total.get(state, 0) + 1
+                    self._states[jid] = state
+                    links += max(0, int(getattr(job, "_active", 0) or 0))
+                    speed += max(0.0, float(getattr(job, "speed", 0.0) or 0.0))
+                    host = str(getattr(job, "_host", "") or
+                               host_key(getattr(job, "url", "")) or "?")
+                    done = max(0, int(getattr(job, "done", 0) or 0))
+                    prev = self._done.get(jid, 0)
+                    if done < prev:
+                        # yeniden baslatma / merkle onarimi: taban duser,
+                        # negatif delta uretilmez; sonraki baytlar sayilir
+                        prev = done
+                    self._done[jid] = done
+                    if done > prev:
+                        self._add(self._bytes, host, done - prev)
+                    self._sample_counters(jid, self._snapshot_counters(job))
+                except Exception:
                     continue
-                live.add(jid)
-                state = str(getattr(job, "state", "") or "")
-                states[state] = states.get(state, 0) + 1
-                if state in TERMINAL and self._states.get(jid) not in TERMINAL:
-                    self._jobs_total[state] = self._jobs_total.get(state, 0) + 1
-                self._states[jid] = state
-                links += max(0, int(getattr(job, "_active", 0) or 0))
-                speed += max(0.0, float(getattr(job, "speed", 0.0) or 0.0))
-                host = str(getattr(job, "_host", "") or
-                           host_key(getattr(job, "url", "")) or "?")
-                done = max(0, int(getattr(job, "done", 0) or 0))
-                prev = self._done.get(jid, 0)
-                if done > prev:
-                    self._add(self._bytes, host, done - prev)
-                self._done[jid] = done
-                self._sample_counters(jid,
-                                      getattr(job, "stats_counters", None))
             for jid in set(self._done) - live:      # kuyruktan cikti
                 self._done.pop(jid, None)
                 self._counters.pop(jid, None)
@@ -88,6 +98,23 @@ class Collector:
             self._links = links
             self._speed = speed
             self._coexist = 1 if coexist_active else 0
+
+    @staticmethod
+    def _snapshot_counters(job):
+        """job.stats_counters'i is kilidi altinda kopyalar: isciler ayni
+        sozlugu degistirirken gezinmek RuntimeError firlatabilir."""
+        raw = getattr(job, "stats_counters", None)
+        if not isinstance(raw, dict):
+            return None
+        lock = getattr(job, "_lock", None)
+        try:
+            if lock is not None:
+                with lock:
+                    return {k: dict(v) for k, v in raw.items()
+                            if isinstance(v, dict)}
+            return {k: dict(v) for k, v in raw.items() if isinstance(v, dict)}
+        except Exception:
+            return None
 
     @staticmethod
     def _add(target: dict, host: str, n: int) -> None:

@@ -243,6 +243,54 @@ class PlanApiTests(unittest.TestCase):
         api._sanitize_config(cfg)
         self.assertIs(cfg["speed_plan_manual"], True)
 
+    def test_05_config_set_clear_restores_the_user_limit(self):
+        """Web ayarlari plani bos liste ile gonderir (config-set): plan
+        limiti kalici uygulanmis kalmamali, onceki kullanici limiti
+        (diske de) geri gelmeli."""
+        self.cfg["turbo_mode"] = False
+        self.cfg["speed_limit"] = 500_000
+        r = api.handle(self.ctx, "config-set", {"config": {
+            "speed_plan": [{"days": "", "limit": "2MB"}]}})
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.qm.cfg["speed_limit"], 2 * MB)
+        r = api.handle(self.ctx, "config-set", {"config": {"speed_plan": []}})
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.qm.cfg["speed_limit"], 500_000)
+        self.assertEqual(self.qm.bucket.rate, 500_000)
+        st = self.qm.stats()["speed_plan"]
+        self.assertFalse(st["enabled"])
+        self.assertIsNone(st["active_rule"])
+        on_disk = self.env.load_config()
+        self.assertEqual(on_disk["speed_plan"], [])
+        self.assertEqual(on_disk["speed_limit"], 500_000)   # duzeltilmis deger
+
+    def test_06_plan_emptied_by_any_path_restores(self):
+        """Plan bosaltma yalniz set_speed_plan'dan gecmek zorunda degil:
+        dogrudan atamadan sonraki tick de limite takili kalmaz."""
+        self.cfg["turbo_mode"] = False
+        self.cfg["speed_limit"] = 0
+        self.cfg["speed_plan"] = [dict(ALL_DAY)]
+        self.qm._tick()
+        self.assertEqual(self.qm.cfg["speed_limit"], 2 * MB)
+        self.cfg["speed_plan"] = []
+        self.qm._tick()
+        self.assertEqual(self.qm.cfg["speed_limit"], 0)
+        self.assertEqual(self.qm.bucket.rate, 0)
+
+    def test_07_manual_limit_during_plan_survives_clear(self):
+        """Plan etkinken elle verilen limit 'clear' ile geri gelir: bayat
+        plan-oncesi deger degil, kullanicinin son secimi korunur."""
+        self.ctx["cfg"]["speed_plan"] = [dict(ALL_DAY)]
+        self.qm._tick()
+        self.assertEqual(self.qm.cfg["speed_limit"], 2 * MB)
+        api.handle(self.ctx, "limit", {"value": "1MB"})
+        self.assertEqual(self.qm._plan_saved, MB)
+        cleared = api.handle(self.ctx, "speedplan", {"action": "clear"})
+        self.assertEqual(cleared["plan"], [])
+        self.assertEqual(cleared["limit"], 0)
+        self.assertEqual(self.qm.cfg["speed_limit"], MB)
+        self.assertEqual(self.qm.bucket.rate, MB)
+
 
 class PlanCliTests(unittest.TestCase):
     def test_01_parser_surface(self):
