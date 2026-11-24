@@ -189,10 +189,20 @@ class Manifest:
                 raise ValueError("gecersiz parca ofseti")
             if off != pos or ln <= 0:
                 raise ValueError("parcalar bitisik degil")
+            if ln > MAX_CHUNK:
+                raise ValueError("parca boyu ust sinirin uzerinde")
             chunks.append((off, ln, _hex64(hx)))
             pos += ln
         if pos != size:
             raise ValueError("parca boylari toplami dosya boyuna esit degil")
+        # amplifikasyon siniri: uydurma bildirim binlerce kucuk parca
+        # bildirip dogrulamayi/onarimi sismesin. Son parca kisa olabilir,
+        # digerleri MIN_CHUNK'tan kucuk olamaz (uretilen bildirim boyle).
+        if len(chunks) > size // MIN_CHUNK + 1:
+            raise ValueError("parca sayisi dosya boyuna gore fazla")
+        for _, ln, _ in chunks[:-1]:
+            if ln < MIN_CHUNK:
+                raise ValueError("parca boyu alt sinirin altinda")
         root = _hex64(data.get("root"))
         if merkle_root([h for _, _, h in chunks]) != root:
             raise ValueError("kok parca listesiyle uyusmuyor")
@@ -230,9 +240,15 @@ def write_manifest(man: Manifest, path) -> Path:
     return p
 
 
-def verify_file(path, man: Manifest) -> tuple[bool, list[tuple[int, int]]]:
+def verify_file(path, man: Manifest, halt=None):
     """(boyut uygun mu, bozuk parcalar). Ofsetler bildirimden gelir:
-    yeniden parcalamaya gerek yok, okuma siraldir."""
+    yeniden parcalamaya gerek yok, okuma siraldir.
+
+    `halt`: dogrulama durdurulmali mi (duraklat/iptal). Her parca ve her
+    okuma blogu basinda sorulur; True donerse dogrulama kesilir ve None
+    doner - boylece duraklatma uzun bir dogrulamayi beklemez."""
+    if halt is not None and halt():
+        return None
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -242,6 +258,8 @@ def verify_file(path, man: Manifest) -> tuple[bool, list[tuple[int, int]]]:
     bad = []
     with open(path, "rb") as f:
         for off, ln, hx in man.chunks:
+            if halt is not None and halt():
+                return None
             f.seek(off)
             h = hashlib.sha256()
             left = ln
@@ -251,6 +269,8 @@ def verify_file(path, man: Manifest) -> tuple[bool, list[tuple[int, int]]]:
                     return False, []
                 h.update(b)
                 left -= len(b)
+                if halt is not None and halt():
+                    return None
             if h.hexdigest() != hx:
                 bad.append((off, ln))
     return True, bad

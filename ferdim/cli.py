@@ -69,6 +69,16 @@ def _add_file(c, path: str) -> int:
     return n
 
 
+def _abs_merkle(value: str) -> str:
+    """Yerel merkle bildirimi mutlak yola cevrilir: istegi daemon yurutur ve
+    onun calisma dizini istemcininki degildir (goreli yol yanlis yeri
+    gosterip isi merkle_manifest ile bitirirdi). URL'ler aynen kalir."""
+    v = str(value or "").strip()
+    if v and not v.startswith(("http://", "https://")):
+        return os.path.abspath(os.path.expanduser(v))
+    return v
+
+
 def cmd_add(a, env):
     if a.url.startswith("@"):          # ferdim add @liste.txt
         with _client(env) as c:
@@ -89,7 +99,7 @@ def cmd_add(a, env):
                       limit=a.limit, mirrors=a.mirror,
                       sha256=a.sha256, md5=a.md5,
                       sha1=a.sha1, sha512=a.sha512, checksums=checks,
-                      merkle=a.merkle)
+                      merkle=_abs_merkle(a.merkle))
         if not r.get("ok"):
             print(_("cli_error") + ":", r.get("error"), file=sys.stderr)
             return 1
@@ -425,7 +435,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--mirror", action="append", default=[],
                     help="aynak URL (tekrarlanabilir; .metalink otomatik)")
     sp.add_argument("--merkle",
-                    help="parca bazli dogrulama bildirimi (URL ya da yerel yol)")
+                    help="parca bazli dogrulama bildirimi (URL ya da yerel yol;"
+                         " yalniz HTTP(S) isleri)")
     sp.set_defaults(fn=cmd_add)
 
     sp = sub.add_parser("add-file",
