@@ -349,6 +349,11 @@ S = {
         "tr": "istenen dizin izinli dizinlerin dışında",
         "es": "la carpeta solicitada está fuera de las carpetas permitidas",
         "ru": "запрошенная папка вне разрешённых папок"},
+    "err_setting_socket_only": {
+        "en": "this setting can only be changed from the desktop app or the command line",
+        "tr": "bu ayar yalnız masaüstü uygulamasından ya da komut satırından değiştirilebilir",
+        "es": "este ajuste solo se puede cambiar desde la aplicación de escritorio o la línea de comandos",
+        "ru": "эту настройку можно изменить только из приложения или командной строки"},
     # --------------------------------------------------------------- gecmis
     "hist_title": {
         "en": "History", "tr": "Geçmiş", "es": "Historial", "ru": "История"},

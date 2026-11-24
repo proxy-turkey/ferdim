@@ -140,6 +140,8 @@ class RpcNativeTests(unittest.TestCase):
         root = self.root / "state" / "ferdim"
         token = (root / "token").read_text().strip()
         port = (root / "port").read_text().strip()
+        # 1.7.1 yukseltmesi: ilk acilista token yenilendi, isaret yazildi
+        self.assertTrue((root / "token.v2").is_file())
 
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/api/stats",

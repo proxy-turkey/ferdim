@@ -91,6 +91,39 @@ def _spec_from(params: dict, cfg: dict) -> JobSpec:
     )
 
 
+def _dir_list(value, strip: bool) -> list[str]:
+    """config'teki dize listesi alanlari (watch_dirs/peer_dirs): yalniz
+    dolu dizeler kalir. watch_dirs girdileri oldugu gibi saklanir (yol
+    cozumlemesi kullanim aninda), peer_dirs bastan kirpilir."""
+    if not isinstance(value, list):
+        return []
+    if strip:
+        return [str(d).strip() for d in value
+                if isinstance(d, str) and d.strip()]
+    return [d for d in value if isinstance(d, str) and d.strip()]
+
+
+def _allowed_dir_list(value) -> list[str]:
+    """allowed_dirs: yalniz mutlak yollar, en fazla MAX_ALLOWED_DIRS."""
+    if not isinstance(value, list):
+        return []
+    clean = []
+    for d in value:
+        if not isinstance(d, str):
+            continue
+        d = os.path.expanduser(d.strip())
+        if d and "\x00" not in d and os.path.isabs(d):
+            clean.append(d)
+        if len(clean) >= MAX_ALLOWED_DIRS:
+            break
+    return clean
+
+
+def _peer_dir_list(value) -> list[str]:
+    """peer_dirs: kirpilmis dolu dizeler (bkz `_dir_list`)."""
+    return _dir_list(value, strip=True)
+
+
 def _sanitize_config(cfg: dict, env=None) -> None:
     """Yapilandirmayi guvenli araliga ceker: bozuk bir deger (el ile
     duzenlenmis config.json, bozuk API cagrisi) daemon'u devirmemeli.
@@ -150,28 +183,10 @@ def _sanitize_config(cfg: dict, env=None) -> None:
         if isinstance(_v, str):
             _v = _v.strip().lower() not in ("", "0", "false", "no", "off")
         cfg[_k] = bool(_v)
-    _peer_dirs = cfg.get("peer_dirs")
-    cfg["peer_dirs"] = [str(d).strip() for d in _peer_dirs
-                        if isinstance(d, str) and d.strip()] \
-        if isinstance(_peer_dirs, list) else []
-    dirs = cfg.get("watch_dirs")
-    cfg["watch_dirs"] = [d for d in dirs if isinstance(d, str) and d.strip()] \
-        if isinstance(dirs, list) else []
+    cfg["peer_dirs"] = _peer_dir_list(cfg.get("peer_dirs"))
+    cfg["watch_dirs"] = _dir_list(cfg.get("watch_dirs"), strip=False)
     # HTTP API'nin yazabilecegi ek kokler: yalniz mutlak yollar, en fazla 32
-    adirs = cfg.get("allowed_dirs")
-    if isinstance(adirs, list):
-        clean = []
-        for d in adirs:
-            if not isinstance(d, str):
-                continue
-            d = os.path.expanduser(d.strip())
-            if d and "\x00" not in d and os.path.isabs(d):
-                clean.append(d)
-            if len(clean) >= MAX_ALLOWED_DIRS:
-                break
-        cfg["allowed_dirs"] = clean
-    else:
-        cfg["allowed_dirs"] = []
+    cfg["allowed_dirs"] = _allowed_dir_list(cfg.get("allowed_dirs"))
     sch = cfg.get("schedule")
     if not isinstance(sch, dict):
         sch = cfg["schedule"] = {}
@@ -211,10 +226,17 @@ def _recheck_download_dir(ctx) -> str:
 # keyfi dosya yazma ilkeli olurdu (~/.config/autostart gibi).
 _DIR_DENIED_CODE = "dir_not_allowed"
 _DIR_DENIED_MSG = "dizin izinli koklerin disinda"
+_SOCKET_ONLY_CODE = "setting_socket_only"
+_SOCKET_ONLY_MSG = "bu ayar yalniz Unix soketinden degistirilebilir"
 
 
 def _dir_denied() -> dict:
     return {"ok": False, "code": _DIR_DENIED_CODE, "error": _DIR_DENIED_MSG}
+
+
+def _setting_socket_only() -> dict:
+    return {"ok": False, "code": _SOCKET_ONLY_CODE,
+            "error": _SOCKET_ONLY_MSG}
 
 
 def _real_dir(raw) -> str:
@@ -276,6 +298,54 @@ def _check_add_dir(ctx, params: dict) -> dict | None:
     if not raw:                        # dizin verilmemis: varsayilan kok
         return None
     return None if _path_allowed(ctx, raw) else _dir_denied()
+
+
+# HTTP uzerinden config-set: dizin koklerini genisleten anahtarlar kapali,
+# indirme/izleme dizinleri yalniz ev dizininin altinda kalabilir. Boylece
+# kisitli HTTP yuzeyi (allowed_dirs / peer_dirs / dotfile klasorleri) ile
+# kalici yazma izni kazanamaz. Unix soketi/CLI etkilenmez (ayni kullanici,
+# 0600 soket).
+
+def _under_home(raw) -> bool:
+    """`raw` ev dizininin ALTINDA mi? Evin kendisi ve evin altindaki nokta
+    ile baslayan bilesenler (~/.config/autostart, ~/.local/share) reddedilir:
+    otomatik baslatma/oturum dosyalari HTTP'den yazilamaz."""
+    real = _real_dir(raw)
+    if not real:
+        return False
+    home = os.path.realpath(os.path.expanduser("~"))
+    try:
+        if os.path.commonpath([real, home]) != home or real == home:
+            return False
+    except ValueError:
+        return False
+    rel = os.path.relpath(real, home)
+    return not any(part.startswith(".") for part in rel.split(os.sep) if part)
+
+
+def _config_http_guard(cfg: dict, new: dict) -> dict | None:
+    """HTTP config-set isteginin kisitlamayi delip delmedigini denetler;
+    reddedilirse yanit sozlugu, aksi halde None. Degismeyen deger her zaman
+    gecer (web ayarlari tum config'i yeniden gonderir)."""
+    for key, clean in (("allowed_dirs", _allowed_dir_list),
+                       ("peer_dirs", _peer_dir_list)):
+        if key in new and clean(new.get(key)) != clean(cfg.get(key)):
+            return _setting_socket_only()
+    cur = cfg.get("download_dir")
+    cur = cur if isinstance(cur, str) and cur.strip() else None
+    if "download_dir" in new:
+        want = new.get("download_dir")
+        want = want if isinstance(want, str) and want.strip() else None
+        # bos deger ayari varsayilana dondurur: yazma izni genislemez
+        if want != cur and want is not None \
+                and (want != want.strip() or not _under_home(want)):
+            return _dir_denied()
+    if "watch_dirs" in new:
+        current = set(_dir_list(cfg.get("watch_dirs"), strip=False))
+        for d in _dir_list(new.get("watch_dirs"), strip=False):
+            if d not in current and not _under_home(d):
+                return _dir_denied()
+    return None
 
 
 def _bad_checksum(params: dict) -> bool:
@@ -731,6 +801,10 @@ def handle(ctx, cmd: str, params: dict) -> dict:
     if cmd == "config-set":
         new = params.get("config")
         new = new if isinstance(new, dict) else {}
+        if ctx.get("transport") == "http" or ctx.get("restrict_paths"):
+            denied = _config_http_guard(cfg, new)
+            if denied:
+                return denied          # hicbir anahtar uygulanmaz
         for k, v in new.items():
             if k in cfg:
                 cfg[k] = v
@@ -795,8 +869,11 @@ class WebAccess:
         self.clock = clock                   # testler saati enjekte eder
 
     def set_token(self, token: str) -> None:
+        """Token'i degistirir ve bekleyen TUM biletleri dusurur: eski token
+        icin verilmis biletler yeni token'i alamaz (donusum tam etkili)."""
         with self.lock:
             self.token = token
+            self.nonces.clear()
 
     def get_token(self) -> str:
         with self.lock:

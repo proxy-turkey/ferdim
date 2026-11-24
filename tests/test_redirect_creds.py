@@ -1,14 +1,14 @@
 """Kimlik basliklari koken sinirini gecmez (yonlendirme + ayna).
 
-Kural: Authorization, Cookie ve kullanicinin ozel basliklari YALNIZCA
-kimlik sahibi kokenine (sema + ana makine + port) gider. Farkli kokenli
-30x hedefi (https->http dususu dahil) ve farkli kokenli ayna bunlari
-GORMEZ; ayni kokenli hedef/ayna kimligi korur.
+Kural: Authorization, Cookie, kullanicinin ozel basliklari ve
+Proxy-Authorization YALNIZCA kimlik sahibi kokenine (sema + ana makine +
+port) gider. Farkli kokenli 30x hedefi (https->http dususu dahil) ve farkli
+kokenli ayna bunlari GORMEZ; ayni kokenli hedef/ayna kimligi korur.
+http->https yukseltmesi (80 -> 443) ayni koken sayilir: kimlik korunur.
 
-Kimlik OLMAYANLAR her atlamada kalir: Proxy-Authorization (gecidin
-kimligi), Referer (CDN hotlink denetimi) ve If-Range (dogrulayici;
-yonlendirme hedefi dosyayi sunan kaynak oldugu icin devam dogrulamasi
-orada gerekir).
+Kimlik OLMAYANLAR her atlamada kalir: Referer (CDN hotlink denetimi) ve
+If-Range (dogrulayici; yonlendirme hedefi dosyayi sunan kaynak oldugu icin
+devam dogrulamasi orada gerekir).
 
 Ag testleri yerel is parcacikli sunucular kullanir (internet yok, uyku
 yok); sunucular istegin basliklarini kaydeder.
@@ -146,6 +146,21 @@ class OriginTests(unittest.TestCase):
         a = httpcli.origin_of("https://ornek.test/gizli")
         self.assertFalse(httpcli.same_origin(a, "http://ornek.test/gizli"))
 
+    def test_http_to_https_upgrade_is_the_same_origin(self):
+        """Tasima yukseltmesi (80 -> 443) kimligi korur; ters yon atmaz."""
+        a = httpcli.origin_of("http://ornek.test/x")
+        self.assertTrue(httpcli.same_origin(a, "https://ornek.test/y"))
+        self.assertTrue(httpcli.same_origin(
+            httpcli.origin_of("http://ornek.test:80/x"),
+            "https://ornek.test:443/y"))
+        # varsayilan olmayan port yukseltme sayilmaz
+        self.assertFalse(httpcli.same_origin(
+            httpcli.origin_of("http://ornek.test:8080/x"),
+            "https://ornek.test/y"))
+        self.assertFalse(httpcli.same_origin(
+            httpcli.origin_of("http://ornek.test/x"),
+            "https://baska.test/y"))
+
     def test_unparsable_origin_is_never_same(self):
         self.assertFalse(httpcli.same_origin(("", "", 0), "http://a/x"))
         self.assertFalse(httpcli.same_origin(("http", "a", 80), ""))
@@ -181,6 +196,14 @@ class HeadersForTests(unittest.TestCase):
             self.assertNotIn("Authorization", h, url)
             self.assertNotIn("Cookie", h, url)
 
+    def test_http_to_https_upgrade_keeps_credentials(self):
+        """http://a -> https://a: ayni ana makine, daha guvenli tasima."""
+        opt = _creds("http://a.test/basla")
+        h = opt.headers_for("https://a.test/parca")
+        self.assertIn("Authorization", h)
+        self.assertEqual(h["Cookie"], "oturum=abc")
+        self.assertEqual(h["X-Ferdim-Ozel"], "gizli")
+
     def test_referer_survives_other_origin(self):
         """Referer kimlik degil: CDN'ler hotlink denetimi icin bakar."""
         opt = _creds("http://a.test/basla")
@@ -192,12 +215,15 @@ class HeadersForTests(unittest.TestCase):
         self.assertNotIn("Authorization", other)
         self.assertNotIn("Cookie", other)
 
-    def test_proxy_authorization_survives(self):
-        """Proxy-Authorization gecidin kimligidir: hedefe gore atilmaz."""
+    def test_proxy_authorization_is_not_forwarded(self):
+        """Proxy-Authorization gecidin kimligidir: yabanci koken hedefine
+        statik baslik olarak GITMEZ (ProxyHandler gecitli atlamada ekler)."""
         opt = _creds("http://a.test/basla")
         opt.headers["Proxy-Authorization"] = "Basic cHJveHk="
-        h = opt.headers_for("http://b.test/parca")
-        self.assertEqual(h["Proxy-Authorization"], "Basic cHJveHk=")
+        same = opt.headers_for("http://a.test/parca")
+        self.assertEqual(same["Proxy-Authorization"], "Basic cHJveHk=")
+        other = opt.headers_for("http://b.test/parca")
+        self.assertNotIn("Proxy-Authorization", other)
 
     def test_no_scope_keeps_legacy_behaviour(self):
         """Kapsam bos (tek kaynak, ad-hoc): istek URL'inin kokeni gecerli."""
@@ -318,6 +344,8 @@ class RedirectTests(unittest.TestCase):
         req = urllib.request.Request("https://ornek.test/gizli",
                                      headers={"Authorization": "Basic x",
                                               "Cookie": "a=1",
+                                              "Proxy-Authorization":
+                                                  "Basic cHJveHk=",
                                               "Range": "bytes=0-1",
                                               "If-Range": '"v1"',
                                               "Referer":
@@ -327,6 +355,8 @@ class RedirectTests(unittest.TestCase):
         got = {k.lower(): v for k, v in new.headers.items()}
         self.assertNotIn("authorization", got)
         self.assertNotIn("cookie", got)
+        # gecit kimligi de yabanci koken hedefine tasinmaz
+        self.assertNotIn("proxy-authorization", got)
         self.assertEqual(got.get("range"), "bytes=0-1")
         self.assertEqual(got.get("if-range"), '"v1"',
                          "dogrulayici dususte de kalir")
@@ -337,6 +367,18 @@ class RedirectTests(unittest.TestCase):
         same = handler.redirect_request(req, None, 302, "Found", {},
                                         "https://ornek.test/obur")
         self.assertIn("Authorization", same.headers)
+
+    def test_redirect_decision_keeps_credentials_on_upgrade(self):
+        """http -> https yukseltmesi ayni koken: kimlik korunur."""
+        handler = httpcli.ScopedRedirectHandler()
+        req = urllib.request.Request("http://ornek.test/a",
+                                     headers={"Authorization": "Basic x",
+                                              "Cookie": "a=1"})
+        new = handler.redirect_request(req, None, 301, "Moved", {},
+                                       "https://ornek.test/a")
+        got = {k.lower(): v for k, v in new.headers.items()}
+        self.assertIn("authorization", got)
+        self.assertIn("cookie", got)
 
     def test_h3_redirect_falls_back_to_scoped_tcp(self):
         """h3 yonlendirmeyi izlemez: TCP'ye duser ve koken kurali gecerli.

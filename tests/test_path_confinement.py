@@ -3,7 +3,9 @@
 HTTP uzerinden gelen 'add' / arsiv cikarma istekleri, izinli koklerin
 (indirme klasoru, watch_dirs, config.allowed_dirs) disina yazamaz. Unix
 soketi (ayni kullanici, 0600) kisitlanmaz: 'ferdim add --dir /mnt/x'
-calismaya devam eder. config.json umask'tan bagimsiz 0600 yazilir.
+calismaya devam eder. HTTP config-set de kokleri genisletemez: allowed_dirs
+ve peer_dirs yalniz soketten degisir, indirme/izleme dizinleri ev dizininin
+altinda kalmali. config.json umask'tan bagimsiz 0600 yazilir.
 """
 from __future__ import annotations
 
@@ -245,6 +247,113 @@ class ArchiveConfinementTests(ConfinementCase):
         self.assertTrue((dest / "a.txt").is_file())
 
 
+class HttpConfigGuardTests(unittest.TestCase):
+    """HTTP config-set: dizin koklerini genisletemez; indirme/izleme dizini
+    ev dizininin ALTINDA kalmali. Soket/CLI etkilenmez."""
+
+    def setUp(self):
+        self.env = AppEnv(root=tmp_root(self, "ferdim-httpcfg-"))
+        self.cfg = self.env.load_config()
+        self.qm = QueueManager(self.env, self.cfg)
+        self.addCleanup(self.qm.shutdown)
+        self.ctx = {"qm": self.qm, "env": self.env, "cfg": self.cfg,
+                    "set_cfg": self.env.save_config}
+        # HTTP sunucusunun gecirdigi baglam (web.py make_server ile ayni)
+        self.http = {**self.ctx, "restrict_paths": True, "transport": "http"}
+        self.home = tmp_root(self, "ferdim-home-")
+        self.outside = tmp_root(self, "ferdim-outside-")
+        patcher = mock.patch.dict(os.environ, {"HOME": str(self.home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _set(self, ctx=None, **new):
+        return api.handle(ctx or self.http, "config-set", {"config": new})
+
+    # ------------------------------------------------------- sokete ozel
+    def test_allowed_dirs_cannot_be_widened_over_http(self):
+        r = self._set(allowed_dirs=[str(self.outside)])
+        self.assertFalse(r.get("ok"), r)
+        self.assertEqual(r.get("code"), "setting_socket_only")
+        self.assertEqual(self.cfg["allowed_dirs"], [])
+
+    def test_peer_dirs_cannot_be_changed_over_http(self):
+        r = self._set(peer_dirs=[str(self.outside)])
+        self.assertEqual(r.get("code"), "setting_socket_only")
+        self.assertEqual(self.cfg["peer_dirs"], [])
+
+    def test_socket_may_change_them(self):
+        r = self._set(self.ctx, allowed_dirs=[str(self.outside)],
+                      peer_dirs=[str(self.outside)])
+        self.assertTrue(r.get("ok"), r)
+        self.assertEqual(self.cfg["allowed_dirs"], [str(self.outside)])
+        self.assertEqual(self.cfg["peer_dirs"], [str(self.outside)])
+
+    # -------------------------------------------------- degismeyen deger
+    def test_resubmitting_unchanged_config_passes(self):
+        """Web ayarlari tum config'i yeniden gonderir: ayni deger gecer."""
+        self.assertTrue(self._set(
+            self.ctx, allowed_dirs=[str(self.outside)],
+            peer_dirs=[str(self.outside)],
+            watch_dirs=[str(self.outside)]).get("ok"))
+        r = self._set(allowed_dirs=[str(self.outside)],
+                      peer_dirs=[str(self.outside)],
+                      watch_dirs=[str(self.outside)])
+        self.assertTrue(r.get("ok"), r)
+        self.assertEqual(self.cfg["allowed_dirs"], [str(self.outside)])
+        self.assertEqual(self.cfg["watch_dirs"], [str(self.outside)])
+
+    # ------------------------------------------------------ download_dir
+    def test_download_dir_outside_home_is_rejected(self):
+        r = self._set(download_dir=str(self.outside))
+        self.assertEqual(r.get("code"), "dir_not_allowed")
+        self.assertIsNone(self.cfg["download_dir"])
+
+    def test_download_dir_home_itself_is_rejected(self):
+        r = self._set(download_dir=str(self.home))
+        self.assertEqual(r.get("code"), "dir_not_allowed")
+
+    def test_download_dir_dot_component_is_rejected(self):
+        """~/.config/autostart gibi otomatik baslatma klasorleri kapali."""
+        for rel in (".config/autostart", ".local/share/applications",
+                    "alt/.gizli"):
+            with self.subTest(rel=rel):
+                r = self._set(download_dir=str(self.home / rel))
+                self.assertEqual(r.get("code"), "dir_not_allowed", r)
+
+    def test_download_dir_inside_home_is_allowed(self):
+        target = self.home / "İndirilenler"
+        r = self._set(download_dir=str(target))
+        self.assertTrue(r.get("ok"), r)
+        self.assertEqual(self.cfg["download_dir"], str(target))
+        # bos deger varsayilana doner (yazma izni genislemez)
+        self.assertTrue(self._set(download_dir=None).get("ok"))
+        self.assertIsNone(self.cfg["download_dir"])
+
+    def test_rejected_request_applies_nothing(self):
+        r = self._set(segments=4, download_dir=str(self.outside))
+        self.assertEqual(r.get("code"), "dir_not_allowed")
+        self.assertNotEqual(self.cfg["segments"], 4)
+
+    # --------------------------------------------------------- watch_dirs
+    def test_new_watch_dir_outside_home_is_rejected(self):
+        watch = self.outside / "watch"
+        watch.mkdir(parents=True)
+        r = self._set(watch_dirs=[str(watch)])
+        self.assertEqual(r.get("code"), "dir_not_allowed")
+        self.assertEqual(self.cfg["watch_dirs"], [])
+
+    def test_new_watch_dir_dot_component_is_rejected(self):
+        r = self._set(watch_dirs=[str(self.home / ".config" / "izlenen")])
+        self.assertEqual(r.get("code"), "dir_not_allowed")
+
+    def test_new_watch_dir_inside_home_is_allowed(self):
+        watch = self.home / "izlenen"
+        watch.mkdir()
+        r = self._set(watch_dirs=[str(watch)])
+        self.assertTrue(r.get("ok"), r)
+        self.assertEqual(self.cfg["watch_dirs"], [str(watch)])
+
+
 class ConfigWriteTests(unittest.TestCase):
     def setUp(self):
         self.env = AppEnv(root=tmp_root(self, "ferdim-cfg-"))
@@ -300,10 +409,11 @@ class AllowedDirsSanitizeTests(unittest.TestCase):
         self.assertEqual(cfg["allowed_dirs"], [])
 
     def test_error_key_in_all_four_languages(self):
-        entry = S["err_dir_not_allowed"]
-        self.assertEqual(set(entry), set(LANGS))
-        for lang in LANGS:
-            self.assertTrue(entry[lang].strip(), lang)
+        for key in ("err_dir_not_allowed", "err_setting_socket_only"):
+            entry = S[key]
+            self.assertEqual(set(entry), set(LANGS), key)
+            for lang in LANGS:
+                self.assertTrue(entry[lang].strip(), (key, lang))
 
 
 if __name__ == "__main__":

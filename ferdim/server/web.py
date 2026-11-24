@@ -1,6 +1,10 @@
 """127.0.0.1 HTTP API + yerel web arayuzu.
 
-Guvenlik: Host basligi yalnizca gercek yerel ad + bagli portu kabul eder
+Guvenlik: baglantiyi acan surecin uid'i `/proc/net/tcp`ten dogrulanir; ayni
+kullanici degilse her yol (/, /api/*, /metrics) 403 alir. Boylece `xdg-open`
+komut satirindaki tek kullanimlik bilet (/proc/*/cmdline) baska bir yerel
+kullanici tarafindan once tuketilemez. /proc okunamiyorsa KAPALI davranilir.
+Host basligi yalnizca gercek yerel ad + bagli portu kabul eder
 (DNS rebinding: dusman alan adi 127.0.0.1'e cozulse bile token'i okuyamaz).
 Sayfa token GOMULMEZ: tarayici tek kullanimlik biletle acilir
 (http://127.0.0.1:PORT/#s=<nonce>), bilet POST /api/session ile bir kez
@@ -19,7 +23,11 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import os
+import struct
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import api
@@ -27,6 +35,95 @@ from .. import metrics as _metrics
 
 MAX_BODY = 1024 * 1024       # 1 MiB: API govdesi
 LOG = logging.getLogger("ferdim")
+_SELF_UID = os.getuid()
+_PEER_WARNED = threading.Event()
+
+
+# ------------------------------------------------------------ peer uid kapisi
+# Baska bir yerel kullanici (ya da onun adina calisan bir surec) 127.0.0.1
+# portuna baglanabilir: `xdg-open` komut satirindaki #s=<bilet> adresi
+# /proc/<pid>/cmdline'dan okunup once tuketilebilirdi. Bu yuzden baglantiyi
+# acan surecin uid'i /proc/net/tcp(|6) uzerinden bulunur ve os.getuid() ile
+# karsilastirilir. Bulunamazsa KAPALI davranilir (fail closed).
+
+def _decode_proc_addr(text: str, v6: bool) -> tuple[str, int]:
+    """`/proc/net/tcp` adres alani: '0100007F:1F90' -> ('127.0.0.1', 8080).
+
+    Adres 32 bitlik sozcukler halinde kucuk endian yazilir (port ag
+    duzeninde). Gecersiz metinde ValueError."""
+    addr, _, port = text.partition(":")
+    if v6:
+        if len(addr) != 32:
+            raise ValueError(text)
+        raw = b"".join(struct.pack("<I", int(addr[i:i + 8], 16))
+                       for i in range(0, 32, 8))
+    else:
+        if len(addr) != 8:
+            raise ValueError(text)
+        raw = struct.pack("<I", int(addr, 16))
+    ip = ip_address(raw)
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped          # ::ffff:127.0.0.1 -> 127.0.0.1
+    return str(ip), int(port, 16)
+
+
+def parse_proc_net(text: str, v6: bool = False) -> list[tuple]:
+    """`/proc/net/tcp[6]` metni -> [(yerel ip, port, uzak ip, port, uid)].
+
+    Bozuk satirlar atilir; baslik satiri okunmaz. Saf islev: testler sentetik
+    metin verir, gercek dosyaya ihtiyac yok."""
+    rows = []
+    for line in text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 8:
+            continue
+        try:
+            lip, lport = _decode_proc_addr(fields[1], v6)
+            rip, rport = _decode_proc_addr(fields[2], v6)
+            uid = int(fields[7])
+        except ValueError:
+            continue
+        rows.append((lip, lport, rip, rport, uid))
+    return rows
+
+
+def _norm_ip(value) -> str:
+    ip = ip_address(str(value))
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return str(ip)
+
+
+def peer_uid(client_addr, server_addr, proc: str = "/proc"):
+    """Baglantiyi acan yerel surecin uid'i; bulunamazsa None.
+
+    Eslesme: local_address == istemci (ip:port) ve rem_address == sunucu
+    (ip:port) olan satir istemci soketidir, uid sutunu onundur. IPv6 ve
+    v4-eslenmis satirlar icin tcp6 da okunur."""
+    try:
+        cip, cport = _norm_ip(client_addr[0]), int(client_addr[1])
+        sip, sport = _norm_ip(server_addr[0]), int(server_addr[1])
+    except (IndexError, TypeError, ValueError):
+        return None
+    for name, v6 in (("tcp", False), ("tcp6", True)):
+        try:
+            with open(os.path.join(proc, "net", name),
+                      encoding="ascii", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        for lip, lport, rip, rport, uid in parse_proc_net(text, v6):
+            if (lport, rport) == (cport, sport) and lip == cip and rip == sip:
+                return uid
+    return None
+
+
+def _warn_peer_unknown() -> None:
+    """Kapi kapali kaldi: bir kez uyar (her istekte log doldurmasin)."""
+    if not _PEER_WARNED.is_set():
+        _PEER_WARNED.set()
+        LOG.warning("peer uid okunamadi (/proc/net/tcp); HTTP istekleri "
+                    "reddediliyor")
 
 
 def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
@@ -45,6 +142,24 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
             pass
 
         # ---------------------------------------------------------- helpers
+        def _peer_ok(self) -> bool:
+            """Baglantiyi acan surec ayni kullanici mi?
+
+            Baglanti basina bir kez cozumlenir: keep-alive istekleri
+            /proc/net/tcp'yi yeniden ayristirmaz. Cozumlenemezse KAPALI:
+            bilinmeyen bir yerel surec API'ye erisemez."""
+            cached = getattr(self, "_peer_ok_cache", None)
+            if cached is None:
+                try:
+                    uid = peer_uid(self.client_address,
+                                   self.connection.getsockname())
+                except OSError:            # kapanmis soket: cozumlenemez
+                    uid = None
+                if uid is None:
+                    _warn_peer_unknown()
+                cached = self._peer_ok_cache = (uid == _SELF_UID)
+            return cached
+
         def _local_hosts(self) -> tuple[str, str, str]:
             """Gercek bagli portla yerel Host degerleri; rebinding'i keser."""
             port = self.server.server_address[1]
@@ -132,6 +247,9 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
 
         # ------------------------------------------------------------ routes
         def do_GET(self):
+            if not self._peer_ok():
+                self._reject(403)          # baska kullanici: her yol kapali
+                return
             if not self._host_ok():
                 self._reject(421)
                 return
@@ -178,6 +296,9 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
                 self._deny(404, "bulunamadi")
 
         def do_POST(self):
+            if not self._peer_ok():
+                self._reject(403)          # baska kullanici: her yol kapali
+                return
             if not self._host_ok():
                 self._reject(421)
                 return

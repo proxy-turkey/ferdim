@@ -19,14 +19,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$T/state" "$T/config/ferdim" "$T/dl" "$T/www"
+mkdir -p "$T/state" "$T/config/ferdim" "$T/dl" "$T/www" "$T/home"
 printf '{"download_dir": "%s/dl", "web_port": 8390, "language": "tr"}\n' "$T" \
   > "$T/config/ferdim/config.json"
 python3 "$REPO/tests/ui/srv.py" "$T/www" 0 > "$T/srv.port" & SRV_PID=$!
 for _ in $(seq 1 50); do [ -s "$T/srv.port" ] && break; sleep 0.1; done
 SP="$(head -1 "$T/srv.port")"
 
-( cd / && XDG_STATE_HOME="$T/state" XDG_CONFIG_HOME="$T/config" PYTHONPATH="$REPO" \
+# Ev dizini de gecici kokte: HTTP config-set yalniz ev dizininin altindaki
+# yollari kabul eder (bkz ferdim/api.py _config_http_guard). Boylece web
+# ayarlari testte gercek ~/.config'e dokunmaz.
+( cd / && HOME="$T/home" XDG_STATE_HOME="$T/state" \
+    XDG_CONFIG_HOME="$T/config" PYTHONPATH="$REPO" \
     exec python3 -m ferdim.daemon > "$T/daemon.out" 2>&1 ) &
 # daemon 8390'dan baslayip bos port secer; gercek portu dosyaya yazar
 for _ in $(seq 1 60); do [ -s "$T/state/ferdim/port" ] && break; sleep 0.2; done
@@ -38,7 +42,11 @@ export XDG_STATE_HOME="$T/state" XDG_CONFIG_HOME="$T/config" PYTHONPATH="$REPO"
 RC=0
 
 if [ "$WHAT" = web ] || [ "$WHAT" = all ]; then
-  ( cd "$REPO" && PORT="$DP" SRV="http://127.0.0.1:$SP" \
+  # HOME yalniz daemon'a verildi (yukarida): HTTP config-set ev dizininin
+  # altindaki yollari kabul eder, testte bu gecici kok olur. Test sureci ve
+  # Chromium gercek HOME'u kullanir (playwright ikilisi orada kurulu).
+  ( cd "$REPO" && WATCH_BASE="$T/home" PORT="$DP" \
+      SRV="http://127.0.0.1:$SP" \
       SLOW="http://127.0.0.1:$SP/slow" TOKEN_PATH="$T/state/ferdim/token" \
       SOCK="$T/state/ferdim/ferdim.sock" \
       timeout 240 python3 tests/ui/web_live.py ) || RC=1

@@ -1,25 +1,30 @@
-"""Yerel web sunucusu guvenligi: DNS rebinding (Host) ve Origin kapisi,
-token karsilastirmasinin ASCII disi baslikta cokmemesi, sayfaya token
-gomulmemesi.
+"""Yerel web sunucusu guvenligi: peer uid kapisi, DNS rebinding (Host) ve
+Origin kapisi, token karsilastirmasinin ASCII disi baslikta cokmemesi,
+sayfaya token gomulmemesi.
 
 Rebinding saldirisi: dusman alan adi 127.0.0.1'e cozulur, tarayici ayni
 origin'i korur ve Host basligi saldirganin adidir. Sunucu Host'u gercek
 bagli portla karsilastirir. Sayfa artik token tasimaz: tarayici tek
 kullanimlik biletle acilir (bkz. tests/test_web_session.py), sayfayi okuyan
-baska bir yerel kullanici API'ye erisemez.
+baska bir yerel kullanici API'ye erisemez. Baglantiyi acan surecin uid'i
+/proc/net/tcp(|6) uzerinden dogrulanir: baska kullanici 403 alir; boylece
+`xdg-open` komut satirindaki #s=<bilet> adresi once tuketilemez.
 """
 from __future__ import annotations
 
+import os
 import socket
 import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ferdim.engine.queue import QueueManager
 from ferdim.paths import AppEnv
+from ferdim.server import web
 from ferdim.server.web import make_server
 from tests.helpers import tmp_root
 
@@ -76,6 +81,101 @@ def json_code(body: bytes) -> str:
         return json.loads(body).get("code", "")
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------- peer uid
+PROC_HEADER = ("  sl  local_address rem_address   st tx_queue rx_queue tr "
+               "tm->when retrnsmt   uid  timeout inode\n")
+
+
+def proc_row(local: str, remote: str, uid: int = 1000) -> str:
+    """Sentetik /proc/net/tcp satiri (alan sirasi gercek dosyayla ayni)."""
+    return (f"   0: {local} {remote} 01 00000000:00000000 00:00000000 "
+            f"00000000  {uid}        0 1 1 0000000000000000 100 0 0 10 0\n")
+
+
+V4_CLIENT = "0100007F:9C40"          # 127.0.0.1:40000
+V4_SERVER = "0100007F:1F90"          # 127.0.0.1:8080
+V6_CLIENT = "00000000000000000000000001000000:9C40"     # [::1]:40000
+V6_SERVER = "00000000000000000000000001000000:1F90"     # [::1]:8080
+MAPPED_CLIENT = "0000000000000000FFFF00000100007F:9C40"  # ::ffff:127.0.0.1
+MAPPED_SERVER = "0000000000000000FFFF00000100007F:1F90"
+
+
+class ProcParserTests(unittest.TestCase):
+    """`/proc/net/tcp` ayristirmasi: v4, v6 ve v4-eslenmis satirlar."""
+
+    def test_01_ipv4_row(self):
+        rows = web.parse_proc_net(
+            PROC_HEADER + proc_row(V4_CLIENT, V4_SERVER, 1000))
+        self.assertEqual(rows,
+                         [("127.0.0.1", 40000, "127.0.0.1", 8080, 1000)])
+
+    def test_02_ipv6_row(self):
+        rows = web.parse_proc_net(
+            PROC_HEADER + proc_row(V6_CLIENT, V6_SERVER, 1001), v6=True)
+        self.assertEqual(rows, [("::1", 40000, "::1", 8080, 1001)])
+
+    def test_03_v4_mapped_row_is_ipv4(self):
+        rows = web.parse_proc_net(
+            PROC_HEADER + proc_row(MAPPED_CLIENT, MAPPED_SERVER, 1002),
+            v6=True)
+        self.assertEqual(rows[0][0::2], ("127.0.0.1", "127.0.0.1", 1002))
+        self.assertEqual(rows[0][1::2], (40000, 8080))
+
+    def test_04_header_and_broken_rows_are_skipped(self):
+        text = (PROC_HEADER + "bozuk satir\n"
+                + proc_row("0100007F", V4_SERVER, 1)        # port yok
+                + proc_row("ZZZZZZZZ:1F90", V4_SERVER, 1)   # hex degil
+                + proc_row(V4_CLIENT, V4_SERVER, 1000))
+        self.assertEqual(web.parse_proc_net(text),
+                         [("127.0.0.1", 40000, "127.0.0.1", 8080, 1000)])
+        # v6 ayristiricisi 8 haneli satiri kabul etmez
+        self.assertEqual(web.parse_proc_net(
+            PROC_HEADER + proc_row(V4_CLIENT, V4_SERVER), v6=True), [])
+
+
+class PeerUidTests(unittest.TestCase):
+    """peer_uid: eslesen satirin uid'i; yoksa/okunamiyorsa None (kapali)."""
+
+    def _proc(self, v4: str = "", v6: str = ""):
+        root = tmp_root(self, "ferdim-proc-")
+        (root / "net").mkdir()
+        (root / "net" / "tcp").write_text(PROC_HEADER + v4)
+        (root / "net" / "tcp6").write_text(PROC_HEADER + v6)
+        return root
+
+    def test_01_ipv4_match_returns_uid(self):
+        root = self._proc(v4=proc_row(V4_CLIENT, V4_SERVER, 4242))
+        self.assertEqual(
+            web.peer_uid(("127.0.0.1", 40000), ("127.0.0.1", 8080),
+                         proc=str(root)), 4242)
+
+    def test_02_ipv6_match_returns_uid(self):
+        root = self._proc(v6=proc_row(V6_CLIENT, V6_SERVER, 4243))
+        self.assertEqual(
+            web.peer_uid(("::1", 40000), ("::1", 8080), proc=str(root)), 4243)
+
+    def test_03_v4_mapped_row_matches_ipv4_client(self):
+        root = self._proc(v6=proc_row(MAPPED_CLIENT, MAPPED_SERVER, 4244))
+        self.assertEqual(
+            web.peer_uid(("::ffff:127.0.0.1", 40000), ("127.0.0.1", 8080),
+                         proc=str(root)), 4244)
+
+    def test_04_no_matching_row_is_none(self):
+        root = self._proc(v4=proc_row(V4_CLIENT, V4_SERVER, 4242))
+        self.assertIsNone(
+            web.peer_uid(("127.0.0.1", 40001), ("127.0.0.1", 8080),
+                         proc=str(root)))
+        # ters yon (sunucu satiri) istemci sayilmaz
+        self.assertIsNone(
+            web.peer_uid(("127.0.0.1", 8080), ("127.0.0.1", 40000),
+                         proc=str(root)))
+
+    def test_05_unreadable_proc_is_none(self):
+        self.assertIsNone(web.peer_uid(("127.0.0.1", 1), ("127.0.0.1", 2),
+                                       proc="/tmp/ferdim-yok-boyle-dizin"))
+        self.assertIsNone(web.peer_uid(("bozuk", 1), ("127.0.0.1", 2)))
 
 
 class WebHostGuardTests(unittest.TestCase):
@@ -266,6 +366,62 @@ class WebHostGuardTests(unittest.TestCase):
         status, body = _raw(self.port, _request(
             "/api/stats", host=self.host, token=TOKEN))
         self.assertEqual(status, 200)
+
+    def test_09_foreign_uid_is_rejected_on_every_route(self):
+        """Baska kullanicinin sureci (ya da onun adina calisan istemci)
+        /proc/*/cmdline'daki bileti once tuketemez: her yol 403 + kapanis."""
+        cases = (("/", "GET"), ("/app.js", "GET"), ("/metrics", "GET"),
+                 ("/api/i18n", "GET"), ("/api/stats", "GET"),
+                 ("/api/config", "GET"), ("/api/session", "POST"),
+                 ("/api/config", "POST"), ("/bilinmeyen", "GET"))
+        with mock.patch.object(web, "peer_uid", return_value=os.getuid() + 1):
+            for path, method in cases:
+                with self.subTest(path=path, method=method):
+                    body = b'{"nonce": "x"}' if method == "POST" else b""
+                    status, headers, out = _raw_full(self.port, _request(
+                        path, method=method, host=self.host, token=TOKEN,
+                        body=body))
+                    self.assertEqual(status, 403)
+                    self.assertEqual(headers.get("connection"), "close")
+                    self.assertEqual(out, b"")
+                    self.assertNotIn(TOKEN.encode(), out)
+                    self.assertNotIn(b"jobs", out)
+
+    def test_10_unknown_uid_fails_closed(self):
+        """Cozumlenemeyen uid (proc okunamadi / satir yok) = KAPALI."""
+        with mock.patch.object(web, "peer_uid", return_value=None):
+            for path in ("/", "/api/stats", "/metrics"):
+                with self.subTest(path=path):
+                    status, headers, out = _raw_full(self.port, _request(
+                        path, host=self.host, token=TOKEN))
+                    self.assertEqual(status, 403)
+                    self.assertEqual(headers.get("connection"), "close")
+                    self.assertNotIn(b"jobs", out)
+
+    def test_11_live_connection_maps_to_our_uid(self):
+        """Gercek soket: /proc/net/tcp satiri bizim uid'imizi verir."""
+        with socket.create_connection(("127.0.0.1", self.port),
+                                      timeout=10) as s:
+            self.assertEqual(
+                web.peer_uid(s.getsockname(), s.getpeername()), os.getuid())
+
+    def test_12_probe_is_cached_per_connection(self):
+        """Keep-alive: ikinci istek /proc/net/tcp'yi yeniden ayristirmaz."""
+        payload = (f"GET /api/i18n HTTP/1.1\r\nHost: {self.host}\r\n\r\n"
+                   f"GET /api/i18n HTTP/1.1\r\nHost: {self.host}\r\n"
+                   "Connection: close\r\n\r\n").encode()
+        with mock.patch.object(web, "peer_uid", wraps=web.peer_uid) as spy:
+            with socket.create_connection(("127.0.0.1", self.port),
+                                          timeout=10) as s:
+                s.sendall(payload)
+                data = b""
+                while True:
+                    part = s.recv(65536)
+                    if not part:
+                        break
+                    data += part
+        self.assertEqual(data.count(b"HTTP/1.1 200"), 2, data[:300])
+        self.assertEqual(spy.call_count, 1)
 
 
 if __name__ == "__main__":

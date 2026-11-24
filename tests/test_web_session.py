@@ -238,6 +238,17 @@ class WebSessionTests(unittest.TestCase):
         self.assertEqual(r["code"], "web_disabled")
         self.assertTrue(r["error"])
 
+    def test_10_token_rotation_drops_pending_nonces(self):
+        """Bilet eski token icin verildi: donusumden sonra tuketilemez."""
+        nonce = self._mint()
+        self.assertTrue(api.handle(self.ctx, "token-rotate", {})["ok"])
+        status, _headers, body = self._exchange(nonce)
+        self.assertEqual(status, 403)
+        self.assertEqual(self._code(body), "session_invalid")
+        # sonraki testler icin token geri kurulur (set_token biletleri atar)
+        api.write_token(self.env.token_path, TOKEN)
+        self.access.set_token(TOKEN)
+
 
 class SocketTransportTests(unittest.TestCase):
     """Soket: 1 MiB satir siniri, 0600 izin, komutlar gercekten calisir."""
@@ -303,15 +314,26 @@ class SocketTransportTests(unittest.TestCase):
 
 
 class TokenFileTests(unittest.TestCase):
-    """Token dosyasi her acilista 0600'a cekilir; log dosyasi da dar izinli."""
+    """Token dosyasi 0600; 1.7.1 yukseltmesinde bir kez yenilenir.
 
-    def test_01_existing_token_perms_are_tightened(self):
+    Eski surumler token'i index.html'e gomuyordu: yukseltmede token
+    yenilenir (isaret: state/token.v2) ve sizmis olabilecek deger gecersiz
+    kalir. Sonraki acilislar token'i korur."""
+
+    def test_01_legacy_token_is_rotated_once(self):
         from ferdim import daemon
         env = AppEnv(root=tmp_root(self, "ferdim-token-"))
         env.token_path.write_text("eski\n")
         os.chmod(env.token_path, 0o644)
-        self.assertEqual(daemon.ensure_token(env), "eski")
+        token = daemon.ensure_token(env)
+        self.assertNotEqual(token, "eski", "eski token yenilenmeli")
+        self.assertEqual(len(token), 32)
         self.assertEqual(stat.S_IMODE(env.token_path.stat().st_mode), 0o600)
+        marker = env.state_dir / daemon.TOKEN_MARKER
+        self.assertTrue(marker.exists(), "isaret dosyasi yok")
+        self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
+        # bir kez: sonraki acilis token'i (ve iznini) korur
+        self.assertEqual(daemon.ensure_token(env), token)
 
     def test_02_missing_token_is_created_private(self):
         from ferdim import daemon
@@ -319,8 +341,18 @@ class TokenFileTests(unittest.TestCase):
         token = daemon.ensure_token(env)
         self.assertEqual(len(token), 32)
         self.assertEqual(stat.S_IMODE(env.token_path.stat().st_mode), 0o600)
-        # ayni dosya: deger korunur, izin daraltilir
+        self.assertTrue((env.state_dir / daemon.TOKEN_MARKER).exists())
+        # ayni dosya: deger korunur
         self.assertEqual(daemon.ensure_token(env), token)
+
+    def test_03_marker_keeps_token_and_tightens_perms(self):
+        from ferdim import daemon
+        env = AppEnv(root=tmp_root(self, "ferdim-token4-"))
+        env.token_path.write_text("sabit\n")
+        os.chmod(env.token_path, 0o644)
+        daemon._write_marker(env.state_dir / daemon.TOKEN_MARKER)
+        self.assertEqual(daemon.ensure_token(env), "sabit")
+        self.assertEqual(stat.S_IMODE(env.token_path.stat().st_mode), 0o600)
 
     def test_03_rotation_is_atomic_and_private(self):
         env = AppEnv(root=tmp_root(self, "ferdim-token3-"))

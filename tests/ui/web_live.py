@@ -1,8 +1,9 @@
 """FerDim web arayuzu canli testi: yaltilmis daemon + gercek Chromium
-(playwright). PORT, SRV, SLOW, TOKEN_PATH, SOCK cevre degiskenlerini run.sh
-verir; UI_SHOTS verilirse ekran goruntuleri oraya yazilir (yoksa gecici
-dizin). Sayfa token tasimaz: tarayici, soketten alinan tek kullanimlik
-biletli adresle (#s=<nonce>) acilir."""
+(playwright). PORT, SRV, SLOW, TOKEN_PATH, SOCK, WATCH_BASE cevre
+degiskenlerini run.sh verir; UI_SHOTS verilirse ekran goruntuleri oraya
+yazilir (yoksa gecici dizin). Sayfa token tasimaz: tarayici, soketten alinan
+tek kullanimlik biletli adresle (#s=<nonce>) acilir. WATCH_BASE daemon'in ev
+dizininin altinda olmali: HTTP config-set baska yollari reddeder."""
 import datetime as dt
 import json
 import os
@@ -21,6 +22,14 @@ TOKEN = open(os.environ["TOKEN_PATH"]).read().strip()
 SOCK = os.environ.get("SOCK") or os.path.join(
     os.path.dirname(os.environ["TOKEN_PATH"]), "ferdim.sock")
 OUT = os.environ.get("UI_SHOTS") or tempfile.mkdtemp(prefix="ferdim-ui-shots-")
+# HTTP config-set yalniz ev dizininin ALTINDAKI klasorleri kabul eder;
+# run.sh daemon'in HOME'unu bu gecici koke tasir (gercek ~/.config'e
+# dokunulmaz), bu yuzden yol zorunlu: yanlislikla gercek eve yazilmasin.
+WATCH_BASE = os.environ["WATCH_BASE"]
+WATCH_DIRS = [os.path.join(WATCH_BASE, "izlenen"),
+              os.path.join(WATCH_BASE, "ikinci")]
+for _d in WATCH_DIRS:
+    os.makedirs(_d, exist_ok=True)
 fails, errors = [], []
 
 
@@ -429,7 +438,7 @@ with sync_playwright() as p:
     check(" isaretleyince zamanlar acilir", mrow.locator('[data-w=start]').is_enabled())
     mrow.locator('[data-w=start]').fill("03:15")
     mrow.locator('[data-w=stop]').fill("04:45")
-    page.fill("#setWatchDirs", f"{OUT}/izlenen\n  \n{OUT}/ikinci")
+    page.fill("#setWatchDirs", f"{WATCH_DIRS[0]}\n  \n{WATCH_DIRS[1]}")
     page.select_option("#setWatchDone", "keep")
     page.uncheck("#setSidecar")
     page.screenshot(path=f"{OUT}/04-ayarlar.png", full_page=True)
@@ -441,7 +450,7 @@ with sync_playwright() as p:
           cats.get("video") == {"start": st, "stop": sp}
           and cats.get("music") == {"start": "03:15", "stop": "04:45"}, cats)
     check(" izlenen klasorler / mod / yan dosya",
-          cfg["watch_dirs"] == [f"{OUT}/izlenen", f"{OUT}/ikinci"]
+          cfg["watch_dirs"] == WATCH_DIRS
           and cfg["watch_done"] == "keep" and cfg["checksum_sidecar"] is False)
     check(" genel zamanlama kaybolmadi", cfg["schedule"]["enabled"] is False)
     check(" kaydedildi bildirimi", page.is_visible("#notice")

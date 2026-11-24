@@ -1002,6 +1002,12 @@ $("#setSave").onclick = async () => {
     history_days: num("#setHistDays", 0, 3650, cfg.history_days ?? 365),
     speed_plan: plan,
   } });
+  if (r && r.ok === false) {
+    // sunucu reddetti (orn. HTTP'den degistirilemeyen bir dizin ayari):
+    // dialog acik kalsin ki kullanici degeri duzeltebilsin
+    notice(errText(r.code, r.error));
+    return;
+  }
   if (r && r.config) cfg = r.config;
   notice(r && r.warning === "download_dir" ? tr("warn_dir") : tr("saved"));
   localStorage.setItem("ferdimLang", lang === "auto" ? "" : lang);

@@ -13,11 +13,26 @@ from .engine.queue import QueueManager
 from .paths import AppEnv
 from .server import SockServer, make_server
 
+# 1.7.1 oncesi token index.html'e gomuluyordu: yukseltmede bir kez yenilensin
+TOKEN_MARKER = "token.v2"
+
 
 def ensure_token(env) -> str:
     """Token'i her acilista 0600'a ceker (eski dosya dahil) ve dondurur.
     Yalniz ilk olusturmada chmod yapmak, bir kez genis izin almis dosyayi
-    sonsuza kadar genis birakiyordu."""
+    sonsuza kadar genis birakiyordu.
+
+    1.7.1 oncesi surumler token'i index.html'e gomuyordu: yukseltmede token
+    BIR KEZ yenilenir (isaret dosyasi: state/token.v2, 0600). Boylece baska
+    bir yerel kullaniciya sizmis olabilecek eski token gecersiz kalir. Yeni
+    kurulum da bu yoldan gecer (token + isaret birlikte olusur)."""
+    marker = env.state_dir / TOKEN_MARKER
+    if not marker.exists():
+        api.write_token(env.token_path, secrets.token_hex(16))
+        _write_marker(marker)
+        logging.getLogger("ferdim").info(
+            "web token yenilendi (1.7.1 oncesi token gecersiz)")
+        return env.token_path.read_text("utf-8").strip()
     if env.token_path.exists():
         try:
             os.chmod(env.token_path, 0o600)
@@ -26,6 +41,15 @@ def ensure_token(env) -> str:
     else:
         api.write_token(env.token_path, secrets.token_hex(16))
     return env.token_path.read_text("utf-8").strip()
+
+
+def _write_marker(path) -> None:
+    """'Bu surumde token bir kez yenilendi' isareti; 0600."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
 
 
 def secure_log(env) -> None:

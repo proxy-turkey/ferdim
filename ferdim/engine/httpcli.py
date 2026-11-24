@@ -13,10 +13,12 @@ Kimlik kapsami: Authorization, Cookie ve kullanicinin ozel basliklari
 YALNIZCA kimlik sahibi kokenine (sema+ana makine+port) gider. Iki yerde
 uygulanir: `DlOptions.headers_for` (ayna baska koken ise dusurur) ve
 `ScopedRedirectHandler` (30x zincirinde yabanci koken ya da https->http
-dususunde dusurur). Kimlik OLMAYAN basliklar her atlama da kalir:
-Proxy-Authorization (gecidin kimligi), Referer (CDN'lerin hotlink
-denetimi) ve If-Range (dogrulayici; yonlendirme hedefi dosyayi sunan
-kaynak oldugu icin devam dogrulamasi orada gerekir).
+dususunde dusurur). http->https yukseltmesi (80 -> 443) ayni koken sayilir:
+kimlik korunur. Kimlik OLMAYAN basliklar her atlama da kalir: Referer
+(CDN'lerin hotlink denetimi) ve If-Range (dogrulayici; yonlendirme hedefi
+dosyayi sunan kaynak oldugu icin devam dogrulamasi orada gerekir).
+Proxy-Authorization kimlik sayilir ve tasinmaz: gecitli atlamada urllib'in
+ProxyHandler'i onu proxy URL'inden yeniden ekler.
 """
 from __future__ import annotations
 
@@ -56,10 +58,12 @@ def _tune(sock: socket.socket) -> None:
 #    fiilen sunan kaynak olabilir (surum sayfasi -> CDN); burada atilirsa
 #    devam dogrulamasi tam da yaygin durumda kaybolur ve degismis dosya
 #    karisik devam ederdi.
-#  - Proxy-Authorization: gecidin kimligi, hedefin degil.
+#  - Proxy-Authorization BURADA YOK: gecidin kimligi hedefe gitmez. Gecitli
+#    atlamada urllib'in ProxyHandler'i onu proxy URL'inden yeniden ekler;
+#    statik bir baslik yabanci kokenin sunucusuna sizardi.
 _OPEN_HEADERS = frozenset({
     "host", "user-agent", "accept", "accept-encoding", "connection",
-    "range", "if-range", "referer", "proxy-authorization",
+    "range", "if-range", "referer",
 })
 
 
@@ -84,19 +88,27 @@ def origin_of(url: str) -> tuple:
 def same_origin(origin: tuple, url: str) -> bool:
     """`origin` bu URL'in kokeniyle ayni mi?
 
-    Farkli sema (https->http dususu dahil), farkli ana makine ya da farkli
-    port = farkli koken. Gecersiz/eksik koken hicbir zaman ayni sayilmaz:
-    kimlik sizmaz."""
+    Farkli ana makine, farkli sema (https->http dususu dahil) ya da farkli
+    port = farkli koken. Istisna: http (80) -> https (443) YUKSELTMESI ayni
+    koken sayilir; kimlik korunur (hedef makine ayni, tasima daha guvenli).
+    Ters yon (https->http) kimligi atar. Gecersiz/eksik koken hicbir zaman
+    ayni sayilmaz: kimlik sizmaz."""
     if not origin or origin[0] not in ("http", "https"):
         return False
-    return origin == origin_of(url)
+    target = origin_of(url)
+    if origin == target:
+        return True
+    return (origin[0] == "http" and origin[2] == 80
+            and target[0] == "https" and target[2] == 443
+            and origin[1] == target[1])
 
 
 def strip_credentials(headers: dict) -> dict:
-    """Kimlik basliklarini atar: Authorization, Cookie ve kullanicinin ozel
-    basliklari. Kimlik OLMAYANLAR kalir: User-Agent, Accept-Encoding,
-    Connection, Range, If-Range, Referer, Proxy-Authorization
-    (bak: `_OPEN_HEADERS`)."""
+    """Kimlik basliklarini atar: Authorization, Cookie, kullanicinin ozel
+    basliklari ve Proxy-Authorization. Kimlik OLMAYANLAR kalir: User-Agent,
+    Accept-Encoding, Connection, Range, If-Range, Referer (bak:
+    `_OPEN_HEADERS`). Gecitli atlamada proxy kimligini urllib'in ProxyHandler
+    kendisi proxy URL'inden ekler; statik bir kopya hedefe sizardi."""
     return {k: v for k, v in headers.items()
             if str(k).strip().lower() in _OPEN_HEADERS
 }
@@ -179,11 +191,12 @@ class ScopedRedirectHandler(urllib.request.HTTPRedirectHandler):
     """30x zinciri: kimlik basliklari yalnizca ILK istegin kokeninde kalir.
 
     stdlib handler'i govde disi butun basliklari (Authorization, Cookie,
-    kullanicinin ozel basliklari) hedefe kopyalar: yabanci bir koken 30x
-    ile parolayi/cerezi toplayabilirdi. Burada hedef koken ilk istegin
-    kokeninden farkliysa (sema/ana makine/port; https->http dususu dahil)
-    kimlik basliklari atilir; kimlik OLMAYANLAR kalir: Range, If-Range
-    (dogrulayici), Referer, Proxy-Authorization (`_OPEN_HEADERS`).
+    kullanicinin ozel basliklari, Proxy-Authorization) hedefe kopyalar:
+    yabanci bir koken 30x ile parolayi/cerezi toplayabilirdi. Burada hedef
+    koken ilk istegin kokeninden farkliysa (ana makine/port; https->http
+    dususu dahil) kimlik basliklari atilir; kimlik OLMAYANLAR kalir: Range,
+    If-Range (dogrulayici) ve Referer (`_OPEN_HEADERS`). http->https
+    yukseltmesi (80 -> 443) ayni koken sayilir: kimlik korunur.
 
     Zincir boyunca ILK koken tasinir (`_ferdim_origin`): A->B->A donusunde
     kimlik geri gelmez, cunku A istegi B isteginin (kimliksiz) basliklari
