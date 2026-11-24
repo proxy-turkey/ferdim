@@ -50,5 +50,7 @@
   "webUi": {"message": "Open web UI"},
   "notifyStartFail": {"message": "FerDim: could not start the download"},
   "notifyServiceOff": {"message": "FerDim: service unreachable"},
-  "notifyServiceOffBody": {"message": "The FerDim daemon may not be running. Try 'ferdim daemon' in a terminal."}
+  "notifyServiceOffBody": {"message": "The FerDim daemon may not be running. Try 'ferdim daemon' in a terminal."},
+  "notifyTakeoverFail": {"message": "FerDim: download kept in the browser"},
+  "notifyTakeoverFailBody": {"message": "FerDim could not take the download over. The browser download continues."}
 }

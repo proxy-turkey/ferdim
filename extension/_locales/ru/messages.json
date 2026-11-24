@@ -50,5 +50,7 @@
   "webUi": {"message": "Открыть веб-интерфейс"},
   "notifyStartFail": {"message": "FerDim: не удалось начать загрузку"},
   "notifyServiceOff": {"message": "FerDim: сервис недоступен"},
-  "notifyServiceOffBody": {"message": "Возможно, демон FerDim не запущен. Попробуйте «ferdim daemon» в терминале."}
+  "notifyServiceOffBody": {"message": "Возможно, демон FerDim не запущен. Попробуйте «ferdim daemon» в терминале."},
+  "notifyTakeoverFail": {"message": "FerDim: загрузка осталась в браузере"},
+  "notifyTakeoverFailBody": {"message": "FerDim не смогла перехватить загрузку. Загрузка в браузере продолжается."}
 }

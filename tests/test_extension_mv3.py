@@ -50,7 +50,8 @@ function makeEnv(o) {
   o = o || {};
   const log = { scripting: [], executeScript: [], created: [], removed: 0,
                 sessionSet: [], localSet: [], native: [], cookieQueries: [],
-                pageShows: [] };
+                pageShows: [], paused: [], resumed: [], cancelled: [],
+                erased: [], notified: [], seq: [] };
   const listeners = {};
   const on = (name) => ({
     addListener: (fn) => { (listeners[name] = listeners[name] || []).push(fn); },
@@ -80,6 +81,11 @@ function makeEnv(o) {
       /* sendNativeMessage(uygulama, mesaj): ikinci arguman yuk. */
       sendNativeMessage: async (app, msg) => {
         log.native.push(JSON.parse(JSON.stringify(msg || {})));
+        /* Yalnizca indirme devri isaretlenir: acilistaki ping siralamayi
+         * bozmasin (devir sirasi testi buna bakar). */
+        log.seq.push(msg && msg.cmd === "download" ? "native:download" : "native");
+        if (o.native === "throw") throw new Error("native host yok");
+        if (o.native === "fail") return { ok: false, error: "reddedildi" };
         return { ok: true, port: 8378, turbo: false };
       },
       getURL: (p) => "moz-extension://test/" + p,
@@ -116,24 +122,39 @@ function makeEnv(o) {
     },
     downloads: {
       onCreated: on("downloadCreated"),
-      cancel: async () => {},
-      erase: async () => {},
+      pause: async (id) => {
+        log.paused.push(id);
+        log.seq.push("pause:" + id);
+        if (o.pauseFails) throw new Error("duraklatilamaz");
+      },
+      resume: async (id) => { log.resumed.push(id); log.seq.push("resume:" + id); },
+      cancel: async (id) => { log.cancelled.push(id); log.seq.push("cancel:" + id); },
+      erase: async (q) => {
+        log.erased.push(q && q.id);
+        log.seq.push("erase:" + (q && q.id));
+      },
+      search: async (q) => [{ id: q && q.id, state: o.searchState || "in_progress" }],
     },
     webRequest: { onHeadersReceived: on("headers") },
     /* partitionKey'siz sorgu bolumlenmemis cerezleri doner; partitionKey'li
      * sorgu yalnizca o ust duzey siteye ait bolumlu cerezleri (Firefox
-     * davranisi: ikisi ayri sorulur). */
+     * davranisi: ikisi ayri sorulur). storeId verilen sorgu yalnizca o cerez
+     * deposunu (kapsayici sekme / ozel pencere) doner. */
     cookies: {
       getAll: async (details) => {
         log.cookieQueries.push(JSON.parse(JSON.stringify(details)));
         const all = o.cookies || [];
         const want = details.partitionKey;
-        return all.filter((c) => want
-          ? !!c.partitionKey && c.partitionKey.topLevelSite === want.topLevelSite
-          : !c.partitionKey);
+        const store = details.storeId || "firefox-default";
+        return all.filter((c) => {
+          if ((c.storeId || "firefox-default") !== store) return false;
+          return want
+            ? !!c.partitionKey && c.partitionKey.topLevelSite === want.topLevelSite
+            : !c.partitionKey;
+        });
       },
     },
-    notifications: { create: () => {} },
+    notifications: { create: (n) => { log.notified.push(n && n.title); } },
   };
   if (o.scripting !== false) {
     browser.scripting = {
@@ -378,6 +399,77 @@ const sendMessage = (env, msg, sender) => new Promise((resolve, reject) => {
     };
   }
 
+  /* Devir sirasi: duraklat -> devret -> yalnizca onaydan sonra iptal+sil;
+   * devir basarisizsa tarayici indirmesi kalir (resume). */
+  const dlItem = (o) => Object.assign({
+    id: 21, state: "in_progress",
+    url: "https://files.example.com/f/big.zip",
+    referrer: "https://www.example.com/page",
+    filename: "/home/u/Downloads/big.zip", mime: "application/zip",
+    cookieStoreId: "firefox-default",
+  }, o);
+  const takeOver = async (envOpts, item) => {
+    const env = makeEnv(envOpts || {});
+    await env.fire("downloadCreated", item);
+    return {
+      sent: env.log.native.filter((m) => m.cmd === "download"),
+      paused: env.log.paused,
+      resumed: env.log.resumed,
+      cancelled: env.log.cancelled,
+      erased: env.log.erased,
+      notified: env.log.notified,
+      queries: env.log.cookieQueries,
+      seq: env.log.seq,
+    };
+  };
+
+  out.takeoverFailReply = await takeOver({ native: "fail" }, dlItem({ id: 21 }));
+  out.takeoverFailThrow = await takeOver({ native: "throw" }, dlItem({ id: 22 }));
+  out.takeoverOk = await takeOver({}, dlItem({ id: 23 }));
+  /* indirme devir yanitindan once bitti: devretme, dokunma */
+  out.takeoverFinished =
+    await takeOver({ pauseFails: true, searchState: "complete" },
+                   dlItem({ id: 24 }));
+
+  /* kapsayici sekme: cerez deposu indirme ogesinden gelir */
+  out.containerCookies = await takeOver({ cookies: [
+    { name: "container", value: "C1", domain: "files.example.com",
+      sameSite: "strict", firstPartyDomain: "",
+      storeId: "firefox-container-1" },
+    { name: "defaultStore", value: "D1", domain: "files.example.com",
+      sameSite: "strict", firstPartyDomain: "" },
+  ] }, dlItem({ id: 25, cookieStoreId: "firefox-container-1" }));
+
+  /* ozel pencere: cerezler gerekli ama istek ephemeral isaretlenir */
+  out.incognito = await takeOver({ cookies: [
+    { name: "private", value: "P1", domain: "files.example.com",
+      sameSite: "strict", firstPartyDomain: "",
+      storeId: "firefox-private" },
+  ] }, dlItem({ id: 26, cookieStoreId: "firefox-private", incognito: true }));
+
+  /* kendi web arayuzumuz: loopback'in her bicimi ve daemon portu atlanir */
+  {
+    const urls = [
+      "http://127.0.0.1:8378/api/stats",
+      "https://127.0.0.1:8378/index.html",
+      "http://localhost:8378/files/x.zip",
+      "http://[::1]:8378/files/x.zip",
+      "http://127.0.0.5:8378/files/x.zip",
+    ];
+    out.loopback = [];
+    for (let i = 0; i < urls.length; i++) {
+      const r = await takeOver({}, dlItem({ id: 30 + i, url: urls[i] }));
+      out.loopback.push({ url: urls[i], sent: r.sent.length,
+                          paused: r.paused.length,
+                          cancelled: r.cancelled.length });
+    }
+    /* baska port: daemon degil, devralinir */
+    const other = await takeOver({}, dlItem({
+      id: 40, url: "http://127.0.0.1:9999/files/x.zip" }));
+    out.loopbackOtherPort = { sent: other.sent.length,
+                              cancelled: other.cancelled };
+  }
+
   process.stdout.write(JSON.stringify(out));
 })().catch((e) => {
   process.stderr.write(String((e && e.stack) || e));
@@ -483,23 +575,31 @@ class BackgroundSourceTests(unittest.TestCase):
         self.assertIn("runtime.sendNativeMessage", self.src)
 
 
-@unittest.skipUnless(NODE and BACKGROUND.is_file(), "node bulunamadi")
-class BackgroundBehaviorTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.tmp = tempfile.mkdtemp(prefix="ferdim-mv3-")
-        harness = Path(cls.tmp) / "harness.cjs"
+_HARNESS_OUT = None
+_HARNESS_TMP = None
+
+
+def run_harness() -> dict:
+    """Arka plan betigini node vm harness'inde bir kez calistir."""
+    global _HARNESS_OUT, _HARNESS_TMP
+    if _HARNESS_OUT is None:
+        _HARNESS_TMP = tempfile.TemporaryDirectory(prefix="ferdim-mv3-")
+        harness = Path(_HARNESS_TMP.name) / "harness.cjs"
         harness.write_text(HARNESS, encoding="utf-8")
         res = subprocess.run(
             [NODE, str(harness), str(BACKGROUND), str(SNIFF)],
             text=True, capture_output=True, timeout=120)
         if res.returncode != 0:
             raise AssertionError(f"harness: {res.stderr}")
-        cls.out = json.loads(res.stdout)
+        _HARNESS_OUT = json.loads(res.stdout)
+    return _HARNESS_OUT
 
+
+@unittest.skipUnless(NODE and BACKGROUND.is_file(), "node bulunamadi")
+class BackgroundBehaviorTests(unittest.TestCase):
     @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls.tmp, ignore_errors=True)
+    def setUpClass(cls):
+        cls.out = run_harness()
 
     def test_menus_idempotent_on_install(self):
         m = self.out["menus"]
@@ -609,6 +709,82 @@ class BackgroundBehaviorTests(unittest.TestCase):
         self.assertTrue(s["contentPanel"]["ok"])
         self.assertFalse(s["foreignPanel"]["ok"])
         self.assertEqual(s["pageShows"], [3])
+
+
+@unittest.skipUnless(NODE and BACKGROUND.is_file(), "node bulunamadi")
+class DownloadTakeoverTests(unittest.TestCase):
+    """Devir sirasi ve cerez deposu: kaybi onleyen davranis."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.out = run_harness()
+
+    def test_failed_reply_keeps_browser_download(self):
+        """Ana makine reddederse tarayici indirmesi kalir: iptal/silme yok,
+        duraklatilan indirme surdurulur ve bildirim gosterilir."""
+        t = self.out["takeoverFailReply"]
+        self.assertEqual(len(t["sent"]), 1, "devir yine denenir")
+        self.assertEqual(t["paused"], [21])
+        self.assertEqual(t["resumed"], [21])
+        self.assertEqual(t["cancelled"], [])
+        self.assertEqual(t["erased"], [])
+        self.assertEqual(t["notified"], ["notifyTakeoverFail"])
+
+    def test_unreachable_service_keeps_browser_download(self):
+        t = self.out["takeoverFailThrow"]
+        self.assertEqual(t["paused"], [22])
+        self.assertEqual(t["resumed"], [22])
+        self.assertEqual(t["cancelled"], [])
+        self.assertEqual(t["erased"], [])
+        self.assertEqual(t["notified"], ["notifyTakeoverFail"])
+
+    def test_success_cancels_only_after_reply(self):
+        t = self.out["takeoverOk"]
+        self.assertEqual(t["paused"], [23])
+        self.assertEqual(t["cancelled"], [23])
+        self.assertEqual(t["erased"], [23])
+        self.assertEqual(t["resumed"], [], "basarili devirde resume yok")
+        self.assertEqual(t["notified"], [])
+        seq = t["seq"]
+        self.assertLess(seq.index("pause:23"), seq.index("native:download"))
+        self.assertLess(seq.index("native:download"), seq.index("cancel:23"))
+        self.assertLess(seq.index("cancel:23"), seq.index("erase:23"))
+
+    def test_completed_before_reply_is_left_alone(self):
+        """Duraklatilamayan (bitmis) indirme yeniden devredilmez."""
+        t = self.out["takeoverFinished"]
+        self.assertEqual(t["sent"], [])
+        self.assertEqual(t["cancelled"], [])
+        self.assertEqual(t["erased"], [])
+        self.assertEqual(t["resumed"], [])
+        self.assertEqual(t["notified"], [])
+
+    def test_container_store_id_reaches_cookie_query(self):
+        """Kapsayici sekmenin indirmesi kendi deposunun cerezleriyle gider."""
+        t = self.out["containerCookies"]
+        self.assertTrue(t["queries"], "cerez sorgusu yapilmali")
+        for q in t["queries"]:
+            self.assertEqual(q["storeId"], "firefox-container-1", q)
+        self.assertEqual(t["sent"][0]["cookies"], "container=C1")
+
+    def test_incognito_download_flagged_ephemeral(self):
+        t = self.out["incognito"]
+        msg = t["sent"][0]
+        self.assertIs(msg["ephemeral"], True)
+        self.assertEqual(msg["cookies"], "private=P1", msg)
+        for q in t["queries"]:
+            self.assertEqual(q["storeId"], "firefox-private", q)
+
+    def test_loopback_daemon_urls_ignored(self):
+        for hit in self.out["loopback"]:
+            self.assertEqual(hit["sent"], 0, hit["url"])
+            self.assertEqual(hit["paused"], 0, hit["url"])
+            self.assertEqual(hit["cancelled"], 0, hit["url"])
+
+    def test_loopback_other_port_taken_over(self):
+        o = self.out["loopbackOtherPort"]
+        self.assertEqual(o["sent"], 1)
+        self.assertEqual(o["cancelled"], [40])
 
 
 class LocaleParityTests(unittest.TestCase):

@@ -50,5 +50,7 @@
   "webUi": {"message": "Abrir interfaz web"},
   "notifyStartFail": {"message": "FerDim: no se pudo iniciar la descarga"},
   "notifyServiceOff": {"message": "FerDim: servicio inaccesible"},
-  "notifyServiceOffBody": {"message": "El demonio de FerDim puede no estar en marcha. Prueba 'ferdim daemon' en un terminal."}
+  "notifyServiceOffBody": {"message": "El demonio de FerDim puede no estar en marcha. Prueba 'ferdim daemon' en un terminal."},
+  "notifyTakeoverFail": {"message": "FerDim: descarga conservada en el navegador"},
+  "notifyTakeoverFailBody": {"message": "FerDim no pudo asumir la descarga. La descarga del navegador continúa."}
 }

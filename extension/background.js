@@ -1,6 +1,8 @@
 /* FerDim Entegrasyon Modülü - arka plan betigi
  * Davranis modeli:
- *  - tarayici indirmesini yakala -> iptal et -> FerDim'e aktar
+ *  - tarayici indirmesini yakala -> duraklat -> FerDim'e aktar ->
+ *    yalnizca onayli aktarimdan sonra iptal et (aktarim basarisizsa
+ *    tarayici indirmesi devam eder)
  *  - medya/indirme adaylarini webRequest ile dinle (siniflandirma
  *    sniff.js icinde, saf fonksiyon), sayfa basliginda rozet
  *  - sag tik menusu, "tum baglantilari tara" (grab) kutuphanesi
@@ -197,8 +199,10 @@ function topLevelSite(u) {
  * SameSite=None. Boylece kotu niyetli bir sayfanin baslattigi capraz site
  * indirme baska sitenin oturum cerezlerini FerDim'e tasimaz (GET CSRF).
  * Bolumlu (CHIPS) cerezler yalnizca sekmenin ust duzey sitesiyle sinirli
- * sorguyla ve yalnizca ayni site baglaminda eklenir. */
-async function collectCookies(url, ctxUrl) {
+ * sorguyla ve yalnizca ayni site baglaminda eklenir.
+ * storeId zorunludur: varsayilan depo yerine indirmeyi baslatan kapsayici
+ * sekmenin (ya da ozel pencerenin) cerezleri okunur. */
+async function collectCookies(url, ctxUrl, storeId) {
   const same = sameSite(url, ctxUrl);
   const seen = new Set();
   const parts = [];
@@ -217,28 +221,68 @@ async function collectCookies(url, ctxUrl) {
       parts.push(key);
     }
   };
+  // Depo secilmezse tarayici varsayilana duser; kapsayici/ozel depo sizmaz
+  const base = storeId ? { storeId } : {};
   if (same) {
     const tls = topLevelSite(ctxUrl);
     if (tls) {
       try {
         add(await browser.cookies.getAll(
-          { url, partitionKey: { topLevelSite: tls } }));
+          { url, ...base, partitionKey: { topLevelSite: tls } }));
       } catch (e) { /* partitionKey desteklenmiyor */ }
     }
   }
   try {
-    add(await browser.cookies.getAll({ url }));
+    add(await browser.cookies.getAll({ url, ...base }));
   } catch (e) { return ""; }  // cookies izni yok
   return parts.join("; ");
 }
 
 /* ------------------------------------------------------- indirme yakalama */
+/* Kendi indirmemizi yakalamama: loopback'in her bicimi (localhost, [::1],
+ * 127.0.0.0/8) ve https dahil, yalnizca daemon'in web portunda. */
+function isLoopbackHost(h) {
+  return h === "localhost" || h === "::1" || h === "[::1]" ||
+         /^127(\.\d{1,3}){3}$/.test(h);
+}
+function isDaemonUrl(u) {
+  let p;
+  try { p = new URL(u); } catch (e) { return false; }
+  if (p.protocol !== "http:" && p.protocol !== "https:") return false;
+  const port = p.port || (p.protocol === "https:" ? "443" : "80");
+  return isLoopbackHost(p.hostname.toLowerCase()) && port === String(hostPort);
+}
+
+/* Ozel pencere cerez deposu: cerezler bu aktarim icin gerekli, daemon
+ * tarafinda kalici yazilmamali (istek "ephemeral" ile isaretlenir). */
+const PRIVATE_STORE = "firefox-private";
+
+function downloadState(id) {
+  return browser.downloads.search({ id }).then(
+    (items) => (items && items[0] && items[0].state) || "",
+    () => "");
+}
+async function pauseDownload(id) {
+  try { await browser.downloads.pause(id); return true; }
+  catch (e) { return false; }  // bitmis ya da duraklatilamaz
+}
+async function resumeDownload(id) {
+  try { await browser.downloads.resume(id); } catch (e) { /* bitmis */ }
+}
+/* Onayli devirden sonra tarayici kopyasi kaldirilir. Indirme bu arada
+ * bittiyse dosyaya dokunulmaz (erase dosyayi da siler). */
+async function dropBrowserDownload(id) {
+  if ((await downloadState(id)) === "complete") return;
+  try { await browser.downloads.cancel(id); } catch (e) { return; }
+  try { await browser.downloads.erase({ id: id }); } catch (e) { /* yok */ }
+}
+
 async function onDownloadCreated(item) {
   await ready;
   if (item.state !== "in_progress") return;
   const url = item.url || "";
   if (!/^(https?|ftp):/i.test(url)) return; // blob:/data: yakalanamaz
-  if (url.startsWith("http://127.0.0.1:" + hostPort)) return;
+  if (isDaemonUrl(url)) return;
 
   if (opts.takeover === "off") return;
   const mime = item.mime || "";
@@ -250,31 +294,44 @@ async function onDownloadCreated(item) {
   const known = item.totalBytesSuggested || item.totalBytes || 0;
   if (minBytes && known && known < minBytes) return;
 
-  // tarayici indirmesini iptal et, listeden sil
-  try {
-    await browser.downloads.cancel(item.id);
-    await browser.downloads.erase({ id: item.id });
-  } catch (e) { /* zaten bitti */ }
+  // Baglam: indirmeyi baslatan sayfa. Cerez deposu indirme ogesinden gelir
+  // (kapsayici sekme / ozel pencere); referer yoksa aktif sekme.
+  const tab = item.referrer ? null : await activeTab();
+  const ctx = item.referrer || (tab ? tab.url : "");
+  const storeId = item.cookieStoreId || (tab && tab.storeId) || "";
 
-  // Baglam: indirmeyi baslatan sayfa. Cerez kapsami da buradan gelir.
-  const ctx = item.referrer || await activeTabUrl();
-  await handoff(url, {
+  // 1) Once duraklat: devir onaylanmadan tarayici indirmesi iptal edilmez.
+  const paused = await pauseDownload(item.id);
+  // 2) Bu arada bittiyse devretme ve tarayici kopyasina dokunma.
+  if (!paused && (await downloadState(item.id)) === "complete") return;
+  // 3) Devret; yalnizca onayli yanitta tarayici kopyasi kaldirilir.
+  const r = await handoff(url, {
     filename: item.filename ? item.filename.split(/[\\/]/).pop() : nameFromUrl(url),
     referer: opts.sendReferer ? ctx : "",
     ctx,
-    mime,
+    storeId,
+    ephemeral: !!item.incognito,
+    quiet: true,   // devir hatasi icin asagida kendi bildirimi var
   });
+  if (r.ok) { await dropBrowserDownload(item.id); return; }
+  if (paused) await resumeDownload(item.id);
+  notify(_("notifyTakeoverFail"), _("notifyTakeoverFailBody"));
 }
 
-/* Cerez baglami icin: indirmeyi baslatan sekmenin adresi. */
-async function activeTabUrl() {
+/* Cerez baglami icin: indirmeyi baslatan sekmenin adresi ve cerez deposu. */
+async function activeTab() {
   try {
     const tabs = await browser.tabs.query({ active: true, currentWindow: true });
-    const u = tabs && tabs[0] && tabs[0].url;
-    return u && /^https?:/.test(u) ? u : "";
-  } catch (e) { return ""; }
+    const t = tabs && tabs[0];
+    if (!t) return { url: "", storeId: "" };
+    return {
+      url: t.url && /^https?:/.test(t.url) ? t.url : "",
+      storeId: t.cookieStoreId || "",
+    };
+  } catch (e) { return { url: "", storeId: "" }; }
 }
 
+/* Devir. Donus: {ok}. quiet: cagiran kendi bildirimini gosterir. */
 async function handoff(url, extra = {}) {
   const msg = {
     cmd: "download",
@@ -284,17 +341,28 @@ async function handoff(url, extra = {}) {
     ua: navigator.userAgent,
     segments: opts.segments,
   };
+  let storeId = extra.storeId || "";
+  let ctx = extra.ctx || extra.referer || "";
+  if (!storeId || !ctx) {
+    const tab = await activeTab();
+    if (!ctx) ctx = tab.url;
+    if (!storeId) storeId = tab.storeId;
+  }
+  if (extra.ephemeral || storeId === PRIVATE_STORE) msg.ephemeral = true;
   if (opts.sendCookies && /^https?:/i.test(url)) {
-    const ctx = extra.ctx || extra.referer || await activeTabUrl();
-    const cookies = await collectCookies(url, ctx);
+    const cookies = await collectCookies(url, ctx, storeId);
     if (cookies) msg.cookies = cookies;
   }
   try {
     const r = await sendNative(msg);
-    if (!r || !r.ok) notify(_("notifyStartFail"),
-      (r && r.error) || "-");
+    if (!r || !r.ok) {
+      if (!extra.quiet) notify(_("notifyStartFail"), (r && r.error) || "-");
+      return { ok: false, reason: (r && r.error) || "" };
+    }
+    return { ok: true };
   } catch (e) {
-    notify(_("notifyServiceOff"), _("notifyServiceOffBody"));
+    if (!extra.quiet) notify(_("notifyServiceOff"), _("notifyServiceOffBody"));
+    return { ok: false, reason: "service" };
   }
 }
 
@@ -403,11 +471,14 @@ if (browser.runtime.onStartup) {
 }
 browser.contextMenus.onClicked.addListener(async (info, tab) => {
   const referer = tab && tab.url || "";
+  // Kapsayici sekmeden gelen baglanti o sekmenin cerez deposuyla gider
+  const storeId = (tab && tab.cookieStoreId) || "";
   if (info.menuItemId === "fd-link") {
-    await handoff(info.linkUrl, { referer, filename: nameFromUrl(info.linkUrl) });
+    await handoff(info.linkUrl, { referer, storeId,
+                                 filename: nameFromUrl(info.linkUrl) });
   } else if (info.menuItemId === "fd-media") {
     const u = info.srcUrl || info.linkUrl;
-    if (u) await handoff(u, { referer, filename: nameFromUrl(u) });
+    if (u) await handoff(u, { referer, storeId, filename: nameFromUrl(u) });
   } else if (info.menuItemId === "fd-page" || info.menuItemId === "fd-selection") {
     await grabTab(tab.id, info.menuItemId === "fd-selection");
     pageButton.show(tab.id).catch(() => {});
