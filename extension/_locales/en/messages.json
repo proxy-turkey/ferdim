@@ -48,6 +48,7 @@
   "hostOk": {"message": "connected"},
   "hostOff": {"message": "service off"},
   "webUi": {"message": "Open web UI"},
+  "webUiUnavailable": {"message": "Web UI unavailable"},
   "notifyStartFail": {"message": "FerDim: could not start the download"},
   "notifyServiceOff": {"message": "FerDim: service unreachable"},
   "notifyServiceOffBody": {"message": "The FerDim daemon may not be running. Try 'ferdim daemon' in a terminal."},

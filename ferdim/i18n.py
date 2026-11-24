@@ -557,6 +557,27 @@ S = {
         "tr": "LAN eşbaz önbelleği",
         "es": "Caché de pares en LAN",
         "ru": "Кэш узлов в локальной сети"},
+    # ---- launcher web oturumu (tek kullanimlik URL)
+    "launch_web_disabled": {
+        "en": "The web UI is disabled in the configuration.",
+        "tr": "Web arayüzü yapılandırmada kapalı.",
+        "es": "La interfaz web está desactivada en la configuración.",
+        "ru": "Веб-интерфейс отключён в настройках."},
+    "launch_web_failed": {
+        "en": "Could not obtain a web UI address.",
+        "tr": "Web arayüzü adresi alınamadı.",
+        "es": "No se pudo obtener una dirección de la interfaz web.",
+        "ru": "Не удалось получить адрес веб-интерфейса."},
+    "launch_token_rotated": {
+        "en": "API token rotated; open a fresh web UI session.",
+        "tr": "API jetonu yenilendi; web arayüzünü yeniden açın.",
+        "es": "Jeton de API renovado; abra una sesión nueva de la interfaz web.",
+        "ru": "Токен API обновлён; откройте веб-интерфейс заново."},
+    "launch_token_failed": {
+        "en": "Could not rotate the API token.",
+        "tr": "API jetonu yenilenemedi.",
+        "es": "No se pudo renovar el jeton de API.",
+        "ru": "Не удалось обновить токен API."},
 }
 
 

@@ -254,7 +254,15 @@ RPC/HTTP arka plan servisini ön planda çalıştırır (normalde
 \fBferdim.service\fR systemd kullanıcı birimiyle başlatılır).
 .TP
 .BI web
-Web arayüzünü varsayılan tarayıcıda açar.
+Web arayüzünü varsayılan tarayıcıda açar. Adres, yerel soket üzerinden
+arka plan servisinden alınır ve tek kullanımlık bir oturum nonce'u taşır
+(120 saniye geçerli); böylece API jetonu tarayıcı geçmişinde görünmez. Web
+arayüzü yapılandırmada kapalıysa sıfırdan farklı kodla çıkar.
+.TP
+.BI token " rotate"
+Yerel HTTP API jetonunu yeniler. Açık web arayüzü oturumları geçersiz
+olur; yeni adresi \fBferdim web\fR ile alın. Yeni jeton durum dizinine
+yazılır.
 .SH DOSYALAR
 .TP
 .I ~/.local/state/ferdim/

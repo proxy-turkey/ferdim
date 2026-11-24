@@ -247,7 +247,15 @@ Run the RPC/HTTP daemon in the foreground (normally started via the
 \fBferdim.service\fR systemd user unit).
 .TP
 .BI web
-Open the web UI in the default browser.
+Open the web UI in the default browser. The address is fetched from the
+daemon over the local socket and carries a single-use session nonce
+(valid for 120 seconds), so the API token never appears in the browser
+history. Exits non-zero when the web UI is disabled in the configuration.
+.TP
+.BI token " rotate"
+Replace the localhost HTTP API token. Open web UI sessions stop working;
+request a fresh address with \fBferdim web\fR. The new token is written to
+the state directory.
 .SH FILES
 .TP
 .I ~/.local/state/ferdim/

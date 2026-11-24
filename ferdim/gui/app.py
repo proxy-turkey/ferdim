@@ -863,12 +863,25 @@ class FerdimApp(Gtk.Application):
 
     def on_web(self, _btn):
         import subprocess
-        ensure_daemon(self.env)
+        if not self.client and ensure_daemon(self.env):
+            self.connect_client()
         try:
-            port = self.env.port_path.read_text().strip()
-            subprocess.Popen(["xdg-open", f"http://127.0.0.1:{port}"])
+            r = self.client.request("web-session")
         except Exception:
-            pass
+            r = {}
+        url = str(r.get("url") or "")
+        if not r.get("ok") or not url:
+            key = ("launch_web_disabled"
+                   if r.get("code") == "web_disabled"
+                   else "launch_web_failed")
+            self._error(gtr(key))
+            return
+        try:
+            subprocess.Popen(["xdg-open", url],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except OSError:
+            self._error(gtr("launch_web_failed"))
 
 
 def main() -> int:

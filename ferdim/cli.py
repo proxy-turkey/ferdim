@@ -193,13 +193,44 @@ def cmd_daemon(a, env):
     return daemon_main()
 
 
+def _web_failure(r: dict) -> str:
+    """web-session hatasini kullaniciya anlasilir metne cevir."""
+    if r.get("code") == "web_disabled":
+        return _("launch_web_disabled")
+    return _("launch_web_failed")
+
+
 def cmd_web(a, env):
+    """Web arayuzunu tek kullanimlik URL ile acar (jeton adreste tasinmaz).
+
+    URL her cagrida yeniden alinir: nonce tek kullanimlidir ve 120 sn
+    sonra duser, bu yuzden onbelleklenmez."""
     import subprocess
-    ensure_daemon(env)
-    port = env.port_path.read_text().strip()
-    url = f"http://127.0.0.1:{port}"
+    with _client(env) as c:
+        r = c.request("web-session")
+    url = str(r.get("url") or "")
+    if not r.get("ok") or not url:
+        print(f"{_('cli_error')}: {_web_failure(r)}", file=sys.stderr)
+        return 1
     print(url)
-    subprocess.Popen(["xdg-open", url])
+    try:
+        subprocess.Popen(["xdg-open", url],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass                        # URL yazdirildi; tarayici yoksa da is gorur
+    return 0
+
+
+def cmd_token(a, env):
+    """API jetonunu yeniler; eski tek kullanimlik web oturumlari duser."""
+    with _client(env) as c:
+        r = c.request("token-rotate")
+    if not r.get("ok"):
+        print(_("cli_error") + ":",
+              r.get("error") or r.get("code") or _("launch_token_failed"),
+              file=sys.stderr)
+        return 1
+    print(_("launch_token_rotated"))
     return 0
 
 
@@ -640,6 +671,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("web", help="web arayuzunu ac")
     sp.set_defaults(fn=cmd_web)
+
+    sp = sub.add_parser("token", help="API jetonu islemleri")
+    tsp = sp.add_subparsers(dest="action", required=True)
+    one = tsp.add_parser("rotate", help="web API jetonunu yenile")
+    one.set_defaults(fn=cmd_token)
 
     sp = sub.add_parser("publish",
                         help="yayin dizini: merkle/sha256/meta4 uret")

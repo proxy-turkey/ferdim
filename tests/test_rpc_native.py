@@ -293,6 +293,7 @@ class NativeHostFilterTests(unittest.TestCase):
         self.assertEqual([it["filename"] for it in items],
                          ["a.bin", "b.bin"])
         allowed = set(nativehost.DOWNLOAD_DEFAULTS)
+        self.assertNotIn("dir", allowed)  # tarayici hedef klasor secemez
         for it in items:
             self.assertLessEqual(set(it), allowed)
         for banned in ("merkle", "proxy", "insecure", "headers", "checksum"):
@@ -302,11 +303,13 @@ class NativeHostFilterTests(unittest.TestCase):
         start = len(self.seen)
         self._send(p, {"cmd": "download", "url": "http://127.0.0.1:1/c.bin",
                        "filename": "c.bin", "merkle": "/etc/passwd",
-                       "proxy": "socks5://127.0.0.1:9", "insecure": True})
+                       "dir": "/tmp/baska", "proxy": "socks5://127.0.0.1:9",
+                       "insecure": True})
         self.assertTrue(self._recv(p)["ok"])
         add = next(m for m in self.seen[start:] if m.get("cmd") == "add")
         self.assertLessEqual(set(add) - {"cmd"}, allowed)
         self.assertNotIn("merkle", add)
+        self.assertNotIn("dir", add)
 
     def test_02_non_dict_frames_answer_with_error(self):
         p = self._host()

@@ -48,6 +48,7 @@
   "hostOk": {"message": "conectado"},
   "hostOff": {"message": "servicio apagado"},
   "webUi": {"message": "Abrir interfaz web"},
+  "webUiUnavailable": {"message": "Interfaz web no disponible"},
   "notifyStartFail": {"message": "FerDim: no se pudo iniciar la descarga"},
   "notifyServiceOff": {"message": "FerDim: servicio inaccesible"},
   "notifyServiceOffBody": {"message": "El demonio de FerDim puede no estar en marcha. Prueba 'ferdim daemon' en un terminal."},
