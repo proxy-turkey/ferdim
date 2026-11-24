@@ -98,6 +98,8 @@ main{flex:1;overflow:auto;padding:10px 16px}
   background:var(--panel2);line-height:1.5}
 .note.bad{color:var(--bad-text)} .note.warn{color:var(--warn-text)}
 .note.ok{color:var(--ok-text)} .note.info{color:var(--info-text)}
+/* dogrulama rozetleri (saglama / Merkle): ince cerceveli kompakt etiket */
+.note.chk{border:1px solid currentColor;background:transparent;font-weight:600}
 .bar{height:14px;background:var(--panel2);border-radius:99px;overflow:hidden;
   position:relative}
 .bar>i{display:block;height:100%;width:0;
@@ -176,6 +178,18 @@ dialog select,dialog textarea{width:100%;margin-top:4px}
 .ziprow .n{font-family:ui-monospace,monospace;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto}
 .ziprow .s{color:var(--dim);white-space:nowrap}
+
+/* ------------------------------------------------- ana makine profilleri */
+.hostlist{max-height:320px;min-width:440px;overflow-y:auto;display:flex;
+  flex-direction:column;gap:2px}
+.hostrow{display:flex;align-items:center;justify-content:space-between;
+  gap:10px;padding:5px 8px;border-bottom:1px solid var(--line);
+  font-size:12.5px}
+.hostrow:hover{background:var(--panel2)}
+.hostrow .hrow-text{font-variant-numeric:tabular-nums;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+#hostsEmpty{margin:8px 2px}
+@media (max-width: 840px){ .hostlist{min-width:0} }
 
 /* --------------------------------------------------------------- gecmis */
 .history{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}
