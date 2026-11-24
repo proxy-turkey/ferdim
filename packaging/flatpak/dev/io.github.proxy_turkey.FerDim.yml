@@ -1,0 +1,60 @@
+# FerDim — local development manifest (working tree source).
+#
+# Same app configuration as io.github.proxy_turkey.FerDim.yml, but builds
+# from this checkout instead of the v1.6.0 tag archive. Keep the module
+# build commands in sync with the Flathub manifest.
+#
+#   flatpak run --user --command=flatpak-builder org.flatpak.Builder \
+#     --state-dir=/tmp/opencode/flatpak-state --force-clean \
+#     --repo=/tmp/opencode/flatpak-repo /tmp/opencode/flatpak-build \
+#     packaging/flatpak/dev/io.github.proxy_turkey.FerDim.yml
+app-id: io.github.proxy_turkey.FerDim
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+command: ferdim-gui
+
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=xdg-download
+  - --talk-name=org.freedesktop.Notifications
+  - --own-name=org.ferdim.Daemon
+  # TEMPORARY: see the Flathub manifest; drop with the GApplication id fix.
+  - --own-name=app.ferdim.gui
+
+modules:
+  - name: ferdim
+    buildsystem: simple
+    sources:
+      - type: dir
+        path: ../../..
+      - type: file
+        path: ../io.github.proxy_turkey.FerDim.desktop
+      - type: file
+        path: ../io.github.proxy_turkey.FerDim.metainfo.xml
+      - type: file
+        path: ../io.github.proxy_turkey.FerDim.svg
+    build-commands:
+      - install -d /app/share/ferdim
+      - cp -a ferdim web /app/share/ferdim/
+      - find /app/share/ferdim -name '__pycache__' -type d -prune -exec rm -rf '{}' +
+      - install -Dm755 bin/ferdim /app/bin/ferdim
+      - install -Dm755 bin/ferdim-nm /app/bin/ferdim-nm
+      - install -Dm755 bin/ferdim-gui /app/bin/ferdim-gui
+      - install -Dm755 bin/ferdim-dbus /app/bin/ferdim-dbus
+      - install -Dm644 data/org.ferdim.Daemon1.xml /app/share/dbus-1/interfaces/org.ferdim.Daemon1.xml
+      - install -d /app/share/dbus-1/services
+      - sed 's|@BIN@|/app/bin/ferdim-dbus|' data/org.ferdim.Daemon.service > /app/share/dbus-1/services/org.ferdim.Daemon.service
+      - install -Dm644 io.github.proxy_turkey.FerDim.desktop /app/share/applications/io.github.proxy_turkey.FerDim.desktop
+      - install -Dm644 io.github.proxy_turkey.FerDim.svg /app/share/icons/hicolor/scalable/apps/io.github.proxy_turkey.FerDim.svg
+      - install -Dm644 io.github.proxy_turkey.FerDim.metainfo.xml /app/share/metainfo/io.github.proxy_turkey.FerDim.metainfo.xml
+      - install -Dm644 LICENSE /app/share/licenses/io.github.proxy_turkey.FerDim/LICENSE
+      - |
+        for m in ferdim ferdim-nm ferdim-gui ferdim-dbus; do
+          install -Dm644 "docs/$m.1" "/app/share/man/man1/$m.1"
+          install -Dm644 "docs/tr/$m.1" "/app/share/man/tr/man1/$m.1"
+        done

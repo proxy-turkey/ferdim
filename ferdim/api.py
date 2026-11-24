@@ -113,6 +113,12 @@ def _sanitize_config(cfg: dict, env=None) -> None:
             0.02, min(0.9, float(cfg.get("coexist_threshold", 0.15))))
     except (TypeError, ValueError):
         cfg["coexist_threshold"] = 0.15
+    # gecikme sinyali esigi (guncel TTFB / taban): 1.2-20 arasi
+    try:
+        cfg["coexist_latency"] = max(
+            1.2, min(20.0, float(cfg.get("coexist_latency", 2.5))))
+    except (TypeError, ValueError):
+        cfg["coexist_latency"] = 2.5
     dirs = cfg.get("watch_dirs")
     cfg["watch_dirs"] = [d for d in dirs if isinstance(d, str) and d.strip()] \
         if isinstance(dirs, list) else []

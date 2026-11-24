@@ -115,6 +115,8 @@ def main() -> int:
         if notifier is not None:
             notifier.stop()
         qm.shutdown()
+        from .engine import h3      # paylasilan QUIC dongusu + UDP soketleri
+        h3.close_all()
         sock_srv.shutdown()
         if web_srv:
             web_srv.shutdown()

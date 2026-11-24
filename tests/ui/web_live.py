@@ -86,9 +86,19 @@ with sync_playwright() as p:
     ctx = browser.new_context(viewport={"width": 1280, "height": 880},
                               locale="tr-TR")
     page = ctx.new_page()
+
+    def on_console(m):
+        if m.type != "error":
+            return
+        loc = (m.location or {}).get("url") or ""
+        # /api/hosts HTTP yolunu sunucu lane'i ekliyor; yol yokken tarayici
+        # 404'u konsola yazar (istek panelde durum metnine donusuyor).
+        if "404" in m.text and loc.endswith("/api/hosts"):
+            return
+        errors.append("console: " + m.text)
+
     page.on("pageerror", lambda e: errors.append("pageerror: " + str(e)))
-    page.on("console", lambda m: errors.append("console: " + m.text)
-            if m.type == "error" else None)
+    page.on("console", on_console)
     page.goto(f"http://127.0.0.1:{PORT}/")
     page.wait_for_selector("#jobList .row", timeout=15000)
     page.wait_for_timeout(900)
@@ -207,6 +217,107 @@ with sync_playwright() as p:
     check(" bitti duyurusu (aria-live)", "dosya.iso" in live and "Tamam" in live, live)
     j = wait_job("dosya.iso", ("done", "error"), 30)
     check(" aynali is bitti", j and j["state"] == "done", j)
+
+    # --------------------------------------------- ana makine profilleri
+    # Gercek komut: yol varsa satirlar, yoksa panel durum metni gosterir.
+    try:
+        hh = api("/api/hosts", {})
+        print("  INFO  ana makine komutu: sunucuda var,",
+              hh.get("count"), "profil")
+    except Exception as exc:      # HTTPError 404: HTTP yolu eklenmemis
+        print(f"  INFO  ana makine komutu: sunucuda YOK ({exc})")
+    page.click("#hostsBtn")
+    page.wait_for_selector("#hostsDlg[open]")
+    check(" ana makineler kapanisi acilir",
+          page.evaluate("document.querySelector('#hostsDlg').open"))
+    check(" kapanis basligi bagli",
+          page.get_attribute("#hostsDlg", "aria-labelledby") == "hostsTitle")
+    page.wait_for_timeout(700)
+    sok = page.evaluate("""() => {
+        const box = document.querySelector('#hostsList');
+        return { rows: box.querySelectorAll('.hostrow').length,
+                 empty: !document.querySelector('#hostsEmpty').hidden,
+                 status: !document.querySelector('#hostsStatus').hidden }; }""")
+    check(" ana makineler: satir ya da durum metni",
+          sok["rows"] > 0 or sok["empty"] or sok["status"], sok)
+    page.screenshot(path=f"{OUT}/03b-ana-makineler.png")
+
+    # Satir cizimi/yerinde guncelleme: profiller burada ogrenilmedigi icin
+    # (kisa isler governor olcumu uretmez) liste route ile beslenir.
+    work = [
+        {"host": "a.example", "links": 6, "throttled": False, "rtt_band": "low",
+         "per_link_bps": 1048576, "samples": 4, "last_seen": 1700000000},
+        {"host": "b.example:8080", "links": 3, "throttled": True,
+         "rtt_band": "high", "per_link_bps": 262144, "samples": 9,
+         "last_seen": 1700000100}]
+    sent = []
+
+    def fake_hosts(route):
+        body = json.loads(route.request.post_data or "{}") \
+            if route.request.method == "POST" else {}
+        if body.get("forget"):
+            sent.append(body["forget"])
+            work[:] = [h for h in work if h["host"] != body["forget"]]
+            reply = {"ok": True, "forgotten": body["forget"]}
+        elif body.get("clear"):
+            sent.append("clear")
+            reply = {"ok": True, "removed": len(work)}
+            work.clear()
+        else:
+            reply = {"ok": True, "count": len(work), "hosts": work}
+        route.fulfill(body=json.dumps(reply),
+                      headers={"Content-Type": "application/json"})
+
+    page.route("**/api/hosts", fake_hosts)
+    page.click("#hostsClose")
+    page.click("#hostsBtn")                  # panel yeniden komutu cagirir
+    page.wait_for_selector("#hostsList .hostrow", timeout=5000)
+    check(" profil satirlari ana makineye gore cizilir",
+          page.locator("#hostsList .hostrow").count() == 2)
+    htxt = page.inner_text("#hostsList")
+    check(" profil metni: ana makine, baglanti, rtt, hiz",
+          "a.example" in htxt and "6 bağlantı" in htxt and "düşük" in htxt
+          and "1.0 MB" in htxt and "b.example:8080" in htxt, htxt)
+    check(" unut dugmesinin adi ana makineyi icerir", page.evaluate("""() => {
+        const r = document.querySelector('#hostsList .hostrow');
+        const b = r && r.querySelector('button');
+        const host = r && (r.querySelector('.hrow-text').textContent
+                           || '').trim().split(/\\s+/)[0];
+        return !!b && !!host
+          && (b.getAttribute('aria-label') || '').includes(host); }"""))
+    page.evaluate("document.querySelector('#hostsList .hostrow')"
+                  ".dataset.mark = 'ilk'")
+    page.locator("#hostsList .hostrow").first.locator("button").focus()
+    work[0]["samples"] = 42
+    page.wait_for_timeout(2600)              # >= 1 panel tazelemesi (~2 sn)
+    check(" satir yerinde guncellenir (odak korunur)", page.evaluate("""() => {
+        const r = document.querySelector('#hostsList .hostrow');
+        return r.dataset.mark === 'ilk'
+          && r.querySelector('.hrow-text').textContent.includes('42 örnek')
+          && document.activeElement.closest('.hostrow') === r; }"""),
+          page.inner_text("#hostsList"))
+    page.locator("#hostsList .hostrow").first.locator("button").click()
+    page.wait_for_timeout(500)
+    check(" unut: komut govdesi {forget}", sent[:1] == ["a.example"], sent)
+    check(" unut bildirimi (role=status)",
+          "a.example" in page.inner_text("#notice"))
+    check(" unutulan satir listeden duser",
+          page.locator("#hostsList .hostrow").count() == 1)
+    page.once("dialog", lambda d: d.accept())    # "Tumunu unut" onayi
+    page.click("#hostsForgetAll")
+    page.wait_for_timeout(600)
+    check(" tumunu unut: {clear} gonderilir", "clear" in sent, sent)
+    check(" liste bosalinca bos durum gorunur",
+          page.is_visible("#hostsEmpty")
+          and page.locator("#hostsList .hostrow").count() == 0)
+    page.unroute("**/api/hosts", fake_hosts)
+    page.screenshot(path=f"{OUT}/03c-profiller.png")
+    page.click("#hostsClose")
+    check(" ana makineler kapanisi kapanir",
+          not page.evaluate("document.querySelector('#hostsDlg').open"))
+    check(" odak kapanis dugmesine doner",
+          page.evaluate("document.activeElement.id") == "hostsBtn",
+          page.evaluate("document.activeElement.id"))
 
     # -------------------------------------------------- ekleme kapanisi
     page.click("#addBtn")

@@ -1,0 +1,80 @@
+name: GNOME Extension
+
+# Etiket push'unda GNOME Shell eklentisini paketler, EGO inceleme
+# kurallarini (test_gnome_extension) denetler ve zip'i GitHub surumune
+# ekler. extensions.gnome.org yuklemesi insan hesabi gerektirir; adimlar
+# gnome-shell-extension/INSTALL.md icinde anlatilir.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to pack (e.g. v1.6.0)"
+        required: true
+
+permissions:
+  contents: write          # surum varligina zip eklemek icin
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      ZIP: ferdim@proxy-turkey.github.io.shell-extension.zip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Version check
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          pkg=$(python3 -c 'import ferdim;print(ferdim.__version__)')
+          test "$ver" = "$pkg" || { echo "tag $TAG != package $pkg"; exit 1; }
+          python3 - "$ver" <<'PY'
+          import json
+          import sys
+
+          tag = sys.argv[1]
+          path = ("gnome-shell-extension/ferdim@proxy-turkey.github.io/"
+                  "metadata.json")
+          with open(path, encoding="utf-8") as fh:
+              meta = json.load(fh)
+          if meta["version-name"] != tag:
+              sys.exit(f"metadata version-name {meta['version-name']!r} "
+                       f"!= tag {tag!r}")
+          print(f"version-name: {tag}")
+          PY
+
+      # gnome-extensions pack gnome-shell paketiyle gelir.
+      - name: GNOME Shell tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnome-shell
+
+      - name: Extension checks
+        run: python3 -m unittest tests.test_gnome_extension -v
+
+      - name: Pack
+        run: bash scripts/pack_gnome_extension.sh dist
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnome-shell-extension
+          path: dist/*.shell-extension.zip
+
+      - name: Attach to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          zip="dist/$ZIP"
+          python3 -m zipfile -l "$zip"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::warning::release $TAG does not exist yet; zip kept as workflow artifact"
+            exit 0
+          fi
+          gh release upload "$TAG" "$zip" --clobber

@@ -399,6 +399,27 @@ def cmd_merkle(a, env):
     return 0
 
 
+def cmd_publish(a, env):
+    """Yayin dizini: dosya basina merkle/sha256/meta4 + tek index.meta4."""
+    from . import publish
+    try:
+        res = publish.publish(a.dir, a.base_url, a.mirror, a.glob,
+                              merkle=not a.no_merkle, force=bool(a.force))
+    except (OSError, ValueError) as e:
+        print(_("cli_error") + ":", e, file=sys.stderr)
+        return 1
+    for f in res["files"]:
+        print(f"{_('cli_file')}: {f['name']}  ({util.human_size(f['size'])})")
+        if f["merkle_path"]:
+            print(f"  {f['merkle_path']}")
+            print(f"  {_('merkle_chunks')}: {f['merkle_chunks']}  "
+                  f"{_('merkle_root')}: {f['merkle_root']}")
+        print(f"  {f['sha256_path']}")
+        print(f"  {f['meta4_path']}")
+    print(res["index"])
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ferdim",
@@ -546,6 +567,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("web", help="web arayuzunu ac")
     sp.set_defaults(fn=cmd_web)
+
+    sp = sub.add_parser("publish",
+                        help="yayin dizini: merkle/sha256/meta4 uret")
+    sp.add_argument("dir", help="yayin dizini (duz; alt dizinlere inilmez)")
+    sp.add_argument("--base-url", required=True,
+                    help="birincil indirme adresi (http/https)")
+    sp.add_argument("--mirror", action="append", default=[],
+                    help="ayna adresi (tekrarlanabilir)")
+    sp.add_argument("--glob", metavar="PATTERN",
+                    help="dosya adi deseni (orn '*.iso')")
+    sp.add_argument("--no-merkle", action="store_true",
+                    help="parca bildirimi (.ferdim-merkle) uretme")
+    sp.add_argument("--force", action="store_true",
+                    help="guncel olsa da bildirimleri yeniden uret")
+    sp.set_defaults(fn=cmd_publish)
     return p
 
 

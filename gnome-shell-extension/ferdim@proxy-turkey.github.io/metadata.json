@@ -1,8 +1,8 @@
 {
   "uuid": "ferdim@proxy-turkey.github.io",
   "name": "FerDim",
-  "description": "Speed, queue actions and the web UI for the FerDim download manager.",
+  "description": "Panel indicator for the FerDim download manager.\n\nShows the aggregate download speed and the number of active jobs, and offers Pause, Resume and Cancel for each job plus a shortcut to the FerDim web interface. Requires FerDim with its org.ferdim.Daemon1 D-Bus bridge.",
   "shell-version": ["47", "48", "49"],
   "url": "https://github.com/proxy-turkey/ferdim",
-  "version": 1
+  "version-name": "1.6.0"
 }

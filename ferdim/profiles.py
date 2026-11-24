@@ -5,6 +5,12 @@ degerleri ana makine basina bildirir; yeni isler soguk baslangic yerine
 ogrenilmis baglanti sayisindan baslar. Profil yalniz BASLANGIC noktasidir:
 governor kesif yonunu degistirmez, azami guc varsayilani korunur.
 
+Iki ayri ogrenilmis sayi vardir: `links` aralik (HTTP Range) islerinin
+baglanti sayisi, `seg_workers` HLS/DASH segment havuzunun isci sayisidir.
+Ayni ana makinede ikisi de bulunabilir; eski hosts.json kayitlari bu alan
+yokken de yuklenir (eksik alan 0 sayilir). FTP tek akis oldugu icin
+yalnizca RTT bandi ve baglanti basi hiz bildirir.
+
 Dosya durum dizininde 0600 modunda, atomik yazilir (tmp + os.replace);
 en fazla MAX_HOSTS kayit tutulur (en eski last_seen duser) ve
 MAX_AGE_DAYS gun gormeyen kayitlar atilir.
@@ -82,6 +88,7 @@ def _entry(raw) -> dict | None:
     try:
         return {
             "links": max(0, int(raw.get("links") or 0)),
+            "seg_workers": max(0, int(raw.get("seg_workers") or 0)),
             "throttled": bool(raw.get("throttled")),
             "rtt_band": str(raw.get("rtt_band") or ""),
             "per_link_bps": max(0, int(raw.get("per_link_bps") or 0)),
@@ -167,18 +174,22 @@ class HostProfiles:
         return rows
 
     # ----------------------------------------------------------------- yazim
-    def record(self, text: str, *, links: int = 0, throttled: bool = False,
-               rtt: float = 0.0, per_link_bps: float = 0.0,
-               now: float | None = None) -> bool:
-        """Bir isin olcumunu isler: links/hiz yumusak ortalamayla birlesir.
+    def record(self, text: str, *, links: int = 0, seg_workers: int = 0,
+               throttled: bool = False, rtt: float = 0.0,
+               per_link_bps: float = 0.0, now: float | None = None) -> bool:
+        """Bir isin olcumunu isler: links/seg_workers/hiz yumusak ortalamayla
+        birlesir.
 
-        Disk hatasi indirmeyi etkilemez (yalniz loglanir, False doner).
+        links ve seg_workers birbirinden bagimsizdir: bir is yalnizca kendi
+        olctugu alani bildirir (FTP ikisini de bildirmez). Disk hatasi
+        indirmeyi etkilemez (yalniz loglanir, False doner).
         """
         key = host_key(text)
         if not key:
             return False
         try:
             links = max(0, int(links or 0))
+            seg_workers = max(0, int(seg_workers or 0))
             per_link = max(0.0, float(per_link_bps or 0.0))
         except (TypeError, ValueError):
             return False
@@ -186,14 +197,18 @@ class HostProfiles:
             with self._lock:
                 stamp = float(self._now() if now is None else now)
                 data = self._load_locked(stamp)
-                e = data.get(key) or {"links": 0, "throttled": False,
-                                      "rtt_band": "", "per_link_bps": 0,
-                                      "samples": 0, "last_seen": stamp}
+                e = data.get(key) or {"links": 0, "seg_workers": 0,
+                                      "throttled": False, "rtt_band": "",
+                                      "per_link_bps": 0, "samples": 0,
+                                      "last_seen": stamp}
                 e["samples"] = int(e["samples"] or 0) + 1
                 if links > 0:
                     # yumusak ortalama: tek kotu kosu profili bozmaz
                     e["links"] = links if not e["links"] \
                         else max(1, int(round((e["links"] + links) / 2)))
+                if seg_workers > 0:
+                    e["seg_workers"] = seg_workers if not e["seg_workers"] \
+                        else max(1, int(round((e["seg_workers"] + seg_workers) / 2)))
                 if throttled:
                     e["throttled"] = True
                 band = rtt_band(rtt)

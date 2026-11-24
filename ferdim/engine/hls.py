@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -47,15 +48,20 @@ def fetch_text(url: str, opt: httpcli.DlOptions) -> str:
 
 def download_hls(url: str, opt: httpcli.DlOptions, fd: int, meta: dict,
                  stop_event: threading.Event, bucket: TokenBucket,
-                 progress_cb, state, meta_path: Path | None = None) -> None:
+                 progress_cb, state, meta_path: Path | None = None,
+                 *, store=None, cap: int = segments.SEG_MAX) -> None:
+    t0 = time.monotonic()
     text = fetch_text(url, opt)
+    rtt = time.monotonic() - t0      # segment havuzunun RTT bandi (ek istek yok)
     segs, init_url, is_master, variants = parse_playlist(text, url)
     if is_master:
         if not variants:
             raise HlsError("master listesinde varyant yok")
         best = max(variants, key=lambda v: v["bandwidth"])
         state["variant_url"] = best["url"]
+        t0 = time.monotonic()
         text = fetch_text(best["url"], opt)
+        rtt = time.monotonic() - t0  # segment listesini veren istek olculur
         segs, init_url, _, _ = parse_playlist(text, best["url"])
     if not segs:
         raise HlsError("segment bulunamadi")
@@ -65,4 +71,5 @@ def download_hls(url: str, opt: httpcli.DlOptions, fd: int, meta: dict,
     meta["kind"] = "hls"
     meta.setdefault("url", url)
     segments.assemble(opt, fd, meta, stop_event, bucket, progress_cb,
-                      meta_path, init_url, segs)
+                      meta_path, init_url, segs, store=store, cap=cap,
+                      rtt=rtt)
