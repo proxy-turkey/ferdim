@@ -474,14 +474,9 @@ S = {
         "es": "{n} con aviso de suma",
         "ru": "{n} с предупреждением о сумме"},
     # ------------------------------------------------------------ gtk 1.7
-    "hosts_title": {
-        "en": "Host profiles", "tr": "Ana makine profilleri",
-        "es": "Perfiles de servidor", "ru": "Профили серверов"},
+    # hosts_title / hosts_forget_all web seridinde zaten tanimli
     "hosts_forget": {
         "en": "Forget", "tr": "Unut", "es": "Olvidar", "ru": "Забыть"},
-    "hosts_forget_all": {
-        "en": "Forget all", "tr": "Tümünü unut",
-        "es": "Olvidar todos", "ru": "Забыть все"},
     "hosts_confirm_clear": {
         "en": "Forget every learned host profile?",
         "tr": "Öğrenilmiş tüm ana makine profilleri unutulsun mu?",
