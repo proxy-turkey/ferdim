@@ -1,0 +1,15 @@
+#!/bin/sh
+# FerDim D-Bus koprusu (org.ferdim.Daemon1; PyGObject/Gio gerekir)
+SELF="$(readlink -f "$0")"
+FERDIM_LIB=""
+for d in "$(dirname "$SELF")/../share/ferdim" \
+         "$(dirname "$SELF")/../lib/ferdim" \
+         /usr/share/ferdim /usr/lib/ferdim; do
+    if [ -f "$d/ferdim/dbusbridge.py" ]; then FERDIM_LIB="$d"; break; fi
+done
+if [ -z "$FERDIM_LIB" ]; then
+    echo "ferdim-dbus: kutuphane bulunamadi" >&2
+    exit 1
+fi
+export PYTHONPATH="$FERDIM_LIB${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m ferdim.dbusbridge

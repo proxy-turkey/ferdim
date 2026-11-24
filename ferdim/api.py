@@ -87,6 +87,12 @@ def _sanitize_config(cfg: dict, env=None) -> None:
         cfg["watch_interval"] = 3
     if cfg.get("watch_done") not in ("delete", "rename", "keep"):
         cfg["watch_done"] = "delete"
+    # masaustu bildirimleri: elle duzenlenmis "false" metni de kapali sayilir
+    for _k, _default in (("notify", True), ("notify_errors_only", False)):
+        _v = cfg.get(_k, _default)
+        if isinstance(_v, str):
+            _v = _v.strip().lower() not in ("", "0", "false", "no", "off")
+        cfg[_k] = bool(_v)
     dirs = cfg.get("watch_dirs")
     cfg["watch_dirs"] = [d for d in dirs if isinstance(d, str) and d.strip()] \
         if isinstance(dirs, list) else []

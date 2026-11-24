@@ -82,6 +82,16 @@ def main() -> int:
     except Exception as e:
         log.warning("klasor izleyici baslatilamadi: %s", e)
 
+    # masaustu bildirimleri: is bitince/hata verince (arka planda) bildir.
+    # Bildirim kapaliysa isci sessizce bekler; config-set ile acilip
+    # kapatilabilsin diye kosulsuz baslatilir.
+    notifier = None
+    try:
+        from .notify import Notifier
+        notifier = Notifier(cfg).start(qm)
+    except Exception as e:
+        log.warning("bildirim izleyici baslatilamadi: %s", e)
+
     stop = threading.Event()
 
     def _term(*_a):
@@ -102,6 +112,8 @@ def main() -> int:
             stop.wait(1.0)
     finally:
         print("Kapatiliyor...")
+        if notifier is not None:
+            notifier.stop()
         qm.shutdown()
         sock_srv.shutdown()
         if web_srv:

@@ -51,13 +51,14 @@ FerDim is a dynamic, self-tuning download manager for Linux:
 %install
 # application payload (arch-independent)
 mkdir -p %{buildroot}%{_datadir}/%{srcname}
-cp -a ferdim web %{buildroot}%{_datadir}/%{srcname}/
+cp -a ferdim web data %{buildroot}%{_datadir}/%{srcname}/
 find %{buildroot}%{_datadir}/%{srcname} -name '__pycache__' -type d -exec rm -rf {} +
 
 # executables
 install -D -m 0755 bin/ferdim     %{buildroot}%{_bindir}/ferdim
 install -D -m 0755 bin/ferdim-nm  %{buildroot}%{_bindir}/ferdim-nm
 install -D -m 0755 bin/ferdim-gui %{buildroot}%{_bindir}/ferdim-gui
+install -D -m 0755 bin/ferdim-dbus %{buildroot}%{_bindir}/ferdim-dbus
 
 # desktop entry, icon, manual page
 mkdir -p %{buildroot}%{_datadir}/applications
@@ -74,6 +75,13 @@ install -D -m 0644 docs/%{srcname}-gui.1 %{buildroot}%{_mandir}/man1/%{srcname}-
 mkdir -p %{buildroot}%{_userunitdir}
 sed 's|@BIN@|%{_bindir}/ferdim|' scripts/systemd/ferdim.service > \
   %{buildroot}%{_userunitdir}/%{srcname}.service
+
+# D-Bus: arayuz XML'i ve oturum veriyolu etkinlestirme dosyasi
+install -D -m 0644 data/org.ferdim.Daemon1.xml \
+  %{buildroot}%{_datadir}/dbus-1/interfaces/org.ferdim.Daemon1.xml
+mkdir -p %{buildroot}%{_datadir}/dbus-1/services
+sed 's|@BIN@|%{_bindir}/ferdim-dbus|' data/org.ferdim.Daemon.service > \
+  %{buildroot}%{_datadir}/dbus-1/services/org.ferdim.Daemon.service
 
 # Firefox native messaging registration (system-wide; /usr/share/mozilla is
 # a documented manifest location and keeps the package arch-independent)
@@ -101,9 +109,12 @@ python3 -m unittest discover -s tests -v
 %{_bindir}/ferdim
 %{_bindir}/ferdim-nm
 %{_bindir}/ferdim-gui
+%{_bindir}/ferdim-dbus
 %{_datadir}/%{srcname}/
 %{_datadir}/applications/%{srcname}.desktop
 %{_datadir}/icons/hicolor/scalable/apps/%{srcname}.svg
+%{_datadir}/dbus-1/interfaces/org.%{srcname}.Daemon1.xml
+%{_datadir}/dbus-1/services/org.%{srcname}.Daemon.service
 %if 0%{?suse_version}
 %dir %{_datadir}/mozilla
 %endif
