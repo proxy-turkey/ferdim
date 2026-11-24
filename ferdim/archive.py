@@ -42,6 +42,19 @@ PART = ".part"
 SPOOL = 4 * 1024 * 1024          # ic arsiv bellege sigarsa bellekte kalir
 MAX_TASKS = 8                    # son kac cikarma gorevi saklanir
 
+try:                             # Python 3.14+ zipfile zstd yontemi (93)
+    from compression.zstd import ZstdError as _ZstdError
+except ImportError:              # surumde zstd destegi yok
+    _ZstdError = None
+
+# Bozuk ya da desteklenmeyen uye icerigi (bozuk deflate, sifreli/bilinmeyen
+# sikistirma yontemi, 3.14 zstd akisi) her yerde ayni sekilde ele alinir:
+# listelemede kayit notu, cikarmada hata satiri olur.
+_READ_ERRORS = (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError,
+                zlib.error, NotImplementedError)
+if _ZstdError is not None:
+    _READ_ERRORS += (_ZstdError,)
+
 _LIST_LIMIT = object()           # describe(): varsayilan liste siniri
 
 _STEM_SUFFIXES = (".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tgz",
@@ -116,7 +129,7 @@ def _view(path, fmt: str):
     if fmt == "zip":
         try:
             return _ZipView(zipfile.ZipFile(path))
-        except (zipfile.BadZipFile, OSError) as e:
+        except _READ_ERRORS as e:
             raise ArchiveError(f"arsiv okunamadi: {e}") from e
     try:
         return _TarView(tarfile.open(path, "r:*"))
@@ -223,7 +236,7 @@ def _walk(view, prefix: str, chain: list, depth: int, out: list,
                     out, state)
         except ArchiveError as e:
             rec["note"] = str(e)[:120]
-        except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError) as e:
+        except _READ_ERRORS as e:
             rec["note"] = f"ic arsiv okunamadi: {e}"[:120]
 
 
@@ -596,8 +609,7 @@ def extract(path, members=None, dest=None, repair: bool = False,
         if progress:
             progress(done, total, result["bytes"], key)
 
-    failures = (ArchiveError, OSError, zipfile.BadZipFile, tarfile.TarError,
-                EOFError, ValueError, KeyError)
+    failures = (ArchiveError, ValueError, KeyError) + _READ_ERRORS
     if progress:
         progress(0, total, 0, "")
     top = [item for item in planned if not item[1].get("containers")]
@@ -615,8 +627,7 @@ def extract(path, members=None, dest=None, repair: bool = False,
                         store(key, entry, rel, parts, view.open(meta.name))
                     except failures as e:
                         errors.append(f"{key}: {e}")
-        except (ArchiveError, OSError, zipfile.BadZipFile, tarfile.TarError,
-                EOFError) as e:
+        except (ArchiveError,) + _READ_ERRORS as e:
             errors.append(f"arsiv okunamadi: {e}")
         for key in wanted:
             errors.append(f"{key}: arsivde yok")
