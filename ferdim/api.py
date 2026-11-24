@@ -1,6 +1,7 @@
 """Komut tasiyicilari: socket ve HTTP sunucularinin ortak API katmani."""
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -256,18 +257,31 @@ def _archive_cmd(qm, cmd: str, params: dict) -> dict:
         return {"ok": True, "filename": job.final_filename,
                 "format": info["format"], "entries": info["entries"],
                 "note": info["note"]}
-    dest = archive.default_dest(path, params.get("dest"))
+    raw_dest = str(params.get("dest") or "").strip()
+    if raw_dest and not os.path.isabs(os.path.expanduser(raw_dest)):
+        # daemon'un calisma dizini istemcininki degil: goreli yol belirsiz
+        return {"ok": False, "error": "hedef dizin mutlak olmali"}
+    dest = archive.default_dest(path, raw_dest or None)
+    force = bool(params.get("force"))
     if cmd == "archive-repair":
         if not archive.has_manifest(dest):
             return {"ok": False, "code": "no_manifest",
                     "error": "cikarma kaydi yok"}
-        snap = archive.start_extract(path, [], dest, repair=True)
+        try:
+            snap = archive.start_extract(path, [], dest, repair=True,
+                                         force=force)
+        except archive.ArchiveError as e:
+            return {"ok": False, "error": str(e)}
         return {"ok": True, "task": snap["id"], "dest": snap["dest"],
                 "state": snap["state"]}
     members = params.get("members") or []
     if not isinstance(members, list):
         return {"ok": False, "error": "gecersiz uye listesi"}
-    snap = archive.start_extract(path, [str(m) for m in members], dest)
+    try:
+        snap = archive.start_extract(path, [str(m) for m in members], dest,
+                                     force=force)
+    except archive.ArchiveError as e:
+        return {"ok": False, "error": str(e)}
     return {"ok": True, "task": snap["id"], "dest": snap["dest"],
             "state": snap["state"]}
 

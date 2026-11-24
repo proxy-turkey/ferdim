@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -295,11 +296,13 @@ def cmd_archive(a, env):
             if r.get("note"):
                 print(r["note"])
             return 0
+        dest = os.path.abspath(os.path.expanduser(a.dest)) if a.dest else ""
         if a.action == "extract":
             r = c.request("archive-extract", id=a.id, members=a.members,
-                          dest=a.dest or "")
+                          dest=dest, force=bool(a.force))
         else:
-            r = c.request("archive-repair", id=a.id, dest=a.dest or "")
+            r = c.request("archive-repair", id=a.id, dest=dest,
+                          force=bool(a.force))
         if not r.get("ok"):
             if r.get("code") == "no_manifest":
                 print(_("zip_nomf"), file=sys.stderr)
@@ -439,13 +442,17 @@ def build_parser() -> argparse.ArgumentParser:
                      ("repair", "yarim kalan cikarmayi onar")):
         one = asp.add_parser(act, help=hlp)
         one.add_argument("id", help="is kimligi")
-        one.add_argument("--dest", help="hedef dizin (varsayilan: arsiv yaninda)")
         if act == "list":
             one.add_argument("--nested", action="store_true",
                              help="ic arsivleri de listele")
-        elif act == "extract":
-            one.add_argument("members", nargs="*",
-                             help="uye yollari (bos = tumu)")
+        else:
+            one.add_argument("--dest",
+                             help="hedef dizin (mutlak; varsayilan: arsiv yaninda)")
+            one.add_argument("--force", action="store_true",
+                             help="kayitli olmayan var olan dosyalarin uzerine yaz")
+            if act == "extract":
+                one.add_argument("members", nargs="*",
+                                 help="uye yollari (bos = tumu)")
         one.set_defaults(fn=cmd_archive)
 
     sp = sub.add_parser("daemon", help="arka plan servisini on planda calistir")

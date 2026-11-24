@@ -12,8 +12,8 @@ tavan hangisiyse \(em yerel hat ya da uzak sunucu \(em onu doyurmak için
 bağlantı sayısını sürekli kalibre eder. Uyarlanabilir akış medyası (HLS ve
 DASH manifestleri) paralel parçalar hâlinde indirilir, metalink
 (\&.metalink / .meta4) belgeleri sağlama toplamlarıyla birlikte kuyruğa
-alınan yansı kümelerine açılır ve tamamlanmış ZIP arşivleri yerinde
-önizlenebilir. İndirmeler çökme güvenlidir (düzenli üst veri kontrol
+alınan yansı kümelerine açılır ve tamamlanmış ZIP ve TAR arşivleri
+yerinde listelenebilir, seçilerek çıkarılabilir ve onarılabilir. İndirmeler çökme güvenlidir (düzenli üst veri kontrol
 noktaları ve ETag/If-Range doğrulaması kullanan seyrek parça dosyaları),
 sunucu kısıtlamalarına (HTTP 429/503) sorunsuz uyum sağlar ve yeniden
 başlatmalardan sonra kaldığı yerden devam eder. Kaynaklar (asıl URL ve
@@ -134,6 +134,22 @@ başına ortalamaları (bağlantı ve hız) yazdırır. \fB\-\-redownload\fR
 \fB\-\-clear\fR her şeyi siler; \fB\-\-older\-than\fR \fIGÜN\fR ile
 yalnızca o kadar günden eski kayıtlar silinir. Bir URL'ye gömülü parola
 saklanan adreste tutulmaz; yalnızca yeniden indirme için saklanır.
+.TP
+.BI archive " list|extract|repair" " ID"
+Biten bir arşiv üzerinde çalışır: ZIP (iç içe ZIP üyeleri dahil) ve TAR,
+\&.tar.gz, .tar.xz ve .tar.bz2. \fBlist\fR kayıtları yazdırır;
+\fB\-\-nested\fR iç ZIP arşivlerinin üyelerini de listeler; bunlar
+\fIdış.zip!/iç.zip!/dosya\fR biçiminde gösterilir. \fBextract\fR verilen
+üyeleri (ad verilmezse tümünü) hedef dizine çıkarır: varsayılan, arşivin
+yanındaki arşiv adıyla aynı dizindir; \fB\-\-dest\fR mutlak bir yol alır.
+Çıkarma yol güvenlidir: \fB..\fR, mutlak yol veya dışarı çıkan bağlantı
+içeren kayıtlar reddedilir; bu araç tarafından yazılmamış var olan bir
+dosya, \fB\-\-force\fR verilmedikçe korunur. Her üye \fIdosya.part\fR
+olarak yazılıp yerine taşınır ve listeleme sınırı çıkarmayı kısıtlamaz.
+\fBrepair\fR kayıtlı \fI.ferdim-extract.json\fR defterini (boyut ve CRC32)
+doğrular ve yalnızca eksik ya da bozuk üyeleri yeniden çıkarır, böylece
+kesilen çıkarma kaldığı yerden sürer. Seçenekler: \fB\-\-nested\fR
+(list), \fB\-\-dest\fR \fIDIZIN\fR ve \fB\-\-force\fR (extract, repair).
 .TP
 .BI daemon
 RPC/HTTP arka plan servisini ön planda çalıştırır (normalde

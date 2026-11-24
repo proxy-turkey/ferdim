@@ -5,8 +5,11 @@ dizin disina hicbir sey yazmadigini dogrular; boyut/oran sinirlari
 kucultulmus sabitlerle (mock.patch) sinanir."""
 from __future__ import annotations
 
+import argparse
 import collections
+import contextlib
 import io
+import os
 import sys
 import tarfile
 import time
@@ -18,7 +21,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ferdim import api, archive, util
+from ferdim import api, archive, cli, util
 from ferdim.engine.job import JobSpec, JobState
 from ferdim.engine.queue import QueueManager
 from ferdim.paths import AppEnv
@@ -52,8 +55,21 @@ class ArchiveCase(unittest.TestCase):
     def setUp(self):
         self.root = tmp_root(self, "ferdim-arc-")
 
+    def tearDown(self):
+        with archive._TLOCK:
+            archive._TASKS.clear()
+
     def paths(self, info: dict) -> dict:
         return {e["path"]: e for e in info["entries"]}
+
+    def wait_task(self, task_id: str, timeout: float = 20) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = archive.task_status(task_id)
+            if status.get("ok") and status.get("state") != "running":
+                return status
+            time.sleep(0.02)
+        self.fail("arsiv gorevi bitmedi")
 
 
 class ListingTests(ArchiveCase):
@@ -277,16 +293,16 @@ class ExtractSafetyTests(ArchiveCase):
         """Kesilen cikarma: planlanan uyeler kayitta kalir, onarim tamamlar."""
         arc = make_zip(self.root / "outer.zip", {"a.txt": b"a", "b.txt": b"b"})
         dest = self.root / "out"
-        real = archive._member_stream
+        real = archive._write_part
         calls = {"n": 0}
 
-        def flaky(path, fmt, key):
+        def flaky(stream, part, budget):
             calls["n"] += 1
             if calls["n"] == 2:
                 raise OSError("kesildi")
-            return real(path, fmt, key)
+            return real(stream, part, budget)
 
-        with mock.patch.object(archive, "_member_stream", flaky):
+        with mock.patch.object(archive, "_write_part", flaky):
             res = archive.extract(arc, dest=dest)
         self.assertFalse(res["ok"])
         self.assertEqual(res["extracted"], 1)
@@ -298,6 +314,140 @@ class ExtractSafetyTests(ArchiveCase):
         self.assertEqual(done["skipped"], 1)
         self.assertEqual((dest / "a.txt").read_bytes(), b"a")
         self.assertEqual((dest / "b.txt").read_bytes(), b"b")
+
+    def test_19_extract_not_capped_by_listing_limit(self):
+        """Liste siniri (MAX_ENTRIES) cikarmayi kismamali."""
+        members = {f"f{i:02d}.bin": bytes([i]) * 4 for i in range(6)}
+        arc = make_zip(self.root / "many.zip", members)
+        dest = self.root / "out"
+        with mock.patch.object(archive, "MAX_ENTRIES", 2):
+            info = archive.describe(arc)
+            self.assertEqual(len(info["entries"]), 2)
+            res = archive.extract(arc, dest=dest)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["extracted"], 6)
+        self.assertEqual(len(archive.load_manifest(dest)["members"]), 6)
+        self.assertEqual(sorted(p.name for p in dest.iterdir()
+                                if p.name != archive.MANIFEST),
+                         sorted(members))
+
+    def test_20_extract_entry_cap_fails_loudly(self):
+        members = {f"f{i}.bin": b"x" for i in range(5)}
+        arc = make_zip(self.root / "many.zip", members)
+        dest = self.root / "out"
+        with mock.patch.object(archive, "MAX_EXTRACT_ENTRIES", 3):
+            res = archive.extract(arc, dest=dest)
+        self.assertFalse(res["ok"])
+        self.assertIn("sinirindan fazla", res["error"])
+        self.assertFalse(dest.exists())
+
+    def test_21_tar_extraction_opens_archive_once(self):
+        """tar.gz uye basina yeniden acilmaz: acma sayisi sabit."""
+        members = {f"f{i}.bin": b"x" * 100 for i in range(8)}
+        arc = make_tar(self.root / "cok.tar.gz", members)
+        real = tarfile.open
+        calls = {"n": 0}
+
+        def counting(*a, **kw):
+            calls["n"] += 1
+            return real(*a, **kw)
+
+        with mock.patch.object(tarfile, "open", counting):
+            res = archive.extract(arc, dest=self.root / "out")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["extracted"], 8)
+        self.assertLessEqual(calls["n"], 4, "uye basina yeniden acilmamali")
+        # uye sayisi artsa da acma sayisi artmaz
+        calls["n"] = 0
+        members2 = {f"g{i}.bin": b"y" * 50 for i in range(24)}
+        arc2 = make_tar(self.root / "cok2.tar.gz", members2)
+        with mock.patch.object(tarfile, "open", counting):
+            res = archive.extract(arc2, dest=self.root / "out2")
+        self.assertTrue(res["ok"], res)
+        self.assertLessEqual(calls["n"], 4)
+
+    def test_22_unowned_existing_files_are_not_overwritten(self):
+        arc = make_zip(self.root / "outer.zip", {"a.txt": b"arsiv",
+                                                 "b.txt": b"b"})
+        dest = self.root / "out"
+        dest.mkdir()
+        (dest / "a.txt").write_bytes(b"kullanici")
+        res = archive.extract(arc, dest=dest)
+        self.assertFalse(res["ok"])
+        self.assertEqual((dest / "a.txt").read_bytes(), b"kullanici")
+        self.assertEqual((dest / "b.txt").read_bytes(), b"b")
+        self.assertTrue(any("force" in e for e in res["errors"]), res)
+        forced = archive.extract(arc, dest=dest, force=True)
+        self.assertTrue(forced["ok"], forced)
+        self.assertEqual((dest / "a.txt").read_bytes(), b"arsiv")
+        # kendi kaydimizdaki dosyalar force olmadan da guncellenir
+        (dest / "b.txt").write_bytes(b"bozuldu")
+        again = archive.extract(arc, dest=dest)
+        self.assertTrue(again["ok"], again)
+        self.assertEqual((dest / "b.txt").read_bytes(), b"b")
+
+    def test_23_literal_bang_in_member_name_is_not_nesting(self):
+        arc = make_zip(self.root / "outer.zip", {
+            "kutu.zip": zip_bytes({"notlar.txt": b"ic"}),
+            "kutu.zip!notlar.txt": b"duz"})
+        info = self.paths(archive.describe(arc))
+        self.assertIn("outer.zip!/kutu.zip!notlar.txt", info)    # duz uye
+        self.assertIn("outer.zip!/kutu.zip!/notlar.txt", info)   # gercek ic
+        dest = self.root / "out"
+        res = archive.extract(arc, dest=dest)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual((dest / "kutu.zip!notlar.txt").read_bytes(), b"duz")
+        self.assertEqual((dest / "kutu" / "notlar.txt").read_bytes(), b"ic")
+        sel = archive.extract(arc, members=["outer.zip!/kutu.zip!notlar.txt"],
+                              dest=self.root / "sel")
+        self.assertTrue(sel["ok"], sel)
+        self.assertEqual(sel["extracted"], 1)
+        self.assertEqual((self.root / "sel" / "kutu.zip!notlar.txt")
+                         .read_bytes(), b"duz")
+
+    def test_24_repair_uses_archive_crc(self):
+        arc = make_zip(self.root / "outer.zip", {"a.txt": b"a" * 50})
+        dest = self.root / "out"
+        self.assertTrue(archive.extract(arc, dest=dest)["ok"])
+        manifest = archive.load_manifest(dest)
+        del manifest["members"]["a.txt"]["crc"]      # eski surum kaydi
+        archive._save_manifest(dest, manifest)
+        (dest / "a.txt").write_bytes(b"z" * 50)      # ayni boyut, bozuk
+        res = archive.extract(arc, dest=dest, repair=True)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["extracted"], 1)
+        self.assertEqual((dest / "a.txt").read_bytes(), b"a" * 50)
+        self.assertEqual(archive.load_manifest(dest)["members"]["a.txt"]["crc"],
+                         zlib.crc32(b"a" * 50))
+        # kayittaki CRC bayat ama dosya saglamsa: yazmadan CRC tazelenir
+        manifest = archive.load_manifest(dest)
+        manifest["members"]["a.txt"]["crc"] = 12345
+        archive._save_manifest(dest, manifest)
+        again = archive.extract(arc, dest=dest, repair=True)
+        self.assertTrue(again["ok"], again)
+        self.assertEqual(again["extracted"], 0)
+        self.assertEqual(archive.load_manifest(dest)["members"]["a.txt"]["crc"],
+                         zlib.crc32(b"a" * 50))
+
+    def test_25_running_task_is_not_pruned(self):
+        arc = make_zip(self.root / "a.zip", {"a.txt": b"a"})
+        with mock.patch.object(archive, "MAX_TASKS", 1):
+            with archive._TLOCK:
+                archive._TASKS.clear()
+                archive._TASKS["calisan"] = {"id": "calisan",
+                                             "state": "running", "started": 0}
+            with self.assertRaises(archive.ArchiveError):
+                archive.start_extract(arc, [], self.root / "x")
+            self.assertIn("calisan", archive._TASKS)
+            with archive._TLOCK:
+                archive._TASKS["calisan"]["state"] = "done"
+                archive._TASKS["calisan"]["started"] = 1
+            snap = archive.start_extract(arc, [], self.root / "x")
+            self.assertTrue(snap["ok"], snap)
+            self.assertNotIn("calisan", archive._TASKS)
+            status = self.wait_task(snap["id"])
+            self.assertEqual(status["state"], "done")
+            self.assertIn(snap["id"], archive._TASKS)
 
 
 class ApiArchiveTests(ArchiveCase):
@@ -311,6 +461,7 @@ class ApiArchiveTests(ArchiveCase):
 
     def tearDown(self):
         self.qm.shutdown()
+        super().tearDown()
 
     def _job(self, name: str, data: bytes):
         job = self.qm.add(JobSpec(url="http://127.0.0.1:1/" + name,
@@ -407,6 +558,81 @@ class ApiArchiveTests(ArchiveCase):
                                     {"task": "yok"})["ok"])
         self.assertFalse(api.handle(self.ctx, "archive-extract", {
             "id": job.id, "members": "bozuk"})["ok"])
+
+    def test_25_api_rejects_relative_dest(self):
+        job, _ = self._job("outer.zip", zip_bytes({"a.txt": b"a"}))
+        for cmd in ("archive-extract", "archive-repair"):
+            res = api.handle(self.ctx, cmd,
+                             {"id": job.id, "dest": "goreli/dizin"})
+            self.assertFalse(res["ok"], res)
+            self.assertIn("mutlak", res["error"])
+
+    def test_26_api_force_passthrough(self):
+        job, _ = self._job("outer.zip", zip_bytes({"a.txt": b"arsiv"}))
+        dest = self.root / "api-force"
+        dest.mkdir()
+        (dest / "a.txt").write_bytes(b"kullanici")
+        blocked = api.handle(self.ctx, "archive-extract", {
+            "id": job.id, "members": [], "dest": str(dest)})
+        self.assertTrue(blocked["ok"], blocked)
+        done = self._wait(blocked["task"])
+        self.assertEqual(done["state"], "error", done)
+        self.assertEqual((dest / "a.txt").read_bytes(), b"kullanici")
+        forced = api.handle(self.ctx, "archive-extract", {
+            "id": job.id, "members": [], "dest": str(dest), "force": True})
+        self.assertTrue(forced["ok"], forced)
+        done = self._wait(forced["task"])
+        self.assertEqual(done["state"], "done", done)
+        self.assertEqual((dest / "a.txt").read_bytes(), b"arsiv")
+
+
+class CliArchiveTests(unittest.TestCase):
+    """CLI goreli --dest gonderirse daemon'un CWD'sine bagli kalirdi."""
+
+    class _Fake:
+        def __init__(self):
+            self.sent = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def request(self, cmd, **params):
+            self.sent.append((cmd, params))
+            if cmd == "archive-extract":
+                return {"ok": True, "task": "t1", "dest": "/x",
+                        "state": "running"}
+            return {"ok": True, "state": "done",
+                    "result": {"ok": True, "extracted": 1, "dest": "/x",
+                               "errors": [], "repair": False}}
+
+    def test_27_cli_sends_absolute_dest(self):
+        fake = self._Fake()
+        args = argparse.Namespace(action="extract", id="j1", members=[],
+                                  dest="goreli/alt", force=True)
+        with mock.patch.object(cli, "_client",
+                               lambda env, spawn=True: fake), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = cli.cmd_archive(args, None)
+        self.assertEqual(rc, 0)
+        cmd, params = fake.sent[0]
+        self.assertEqual(cmd, "archive-extract")
+        self.assertEqual(params["dest"], os.path.abspath("goreli/alt"))
+        self.assertTrue(params["force"])
+
+    def test_28_cli_repair_absolutises_dest(self):
+        fake = self._Fake()
+        args = argparse.Namespace(action="repair", id="j1", dest="alt",
+                                  force=False)
+        with mock.patch.object(cli, "_client",
+                               lambda env, spawn=True: fake), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = cli.cmd_archive(args, None)
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake.sent[0][1]["dest"], os.path.abspath("alt"))
+        self.assertFalse(fake.sent[0][1]["force"])
 
 
 if __name__ == "__main__":

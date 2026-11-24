@@ -30,6 +30,7 @@ from pathlib import Path
 
 MAX_DEPTH = 3                    # ust arsiv + en fazla iki ic arsiv
 MAX_ENTRIES = 2000               # listelemede toplam kayit siniri
+MAX_EXTRACT_ENTRIES = 200_000    # cikarma guvenlik siniri (liste siniri degil)
 MAX_INNER = 256 * 1024 ** 2      # ic arsiv okuma boyutu (bomba korumasi)
 MAX_TOTAL = 8 * 1024 ** 3        # tek cikarmada toplam bayt siniri
 RATIO_MAX = 1000.0               # supheli sikistirma orani
@@ -40,6 +41,8 @@ MANIFEST = ".ferdim-extract.json"
 PART = ".part"
 SPOOL = 4 * 1024 * 1024          # ic arsiv bellege sigarsa bellekte kalir
 MAX_TASKS = 8                    # son kac cikarma gorevi saklanir
+
+_LIST_LIMIT = object()           # describe(): varsayilan liste siniri
 
 _STEM_SUFFIXES = (".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tgz",
                   ".tbz2", ".txz", ".zip", ".tar")
@@ -185,17 +188,25 @@ def _expand(view, meta: _Meta, prefix: str, chain: list, depth: int,
 
 def _walk(view, prefix: str, chain: list, depth: int, out: list,
           state: dict) -> None:
-    """chain: ic ice kapsayici adlari (kanonik anahtar icin)."""
+    """chain: ic ice kapsayici uye adlari (hedef dizin hesabi icin).
+
+    'key' kanonik uye yoludur: ust duzeyde uye adi ("a.txt"), ic ice uyede
+    kapsayici yolu ("inner.zip!/a.txt"). Ayirici "!/" oldugu icin uye
+    adindaki '!' karakteri ic ice sayilmaz; kapsayicilar sadece listede
+    gercekten arsiv uyesi olan (chain) adlardir."""
+    suffix_prefix = ("" if prefix == state["archive"] else
+                     _strip_archive(prefix, state["archive"]))
     for meta in view.entries():
-        if len(out) >= state["limit"]:
+        if state["limit"] is not None and len(out) >= state["limit"]:
             state["more"] += 1
             continue
         bomb = _ratio(meta) > RATIO_MAX and meta.size > RATIO_MIN_SIZE
-        rec = {"path": f"{prefix}!/{meta.name}", "name": meta.name,
-               "key": "!".join(chain + [meta.name]), "size": meta.size,
-               "compressed": meta.compressed, "crc": meta.crc,
-               "depth": depth, "kind": "link" if meta.link else "file",
-               "bomb": bomb}
+        key = f"{suffix_prefix}!/{meta.name}" if suffix_prefix else meta.name
+        rec = {"path": f"{prefix}!/{meta.name}", "key": key,
+               "name": meta.name, "containers": list(chain),
+               "size": meta.size, "compressed": meta.compressed,
+               "crc": meta.crc, "depth": depth,
+               "kind": "link" if meta.link else "file", "bomb": bomb}
         out.append(rec)
         if not state["nested"] or not meta.iszip or meta.link:
             continue
@@ -216,26 +227,28 @@ def _walk(view, prefix: str, chain: list, depth: int, out: list,
             rec["note"] = f"ic arsiv okunamadi: {e}"[:120]
 
 
-def describe(path, nested: bool = True, limit: int | None = None) -> dict:
+def describe(path, nested: bool = True, limit=_LIST_LIMIT) -> dict:
     """Arsiv icerigini listeler.
 
-    Donen: {'archive', 'format', 'entries': [...], 'note', 'total'}.
-    Kayit yolu ust arsiv adiyla baslar: 'outer.zip!/a.txt'; ic ice uyelerde
-    'outer.zip!/inner.zip!/b.txt' (derinlik siniri MAX_DEPTH)."""
+    Donen: {'archive', 'format', 'entries': [...], 'note', 'total',
+    'truncated'}. Kayit yolu ust arsiv adiyla baslar: 'outer.zip!/a.txt';
+    ic ice uyelerde 'outer.zip!/inner.zip!/b.txt' (derinlik siniri
+    MAX_DEPTH). 'limit' verilmezse liste siniri MAX_ENTRIES'tir; cikarma
+    kendi sinirini (MAX_EXTRACT_ENTRIES) gecer."""
     path = Path(path)
     if not path.is_file():
         raise ArchiveError("arsiv yok")
     fmt = _detect(path)
     if not fmt:
         raise ArchiveError("desteklenmeyen arsiv bicimi (7z/rar desteklenmez)")
-    state = {"nested": bool(nested), "more": 0,
-             "limit": int(limit if limit is not None else MAX_ENTRIES)}
+    state = {"nested": bool(nested), "more": 0, "archive": path.name,
+             "limit": MAX_ENTRIES if limit is _LIST_LIMIT else limit}
     entries: list = []
     with _view(path, fmt) as view:
         _walk(view, path.name, [], 1, entries, state)
     note = f"+{state['more']}…" if state["more"] else ""
     return {"archive": path.name, "format": fmt, "entries": entries,
-            "note": note, "total": len(entries)}
+            "note": note, "total": len(entries), "truncated": state["more"]}
 
 
 # -------------------------------------------------------- yollar ve kayit
@@ -282,31 +295,40 @@ def _target(dest: Path, parts: list) -> Path:
     return cur / parts[-1]
 
 
-def _norm_member(member, archive: str) -> str:
-    """Listeleme yolunu ('outer.zip!/inner.zip!/a') kanonik anahtara cevirir
-    ('inner.zip!a'); dogrudan uye adi da kabul edilir."""
-    text = str(member).strip()
+def _strip_archive(text: str, archive: str) -> str:
     for prefix in (archive + "!/", archive + "!"):
         if text.startswith(prefix):
-            text = text[len(prefix):]
-            break
-    return "!".join(seg[1:] if seg.startswith("/") else seg
-                    for seg in text.split("!"))
+            return text[len(prefix):]
+    return text
 
 
-def _rel_parts(key: str) -> list:
-    """'inner.zip!/docs/a.txt' -> ['inner', 'docs', 'a.txt'] (arsiv adi
-    uzantisi dizin adindan duser); mutlak bilesen reddedilir."""
-    segs = [s for s in key.replace("\\", "/").split("!") if s]
-    if not segs or any(s.startswith("/") for s in segs):
-        raise ArchiveError("guvensiz yol: " + key)
+def _rel_parts(entry: dict) -> list:
+    """Uyenin hedef yol bilesenleri: kapsayici adlari dizin olur ('.zip'
+    uzantisi duser), son bilesen uye adidir. Uye/kapsayici adi mutlak ya
+    da '..' iceriyorsa reddedilir."""
+    containers = list(entry.get("containers") or [])
+    name = str(entry.get("name") or "")
+    for part in containers + [name]:
+        _safe_parts(part)          # kacis denemesi burada reddedilir
     dirs = []
-    for seg in segs[:-1]:
-        base = seg.rstrip("/").rsplit("/", 1)[-1]
+    for container in containers:
+        base = container.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
         if base.lower().endswith(".zip"):
             base = base[:-4]
         dirs.append(base or "arsiv")
-    return _safe_parts("/".join(dirs + [segs[-1]]))
+    return _safe_parts("/".join(dirs + [name]))
+
+
+def _member_index(entries: list, archive: str) -> dict:
+    """Kullanici girdisi -> kayit. Hem kanonik anahtar ('inner.zip!/a')
+    hem tam listeleme yolu ('outer.zip!/inner.zip!/a') eslesir; uye
+    adindaki '!' bu yuzden yanlislikla ic ice sayilmaz."""
+    index = {}
+    for entry in entries:
+        index[entry["key"]] = entry
+        index[entry["path"]] = entry
+        index[_strip_archive(entry["path"], archive)] = entry
+    return index
 
 
 def load_manifest(dest) -> dict:
@@ -338,16 +360,19 @@ def _file_crc(path: Path) -> int:
     return crc & 0xffffffff
 
 
-def _intact(dest: Path, rec: dict) -> bool:
-    """Kayittaki uye yerinde ve saglam mi? (boyut + varsa CRC32)."""
+def _intact(dest: Path, rec: dict, entry: dict) -> bool:
+    """Yerinde ve saglam mi? Once arsivin bildirdigi boyut/CRC (zip), yoksa
+    cikarma sirasinda hesaplanan CRC (tar) kullanilir."""
     try:
         target = _target(dest, _safe_parts(str(rec.get("target") or "")))
         size = target.stat().st_size
     except (ArchiveError, OSError):
         return False
-    if size != int(rec.get("size", -1)):
+    if size != int(entry.get("size", -1)):
         return False
-    crc = rec.get("crc")
+    crc = entry.get("crc")
+    if crc is None:
+        crc = rec.get("crc")
     if crc is None:
         return True
     try:
@@ -357,9 +382,10 @@ def _intact(dest: Path, rec: dict) -> bool:
 
 
 @contextlib.contextmanager
-def _member_stream(path: Path, fmt: str, key: str):
-    """Uyeyi akis olarak acar; ic ice zincir gecici akislara cozulur."""
-    segs = key.split("!")
+def _member_stream(path: Path, fmt: str, entry: dict):
+    """Ic ice uyeyi akis olarak acar; kapsayicilar gecici akisa cozulur.
+    Kapsayici adlari kayittan gelir ('!' ayristirilmaz)."""
+    segs = list(entry.get("containers") or []) + [str(entry.get("name") or "")]
     views, spools = [], []
     try:
         view = _view(path, fmt)
@@ -401,60 +427,91 @@ def _fail(msg: str, dest=None, code: str = "") -> dict:
 def _selection(entries: list, archive: str, members, repair: bool,
                manifest: dict, dest: Path) -> tuple:
     """(secilecekler, atlanan, hatalar) - onarimda yalniz bozuk uyeler."""
-    by_key = {e["key"]: e for e in entries}
+    index = _member_index(entries, archive)
     errors: list = []
     selected: list = []
     skipped = 0
     if repair:
         for key, rec in manifest["members"].items():
-            entry = by_key.get(key)
+            entry = index.get(key)
             if not entry:
                 errors.append(f"{key}: arsivde yok")
                 continue
-            if _intact(dest, rec):
+            if _intact(dest, rec, entry):
                 skipped += 1
                 continue
-            selected.append((key, entry))
+            selected.append((entry["key"], entry))
         return selected, skipped, errors
     if members:
         seen = set()
         for member in members:
-            key = _norm_member(member, archive)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            entry = by_key.get(key)
-            if not entry:
+            entry = index.get(str(member).strip())
+            if entry is None:
                 errors.append(f"{member}: arsivde yok")
-            elif entry["kind"] != "file":
+                continue
+            if entry["key"] in seen:
+                continue
+            seen.add(entry["key"])
+            if entry["kind"] != "file":
                 skipped += 1
             else:
-                selected.append((key, entry))
+                selected.append((entry["key"], entry))
         return selected, skipped, errors
-    for key, entry in by_key.items():
+    for entry in entries:
         if entry["kind"] != "file":
             skipped += 1
             continue
-        selected.append((key, entry))
+        selected.append((entry["key"], entry))
     return selected, skipped, errors
 
 
+def _write_part(stream, part: Path, budget: int) -> tuple:
+    """Akisi 'part' dosyasina yazar; (boyut, crc32) dondurur. Butce asilirsa
+    yarim dosya silinir."""
+    crc = size = 0
+    try:
+        with stream as src, open(part, "wb") as out:
+            while True:
+                chunk = src.read(CHUNK)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > budget:
+                    raise ArchiveError("cikarma boyut siniri asildi")
+                crc = zlib.crc32(chunk, crc)
+                out.write(chunk)
+    except BaseException:
+        try:
+            part.unlink()
+        except OSError:
+            pass
+        raise
+    return size, crc & 0xffffffff
+
+
 def extract(path, members=None, dest=None, repair: bool = False,
-            progress=None) -> dict:
+            force: bool = False, progress=None) -> dict:
     """Secilen uyeleri (bos = tumu) hedef dizine cikarir.
 
-    Her uye 'ad.part' dosyasina yazilip os.replace ile yerine konur; basarili
-    her uyeden sonra .ferdim-extract.json guncellenir, boylece kesilen bir
-    cikarma 'repair' ile kaldigi yerden onarilabilir."""
+    Liste siniri cikarmayi kismaz: kayit sayisi MAX_EXTRACT_ENTRIES'i asarsa
+    islem bastan ve acik bir hatayla reddedilir. Ust duzey uyeler arsiv BIR
+    kez acilip arsiv sirasinda okunur (tar.gz'de uye basina yeniden acma
+    yok); yalniz ic ice ('!/') uyeler icin kapsayici zinciri cozulur. Her
+    uye 'ad.part' dosyasina yazilip os.replace ile yerine konur; basarili
+    uyeden sonra .ferdim-extract.json guncellenir. Kayitli olmayan var olan
+    dosyalar 'force' verilmedikce ezilmez."""
     path = Path(path)
     if not path.is_file():
         return _fail("arsiv yok")
     try:
-        info = describe(path, nested=True)
+        info = describe(path, nested=True, limit=MAX_EXTRACT_ENTRIES)
     except ArchiveError as e:
         return _fail(str(e))
     entries = info["entries"]
     target = default_dest(path, dest)
+    if info["truncated"]:
+        return _fail(f"arsivde {MAX_EXTRACT_ENTRIES} sinirindan fazla kayit "
+                     f"var; cikarma yapilmadi", target)
     if repair:
         manifest = load_manifest(target)
         if not manifest:
@@ -462,17 +519,26 @@ def extract(path, members=None, dest=None, repair: bool = False,
     else:
         manifest = {"version": 1, "archive": path.name,
                     "created": time.time(), "members": {}}
+    prev = manifest if repair else load_manifest(target)
+    owned = {str(rec.get("target") or "")
+             for rec in (prev.get("members") or {}).values()}
     selected, skipped, errors = _selection(entries, path.name, members,
                                           repair, manifest, target)
     planned: list = []
     plan = 0
     for key, entry in selected:
         try:
-            rel = "/".join(_rel_parts(key))
+            parts = _rel_parts(entry)
+            rel = "/".join(parts)
+            tgt = _target(target, parts)
         except ArchiveError as e:
             errors.append(f"{key}: {e}")
             continue
-        planned.append((key, entry, rel))
+        if not force and tgt.exists() and rel not in owned:
+            errors.append(f"{key}: hedefte dosya var (--force ile uzerine "
+                          f"yazilir)")
+            continue
+        planned.append((key, entry, rel, parts))
         plan += max(0, int(entry["size"]))
     if plan > MAX_TOTAL:
         return _fail(f"cikarma boyut siniri asildi ({plan} bayt)", target)
@@ -492,52 +558,76 @@ def extract(path, members=None, dest=None, repair: bool = False,
         manifest["members"] = {
             key: {"size": int(entry["size"]), "crc": entry.get("crc"),
                   "target": rel, "at": 0}
-            for key, entry, rel in planned}
+            for key, entry, rel, _ in planned}
         _save_manifest(target, manifest)
+    else:
+        # onarim arsivin bildirdigi CRC'yi esas alir; kayittaki eski/bos
+        # deger tazelenir ki sonraki onarimlar dogru olcutu kullansin
+        by_key = {e["key"]: e for e in entries}
+        dirty = False
+        for key, rec in manifest["members"].items():
+            entry = by_key.get(key)
+            crc = entry.get("crc") if entry else None
+            if crc is not None and rec.get("crc") != crc:
+                rec["crc"] = crc
+                dirty = True
+        if dirty:
+            _save_manifest(target, manifest)
 
     result = {"ok": True, "dest": str(target), "extracted": 0,
               "skipped": skipped, "errors": errors, "bytes": 0,
               "repair": bool(repair)}
     total = len(planned)
+    done = 0
+
+    def store(key, entry, rel, parts, stream):
+        nonlocal done
+        tgt = _target(target, parts)
+        tgt.parent.mkdir(parents=True, exist_ok=True)
+        part = tgt.with_name(tgt.name + PART)
+        size, crc = _write_part(stream, part, MAX_TOTAL - result["bytes"])
+        os.replace(part, tgt)
+        result["bytes"] += size
+        result["extracted"] += 1
+        manifest["members"][key] = {"size": size, "crc": crc,
+                                    "target": rel, "at": time.time()}
+        _save_manifest(target, manifest)
+        done += 1
+        if progress:
+            progress(done, total, result["bytes"], key)
+
+    failures = (ArchiveError, OSError, zipfile.BadZipFile, tarfile.TarError,
+                EOFError, ValueError, KeyError)
     if progress:
         progress(0, total, 0, "")
-    for i, (key, entry, rel) in enumerate(planned, 1):
+    top = [item for item in planned if not item[1].get("containers")]
+    if top:
+        wanted = {item[0]: item for item in top}
         try:
-            parts = _rel_parts(key)
-            tgt = _target(target, parts)
-            tgt.parent.mkdir(parents=True, exist_ok=True)
-            part = tgt.with_name(tgt.name + PART)
-            crc, size = 0, 0
-            try:
-                with _member_stream(path, info["format"], key) as src, \
-                        open(part, "wb") as out:
-                    while True:
-                        chunk = src.read(CHUNK)
-                        if not chunk:
-                            break
-                        size += len(chunk)
-                        if result["bytes"] + size > MAX_TOTAL:
-                            raise ArchiveError("cikarma boyut siniri asildi")
-                        crc = zlib.crc32(chunk, crc)
-                        out.write(chunk)
-                os.replace(part, tgt)
-            except BaseException:
-                try:
-                    part.unlink()
-                except OSError:
-                    pass
-                raise
-            result["bytes"] += size
-            result["extracted"] += 1
-            manifest["members"][key] = {"size": size,
-                                        "crc": crc & 0xffffffff,
-                                        "target": rel, "at": time.time()}
-            _save_manifest(target, manifest)
+            # tar.gz: uye basina yeniden acma yerine tek gecis
+            with _view(path, info["format"]) as view:
+                for meta in view.entries():
+                    item = wanted.pop(meta.name, None)
+                    if item is None:
+                        continue
+                    key, entry, rel, parts = item
+                    try:
+                        store(key, entry, rel, parts, view.open(meta.name))
+                    except failures as e:
+                        errors.append(f"{key}: {e}")
         except (ArchiveError, OSError, zipfile.BadZipFile, tarfile.TarError,
-                EOFError, ValueError) as e:
+                EOFError) as e:
+            errors.append(f"arsiv okunamadi: {e}")
+        for key in wanted:
+            errors.append(f"{key}: arsivde yok")
+    for key, entry, rel, parts in planned:
+        if not entry.get("containers"):
+            continue
+        try:
+            store(key, entry, rel, parts,
+                  _member_stream(path, info["format"], entry))
+        except failures as e:
             errors.append(f"{key}: {e}")
-        if progress:
-            progress(i, total, result["bytes"], key)
     if errors:
         result["ok"] = False
     return result
@@ -549,12 +639,19 @@ _TLOCK = threading.Lock()
 _SEQ = itertools.count(1)
 
 
-def _prune_locked() -> None:
-    if len(_TASKS) < MAX_TASKS:
-        return
-    for key in sorted(_TASKS, key=lambda k: _TASKS[k].get("started", 0)
-                      )[:len(_TASKS) - MAX_TASKS + 1]:
+def _prune_locked() -> bool:
+    """Yalniz bitmis gorevleri atar; hepsi calisiyorsa False (yeni gorev
+    reddedilir, calisan gorevin kimligi kaybolmaz)."""
+    need = len(_TASKS) - MAX_TASKS + 1
+    if need <= 0:
+        return True
+    finished = [k for k, t in _TASKS.items() if t.get("state") != "running"]
+    if len(finished) < need:
+        return False
+    for key in sorted(finished, key=lambda k: _TASKS[k].get("started", 0)
+                      )[:need]:
         _TASKS.pop(key, None)
+    return True
 
 
 def task_status(task_id: str) -> dict:
@@ -567,7 +664,8 @@ def task_status(task_id: str) -> dict:
             "dest", "error", "result")}}
 
 
-def _run_task(task_id: str, path, members, target, repair: bool) -> None:
+def _run_task(task_id: str, path, members, target, repair: bool,
+              force: bool) -> None:
     def progress(done, total, nbytes, current):
         with _TLOCK:
             task = _TASKS.get(task_id)
@@ -577,7 +675,7 @@ def _run_task(task_id: str, path, members, target, repair: bool) -> None:
 
     try:
         result = extract(path, members=members, dest=target, repair=repair,
-                         progress=progress)
+                         force=force, progress=progress)
     except Exception as e:      # motor hatasi gorevi kilitler
         result = _fail(str(e), target)
     with _TLOCK:
@@ -589,12 +687,16 @@ def _run_task(task_id: str, path, members, target, repair: bool) -> None:
                 result.get("error") or (result.get("errors") or [""])[0])
 
 
-def start_extract(path, members=None, dest=None, repair: bool = False) -> dict:
-    """Cikarmayi arka planda baslatir; gorev ozeti dondurur.
-    Ilerleme task_status() ile izlenir (web/CLI ayni sozlesmeyi kullanir)."""
+def start_extract(path, members=None, dest=None, repair: bool = False,
+                  force: bool = False) -> dict:
+    """Cikarmayi arka planda baslatir; gorev ozeti dondurur. Ilerleme
+    task_status() ile izlenir (web/CLI ayni sozlesmeyi kullanir). Calisan
+    gorev sayisi MAX_TASKS'a ulastiysa ArchiveError yukseltir."""
     target = default_dest(path, dest)
     with _TLOCK:
-        _prune_locked()
+        if not _prune_locked():
+            raise ArchiveError("cok fazla arsiv gorevi calisiyor; "
+                               "bitmesini bekleyin")
         task_id = f"a{next(_SEQ)}"
         task = {"id": task_id, "kind": "repair" if repair else "extract",
                 "state": "running", "done": 0, "total": 0, "bytes": 0,
@@ -602,7 +704,8 @@ def start_extract(path, members=None, dest=None, repair: bool = False) -> dict:
                 "result": None, "started": time.time()}
         _TASKS[task_id] = task
     thread = threading.Thread(target=_run_task,
-                              args=(task_id, path, members, target, repair),
+                              args=(task_id, path, members, target, repair,
+                                    force),
                               name=f"ferdim-arsiv-{task_id}", daemon=True)
     thread.start()
     return task_status(task_id)

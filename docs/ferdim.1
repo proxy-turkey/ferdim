@@ -11,7 +11,8 @@ calibrates the connection count to saturate either the local line or the
 remote server, whichever ceiling is reachable. Adaptive streaming media
 (HLS and DASH manifests) is fetched as parallel segments, metalink
 (.metalink / .meta4) documents expand into queued mirror sets with
-checksums, and finished ZIP archives can be previewed in place.
+checksums, and finished ZIP and TAR archives can be listed, selectively
+extracted and repaired in place.
 Downloads are crash-safe
 (sparse part files with periodic metadata checkpoints and ETag/If-Range
 validation), adapt gracefully to server throttling (HTTP 429/503), and
@@ -126,6 +127,23 @@ speed). \fB\-\-redownload\fR \fIID\fR queues the saved URL and options
 again. \fB\-\-clear\fR removes everything, or with \fB\-\-older\-than\fR
 \fIDAYS\fR only records older than that. A password embedded in a URL is
 kept out of the stored address; it is retained only for re-download.
+.TP
+.BI archive " list|extract|repair" " ID"
+Work on a finished archive: ZIP (nested inner ZIP members included) and
+TAR, .tar.gz, .tar.xz and .tar.bz2. \fBlist\fR prints the entries;
+\fB\-\-nested\fR also lists the members of inner ZIP archives, shown as
+\fIouter.zip!/inner.zip!/file\fR. \fBextract\fR writes the given members
+(all when none are named) into the target directory: by default a
+directory named after the archive, next to it; \fB\-\-dest\fR takes an
+absolute path. Extraction is path-safe: entries with \fB..\fR, absolute
+paths or escaping links are refused, and an existing file that this tool
+did not write is kept unless \fB\-\-force\fR is given. Each member is
+written to \fIname.part\fR and renamed into place, and the listing cap
+does not limit extraction. \fBrepair\fR verifies the recorded
+\fI.ferdim-extract.json\fR manifest (size and CRC32) and re-extracts only
+missing or damaged members, so an interrupted extraction resumes where it
+stopped. Options: \fB\-\-nested\fR (list), \fB\-\-dest\fR \fIDIR\fR and
+\fB\-\-force\fR (extract, repair).
 .TP
 .BI daemon
 Run the RPC/HTTP daemon in the foreground (normally started via the
