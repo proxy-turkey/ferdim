@@ -50,6 +50,15 @@ checks, mock builds cleanly on Fedora 43.
 | `ferdim/engine/queue.py` | QueueManager: concurrency, night scheduler + per-category windows, smart queue (background size prober, smallest-first), persistence (mirrors, checksums and per-job limits survive restarts) |
 | `ferdim/engine/socks.py` | SOCKS5 tunnel client (RFC 1928 / RFC 1929), pure stdlib: `socks5://` resolves locally, `socks5h://` at the proxy |
 | `ferdim/engine/httpcli.py` | Probe/download primitives (per-read timeout ⇒ stall detection), `fetch_small` for sidecars, headers, auth, proxy, cookies |
+| `ferdim/profiles.py` | Learned per-host connection profiles (`hosts.json`): seed for new jobs, report on done/pause |
+| `ferdim/coexist.py` | Opt-in coexistence: `/proc/net/dev` line monitor minus own traffic, hysteresis → queue sets `set_external_cap` |
+| `ferdim/engine/h3.py` | Optional HTTP/3 via lazily imported `aioquic`; Alt-Svc cache, broken-origin backoff, blocking `Response` adapter |
+| `ferdim/cdc.py` | FastCDC chunker, Merkle root, `.ferdim-merkle` manifests, `merkle update` |
+| `ferdim/archive.py` | Nested ZIP / tar listing, selective extraction, `.ferdim-extract.json` repair |
+| `ferdim/notify.py`, `ferdim/dbusbridge.py` | Desktop notifications (gdbus/notify-send argv, coalesced); optional Gio session-bus bridge `org.ferdim.Daemon1` |
+| `gnome-shell-extension/` | GNOME Shell 47–49 panel extension (talks to `ferdim-dbus`) |
+| `extension/sniff.js` | Pure, testable response-header media classifier used by `background.js` |
+| `packaging/aur/PKGBUILD` | Arch package; `.github/workflows/aur.yml` publishes it on tag |
 | `ferdim/metalink.py` | `.metalink` / `.meta4` (RFC 5854) parsing |
 | `ferdim/api.py` | Command handlers shared by socket and HTTP: token-auth API, metalink expansion (remote + local `add-file`), config sanitising (`_sanitize_config`), turbo/limit consistency, ZIP preview |
 | `ferdim/watch.py` | Watched folders: `.metalink`/`.meta4` and URL-list files are queued, then deleted / renamed `.done` / kept |
@@ -167,6 +176,20 @@ Read `job.py` before touching the engine. The invariants that matter:
   FTP opens control + passive data connections through `_SocksFTP`
   (active mode is impossible over CONNECT). Proxy `auth` / `forbidden`
   codes are terminal — never burn retries on them.
+- **Ceilings compose.** `_ceiling_locked()` = min(segment max, external
+  cap). Coexistence sets the external cap; the profile seed, resume-restored
+  links and every governor up-probe are clamped to it under the job lock.
+  With `coexist` off the cap is `None` and nothing changes.
+- **Merkle repair before DONE.** `_finish()` may return "repair queued":
+  `_merkle_repair()` puts only the bad chunk ranges back into `_pending`
+  and restarts workers via `_start_workers` (never a second monitor), at
+  most `MERKLE_REPAIR_MAX` (2) times, then `merkle_mismatch`.
+- **HTTP/3 is off by default** and `aioquic` must never be imported at core
+  import time (a test checks `sys.modules`). `auto` falls back to TCP;
+  `force` does not; proxies disable h3.
+- Archive extraction writes `member.part` then `os.replace` and records the
+  member in `.ferdim-extract.json`; link and device members are never
+  created; files FerDim did not write are not overwritten without `force`.
 
 ## Commands
 
@@ -198,7 +221,8 @@ background task; it will fail on the password prompt.
    `packaging/ferdim.spec` (`Version:` + `%changelog` entry),
    `docs/ferdim.1` / `ferdim-nm.1` / `ferdim-gui.1` and their Turkish
    twins in `docs/tr/` (`.TH` string; `tests/test_manpages.py` checks),
-   `extension/manifest.json`, `CHANGELOG.md`.
+   `extension/manifest.json`, `pyproject.toml`, `packaging/aur/PKGBUILD`
+   (`pkgver`), `CHANGELOG.md`.
 2. Gates: tests green, web-ext lint 0/0, `bash tests/ui/run.sh all`
    green, `bash tests/cli_smoke.sh` green against the installed build,
    rpmlint 0/0, mock build OK (its `%check` re-runs the suite),

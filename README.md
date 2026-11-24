@@ -50,11 +50,18 @@ front-ends: CLI, web UI, and GTK 4.
 | **Smart queue** | A background prober learns the size of queued files and runs smallest-first, so a 2 MB PDF never waits behind a 4 GB ISO. |
 | **Live telemetry** | The web UI plots aggregate throughput and the open-connection count over the last two minutes, plus a per-job speed sparkline — plain canvas, no chart library, client-side ring buffers. |
 | **Queue history** | Finished jobs (done, error, canceled) are stored in a SQLite database in the state directory (`history.db`, mode 0600, WAL). Search by file, URL or host, filter by state, re-download with the saved URL and options, and read totals plus per-host averages (links, speed). Retention is `history_days` (default 365, `0` keeps forever); a URL's password is stored only for re-download, never in the searchable record. |
+| **Learned host profiles** | Each host remembers the link count the governor settled at, its safe ceiling after 429/503, a response-time band and the per-link speed (`hosts.json`, 500 hosts, 90-day expiry). New jobs start there instead of cold; the governor still probes both ways. `ferdim hosts` lists them, `learn_hosts = false` turns learning off. |
+| **Merkle verification** | A `.ferdim-merkle` manifest (content-defined chunks, SHA-256 per chunk, Merkle root) is discovered next to the URL or given with `--merkle`. A corrupt chunk is re-fetched **by range only** (at most twice) before the job completes; `ferdim merkle update` rebuilds a new version of a file from an old local copy and fetches only the changed chunks. |
+| **Coexistence mode** (opt-in) | `ferdim coexist on`: while other traffic on the line exceeds `coexist_threshold` (15 % of observed capacity) the queue halves every job's links, and rebuilds them after 10 quiet seconds. Off by default — maximum power stays the default. |
+| **HTTP/3** (optional) | `--http3 auto` (or the `http3` setting) uses QUIC when the server advertises it in `Alt-Svc` and falls back to TCP on any failure; `force` never falls back. Needs the optional `aioquic` module (`python3-aioquic`, `pip install ferdim[h3]`); without it nothing changes. |
+| **Archives** | ZIP (nested up to three levels) and tar (`.tar`, `.gz`, `.xz`, `.bz2`) listing, selective extraction and repair of an interrupted extraction (`.ferdim-extract.json` records size + CRC per member; only damaged members are rewritten). Path traversal, escaping links and decompression bombs are rejected. |
+| **Desktop integration** | Desktop notifications for completions, failures and verification results (portal → freedesktop → `notify-send`, bursts coalesced; `notify`, `notify_errors_only`). `ferdim-dbus` exports `org.ferdim.Daemon1` on the session bus (D-Bus activated); a GNOME Shell extension (47–49) shows speed and job controls in the panel. |
 
 Also included: queue with concurrency limits and a night-window scheduler,
 watched folders, global + per-job speed limits, clipboard watching (event-driven on Wayland),
 HTTP and SOCKS5 proxy support, Basic-Auth, custom headers/cookies/referer/UA passthrough
-from the browser extension, ZIP preview from the queue view, and graceful
+from the browser extension, generic media sniffing from response headers
+(HLS/DASH manifests, large direct files), and graceful
 single-stream fallback for servers without byte ranges.
 
 **Deliberate limits:** DRM-protected streams and live (non-VOD) HLS are not
@@ -171,6 +178,14 @@ ferdim history debian --state done              # search file/URL/host + state
 ferdim history --stats                         # bytes served, per-host averages
 ferdim history --redownload <id>                # queue the same URL/options again
 ferdim history --clear --older-than 30          # retention (history_days config)
+ferdim hosts                                    # learned per-host link profiles
+ferdim archive list <id> --nested               # nested ZIP / tar listing
+ferdim archive extract <id> docs/a.txt --dest ~/out   # selective extraction
+ferdim archive repair <id>                      # fix an interrupted extraction
+ferdim merkle make big.iso                      # publish big.iso.ferdim-merkle
+ferdim merkle update old.iso https://example.com/new.iso --manifest new.iso.ferdim-merkle
+ferdim coexist on                               # shed links while the line is busy
+ferdim add https://example.com/big.iso --http3 auto    # QUIC when advertised
 ```
 
 - **Web UI** — `http://127.0.0.1:8378`: live queue, categories, speed/ETA,
@@ -179,6 +194,10 @@ ferdim history --clear --older-than 30          # retention (history_days config
   (global and per-category), watched folders, language picker. Fully
   keyboard- and screen-reader-friendly.
 - **GTK 4 app** — `ferdim-gui` or from your app menu.
+- **GNOME Shell** — `bash scripts/install.sh` installs the panel extension
+  when GNOME Shell is present (package users: see
+  `/usr/share/ferdim/gnome-shell-extension/INSTALL.md`), then
+  `gnome-extensions enable ferdim@proxy-turkey.github.io`.
 - **CLI** — full control; `ferdim --help`.
 
 Defaults are *maximum power*: up to 32 links per file, no speed limit, 8
@@ -235,10 +254,11 @@ tests/             unittest suite + local HTTP fixtures
 - [x] Sidecar checksum discovery, SHA-1 / SHA-512 (1.4.1)
 - [x] Per-category schedule windows and watched folders (1.4.1)
 - [x] Web UI + GTK accessibility pass (1.4.1)
+- [x] FTP/FTPS, SOCKS5, SQLite history, COPR/OBS/AUR (1.5)
+- [x] D-Bus, GNOME Shell, notifications, archives, host profiles (1.6)
+- [x] Coexistence mode, HTTP/3 extra, Merkle verification, Turkish man pages (1.6)
 
-The forward plan — distribution (COPR, official Fedora), desktop
-integration (D-Bus, GNOME Shell), and research items (HTTP/3,
-content-defined chunk verification) — lives in
+What is left (official Fedora package, new locales, MV3) lives in
 [ROADMAP.md](ROADMAP.md).
 
 ## Contributing

@@ -4,6 +4,71 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [Unreleased]
+
+### Added
+- Learned per-host connection profiles (`ferdim/profiles.py`,
+  `state/hosts.json`, 0600, 500 hosts, 90-day expiry): a finished or paused
+  transfer records the link count the governor settled at, the safe ceiling
+  after 429/503, a response-time band and the per-link speed. New jobs start
+  from the learned link count (and floor on throttled hosts), clamped to the
+  configured ceiling; the governor keeps probing in both directions.
+  `ferdim hosts [--forget HOST | --clear]`, `hosts` API command,
+  `learn_hosts` setting (default on).
+- Archive browsing (`ferdim/archive.py`): nested ZIP listing (three levels,
+  `outer.zip!/inner.zip!/file`), tar listing and extraction (`.tar`, gzip, xz,
+  bzip2), selective extraction, and repair of interrupted extractions from
+  the `.ferdim-extract.json` manifest (size + CRC per member). Traversal,
+  escaping links, device members and decompression bombs are rejected; an
+  existing file that FerDim did not write is never overwritten without
+  `--force`. `ferdim archive list|extract|repair`, `archive-*` API commands
+  and checkboxes plus extract/repair buttons in the web archive panel.
+- Desktop notifications for completions, failures and verification results
+  (portal, then freedesktop, then `notify-send`; bursts are coalesced into
+  one summary). Settings `notify` and `notify_errors_only`.
+- `ferdim-dbus`: an optional session-bus bridge (PyGObject) that exports
+  `org.ferdim.Daemon1` at `/org/ferdim/Daemon` (`Add`, `Pause`, `Resume`,
+  `Cancel`, `List`, `Stats`, `Version`, `Changed`), D-Bus activated.
+- GNOME Shell extension (47–49): panel speed and active count, per-job
+  pause/resume/cancel, "Open web UI". `scripts/install.sh` installs it when
+  GNOME Shell is present; packages ship it under
+  `/usr/share/ferdim/gnome-shell-extension/`.
+- Extension media sniffing v2 (`extension/sniff.js`): generic
+  response-header classification — HLS/DASH manifest MIME types,
+  `Content-Disposition` attachments (including RFC 5987 file names),
+  `Content-Range`-aware sizes — and segment noise no longer inflates the
+  badge count.
+- Coexistence mode (opt-in, `ferdim coexist on|off|status`, web footer
+  indicator and settings toggle): while foreign traffic on the line exceeds
+  `coexist_threshold` (default 15 % of observed capacity) for 3 s, every job
+  runs at half its links; they are rebuilt after 10 quiet seconds. Off by
+  default.
+- HTTP/3 (QUIC) as an optional extra (`ferdim/engine/h3.py`, `aioquic`
+  loaded lazily): `--http3 auto|force` or the `http3` setting; `auto` uses
+  QUIC only when the origin advertised it in `Alt-Svc` and falls back to TCP
+  (marking the origin broken for 10 min) on any failure. `pyproject.toml`
+  declares the `h3` extra; the RPM suggests `python3-aioquic`.
+- Content-defined chunking with Merkle verification (`ferdim/cdc.py`):
+  `.ferdim-merkle` manifests (FastCDC chunks, SHA-256 per chunk, Merkle
+  root) are discovered next to the URL or given with `--merkle`; a corrupt
+  chunk is re-downloaded by range only (at most twice) before the job is
+  reported done. `ferdim merkle make|verify|update` — `update` rebuilds a
+  new version of a file from an old local copy and fetches only the changed
+  chunks.
+- Turkish man pages (`docs/tr/`), installed under `%lang(tr)`; a test keeps
+  their versions and long options in step with the English pages.
+- `ferdim-dbus(1)`.
+- Arch Linux: `packaging/aur/PKGBUILD` (its `check()` runs the full suite)
+  and `.github/workflows/aur.yml`, which publishes it on every tag.
+- MV3 migration spike: `docs/mv3-spike.md` and `scripts/build_mv3.sh`.
+
+### Fixed
+- HTTPS downloads on Python 3.11 failed with the TLS context handed to the
+  connection; an explicit context is now always passed.
+- openSUSE builds: `python3` (for sqlite3) and `hicolor-icon-theme` are
+  build requirements.
+- The test suite no longer leaves temporary directories behind.
+
 ## [1.5.1] — 2026-11-24
 
 ### Added

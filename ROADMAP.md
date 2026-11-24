@@ -34,17 +34,22 @@ Shipped in **1.4.1** (2026-11-23):
 - [ ] Official Fedora package submission completed (sponsor found;
       `docs/fedora-submission.md` has the template).
 - [ ] openSUSE OBS and Arch AUR community packages. (OBS done:
-      `home:proxy-turkey/ferdim`; AUR pending an AUR account SSH key.)
+      `home:proxy-turkey/ferdim`; AUR: `packaging/aur/PKGBUILD` builds and
+      `.github/workflows/aur.yml` publishes on tag — the first push waits for
+      the publish key to be registered on the AUR account.)
 - [ ] Extension published on AMO (signed) with an update URL; MV3
-      migration spike to stay ahead of MV2 deprecation.
+      migration spike to stay ahead of MV2 deprecation. (Submitted to the
+      listed channel on every tag, awaiting Mozilla review; spike done —
+      `docs/mv3-spike.md`, `scripts/build_mv3.sh`: the only MV3 break is
+      `tabs.executeScript` in the link-grab path.)
 - [ ] More locales: German, French, Portuguese (Brazil), Arabic —
       community-reviewed.
 - [x] FTP/FTPS downloads via stdlib `ftplib`.
-- [ ] SOCKS5 proxy support as an optional pure-Python extra
-      (engine default remains stdlib-only).
+- [x] SOCKS5 proxy support — shipped in the stdlib core itself (1.5.1),
+      so no extra is needed.
 - [x] Web UI speed graph (per-job and aggregate) and a live
       connection-count timeline; canvas-based, no dependencies.
-- [ ] Queue history in SQLite: search, re-download, aggregate
+- [x] Queue history in SQLite: search, re-download, aggregate
       statistics (bytes served, average link counts per host).
 - [x] Carried over from 1.4.1: probe mirrors in the background (not only
       when a worker first needs them) so an unreachable mirror is reported
@@ -56,29 +61,31 @@ Shipped in **1.4.1** (2026-11-23):
 
 ## 1.6 — desktop integration
 
-- [ ] D-Bus interface (`org.ferdim.*`) for desktop shells; a GNOME
+Shipped in **1.6.0** together with the 2.0 research items below.
+
+- [x] D-Bus interface (`org.ferdim.*`) for desktop shells; a GNOME
       Shell extension driving the daemon.
-- [ ] Extension media sniffing v2: generic response-header analysis to
+- [x] Extension media sniffing v2: generic response-header analysis to
       catch more HLS/DASH manifests and large-file direct links
       (strictly generic — no site-specific scraping, ever).
-- [ ] Learned per-host connection profiles: remember the observed
+- [x] Learned per-host connection profiles: remember the observed
       link ceiling, RTT band and per-link cap per host class; apply
       them as the starting point for new jobs.
-- [ ] Archive browsing: nested ZIP listing, selective extraction,
+- [x] Archive browsing: nested ZIP listing, selective extraction,
       partial-extract repair.
-- [ ] Desktop notifications (portals) for job completion and
+- [x] Desktop notifications (portals) for job completion and
       verification results.
 
 ## 2.0 — research / stretch
 
-- [ ] HTTP/3 (QUIC) transport as an optional extra
+- [x] HTTP/3 (QUIC) transport as an optional extra
       (`pip install ferdim[h3]`); the stdlib path stays the default.
-- [ ] Content-defined chunking with Merkle verification: integrity
+- [x] Content-defined chunking with Merkle verification: integrity
       that survives re-downloads of only the changed ranges.
-- [ ] Coexistence mode (opt-in): automatically shed links when
+- [x] Coexistence mode (opt-in): automatically shed links when
       interactive traffic is detected on the line. Default stays
       maximum power; this is the polite opt-out made smarter.
-- [ ] Localized man pages (Turkish first).
+- [x] Localized man pages (Turkish first).
 
 ## Explicitly not planned
 
