@@ -164,6 +164,16 @@
       <legend data-i18n="lbl_cat_sched">Kategori bazlı zamanlama</legend>
       <div id="catSched" class="catgrid"></div>
     </fieldset>
+    <!-- Saat bazli hiz plani: kurallar textContent ile yazilir; duzenleyici
+         JSON dogrulamasi kaydetmeden once yapilir. -->
+    <fieldset class="group">
+      <legend data-i18n="plan_title">Hız planı</legend>
+      <div id="planRows" class="planrows"></div>
+      <p id="planState" class="dim" role="status" aria-live="polite"></p>
+      <label><span data-i18n="plan_json">Plan (JSON kural listesi)</span>
+        <textarea id="setPlan" rows="4" class="mono" spellcheck="false"></textarea></label>
+      <p id="planError" class="error" role="alert" hidden></p>
+    </fieldset>
     <label><span data-i18n="lbl_watch_dirs">İzlenen klasörler (her satıra bir)</span> <textarea id="setWatchDirs" rows="2" spellcheck="false"></textarea></label>
     <label><span data-i18n="lbl_watch_done">Kuyruğa aldıktan sonra</span>
       <select id="setWatchDone">

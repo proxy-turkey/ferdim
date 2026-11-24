@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import api
+from .. import metrics as _metrics
 
 
 def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
@@ -51,6 +52,15 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
             self.end_headers()
             self.wfile.write(data)
 
+        def _send_text(self, text: str, ctype: str):
+            body = text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
         def _authorized(self) -> bool:
             got = self.headers.get("X-FerDim-Token", "")
             return hmac.compare_digest(got, token)
@@ -66,6 +76,14 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
                                 "text/javascript; charset=utf-8")
             elif u.path == "/style.css":
                 self._send_file(env.web_dir / "style.css", "text/css; charset=utf-8")
+            elif u.path == "/metrics":
+                # Prometheus metin bicimi: ayni token basligi gerekir
+                # (curl -H "X-FerDim-Token: ..."); sorgu dizesi kabul edilmez.
+                if not self._authorized():
+                    self._send_json({"ok": False, "error": "yetkisiz"}, 401)
+                    return
+                self._send_text(_metrics.render(ctx["qm"]),
+                                "text/plain; version=0.0.4; charset=utf-8")
             elif u.path.startswith("/api/"):
                 if not self._authorized():
                     self._send_json({"ok": False, "error": "yetkisiz"}, 401)

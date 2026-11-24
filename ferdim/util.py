@@ -291,19 +291,120 @@ def _hm(s) -> int:
     return int(h) * 60 + int(m)
 
 
-def window_open(start, stop, now=None) -> bool:
+_HM_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+_DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+# hiz plani limit metni: '2MB', '512kb', '1.5g', '0' (sinirsiz)
+_SIZE_TEXT_RE = re.compile(
+    r"^\d+(?:\.\d+)?(?:kib|mib|gib|kb|mb|gb|k|m|g|b)?$", re.IGNORECASE)
+
+
+def window_open(start, stop, now=None, days=None) -> bool:
     """'02:00'-'08:00' penceresi su an acik mi? Gece yarisini asan pencere
-    desteklenir; bozuk giris pencere yok sayilir (her zaman acik)."""
+    desteklenir; bozuk giris pencere yok sayilir (her zaman acik).
+
+    days verilirse (0 = pazartesi) pencere yalniz o gunlerde aciktir. Gece
+    yarisini asan pencerede gun, pencerenin BASLADIGI gundur: 'cuma
+    22:00-02:00' cumartesi 01:00'de de aciktir."""
+    import datetime as _dt
+    now = now or _dt.datetime.now()
+    if days is not None:
+        days = frozenset(days)
+        if not days:
+            return False
     try:
         s, e = _hm(start), _hm(stop)
     except Exception:
-        return True
-    import datetime as _dt
-    now = now or _dt.datetime.now()
+        return days is None or now.weekday() in days
     cur = now.hour * 60 + now.minute
     if s <= e:
-        return s <= cur < e
-    return cur >= s or cur < e
+        return (days is None or now.weekday() in days) and s <= cur < e
+    if cur >= s:
+        return days is None or now.weekday() in days
+    if cur < e:
+        return days is None or ((now.weekday() - 1) % 7) in days
+    return False
+
+
+def parse_days(spec) -> frozenset[int]:
+    """'mon-fri', 'mon,wed', 'sat-sun' -> gun kumesi (0 = pazartesi).
+    Bos ya da '*' her gundur. Bilinmeyen ad ValueError firlatir: cagiran
+    kurali atar (sessizce 'her gun' saymak plani bozardi)."""
+    s = str(spec or "").strip().lower()
+    if not s or s in ("*", "all", "daily", "everyday"):
+        return frozenset(range(7))
+    out: set[int] = set()
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        first, _, last = part.partition("-")
+        if first not in _DAY_NAMES:
+            raise ValueError(f"gun adi: {first}")
+        i = _DAY_NAMES.index(first)
+        if not last:
+            out.add(i)
+            continue
+        if last not in _DAY_NAMES:
+            raise ValueError(f"gun adi: {last}")
+        j = _DAY_NAMES.index(last)
+        while True:                    # 'fri-mon' gibi sarmayi da kabul eder
+            out.add(i)
+            if i == j:
+                break
+            i = (i + 1) % 7
+    return frozenset(out)
+
+
+def speed_plan_rule(plan, now=None):
+    """Ilk eslesen speed_plan kurali (ilk eslesen kazanir); yoksa None."""
+    import datetime as _dt
+    now = now or _dt.datetime.now()
+    for rule in plan or ():
+        if not isinstance(rule, dict):
+            continue
+        try:
+            days = parse_days(rule.get("days"))
+        except ValueError:
+            continue
+        if window_open(rule.get("from", ""), rule.get("to", ""), now, days):
+            return rule
+    return None
+
+
+def speed_plan_limit(plan, now=None):
+    """Etkin plan limiti (bayt/sn; 0 = sinirsiz). Plan bos/gecersizse None:
+    plan yok, mevcut limit oldugu gibi kalir. Kural eslesmezse 0: plan
+    gunun tamamini kapsamak zorunda degil, disinda azami guc gecerlidir."""
+    if not isinstance(plan, list) or not any(isinstance(r, dict) for r in plan):
+        return None
+    rule = speed_plan_rule(plan, now)
+    return parse_size(rule.get("limit")) if rule else 0
+
+
+def sanitize_speed_plan(raw) -> list:
+    """Bozuk kurallari atar, alanlari normalestirir: gun kumesi adi, HH:MM
+    pencere (ikisi de bos = tum gun) ve hiz metni ('2MB'; '0'/'' = sinirsiz)."""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for rule in raw:
+        if not isinstance(rule, dict):
+            continue
+        try:
+            parse_days(rule.get("days"))
+        except ValueError:
+            continue
+        start = str(rule.get("from") or "").strip()
+        stop = str(rule.get("to") or "").strip()
+        if (start or stop) and not (_HM_RE.match(start) and _HM_RE.match(stop)):
+            continue
+        limit = rule.get("limit")
+        text = "" if limit is None else str(limit).strip()
+        if text not in ("", "0") and not _SIZE_TEXT_RE.match(text.replace(" ", "")):
+            continue
+        out.append({"days": str(rule.get("days") or "").strip().lower(),
+                    "from": start, "to": stop, "limit": text or "0"})
+    return out
 
 
 def zip_preview(path, limit: int = 500):

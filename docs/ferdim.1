@@ -96,7 +96,38 @@ Control jobs; \fBremove \-\-delete\-files\fR also discards partial data.
 .BI limit " RATE"
 Global speed limit (\fB0\fR disables). KB, MB and GB are 1024-based.
 Setting a limit while turbo mode is on leaves turbo mode, so the applied
-limit and the turbo state never disagree.
+limit and the turbo state never disagree. A limit set by hand also wins
+over a speed plan until \fBlimit plan\fR gives control back.
+.TP
+.BI speedplan " [show|set JSON|clear|resume]"
+Time-of-day speed profile on top of the schedule windows, for example
+2 MB/s during work hours and maximum power at night. Rules are a JSON
+list:
+\fB[{"days":"mon-fri","from":"09:00","to":"18:00","limit":"2MB"}]\fR.
+\fIdays\fR holds weekday names or ranges (mon-fri, sat-sun, mon,wed; empty
+or * = every day), \fIfrom\fR/\fIto\fR are HH:MM and may cross midnight,
+and \fIlimit\fR is 1024-based ("0" or "" = unlimited). The first matching
+rule wins; when no rule matches, the plan imposes no limit, so maximum
+power needs no rule of its own. The queue applies the active rule every
+half second, so a boundary is honoured without restarting jobs. A limit
+set by hand (\fBlimit\fR or the web speed selector) wins over the plan
+until \fBspeedplan resume\fR (or \fBlimit plan\fR) hands control back;
+\fBspeedplan clear\fR removes the plan and restores the limit that was in
+force before it. While a plan limit applies turbo mode is left, so the
+limit and the turbo state never disagree. The web settings show the rules
+as readable rows and edit them as JSON.
+.TP
+.BI metrics
+Print the Prometheus text exposition format (0.0.4) for local monitoring:
+bytes downloaded, jobs that reached a terminal state, live links, retries
+and HTTP 429/503 throttles per host, aggregate throughput, current queue
+states, coexistence pressure and build information. The daemon serves the
+same text at \fB/metrics\fR on the localhost HTTP port and requires the
+usual token header:
+\fBcurl \-H "X\-FerDim\-Token: $(cat ~/.local/state/ferdim/token)"
+http://127.0.0.1:8378/metrics\fR. A query-string token is not accepted;
+host labels are host names only (no credentials or paths) and at most 200
+hosts are exported separately, the rest summed under \fBother\fR.
 .TP
 .BI turbo " on|off|status"
 Toggle maximum-power defaults (32 links, unlimited speed, 8 concurrent jobs).
@@ -168,7 +199,8 @@ automatic sidecar verification (\fIchecksum_sidecar\fR), desktop
 notifications (\fInotify\fR, default true; \fInotify_errors_only\fR
 reports failures only), retries and
 timeouts (\fItimeout\fR, \fIstall_timeout\fR), coexistence mode
-(\fIcoexist\fR, \fIcoexist_threshold\fR) and download history
+(\fIcoexist\fR, \fIcoexist_threshold\fR), the time-of-day speed plan
+(\fIspeed_plan\fR, \fIspeed_plan_manual\fR) and download history
 retention (\fIhistory_days\fR, default 365 days, \fB0\fR keeps forever).
 .TP
 .BI history " [QUERY]"
