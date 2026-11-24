@@ -8,6 +8,15 @@ hem Range akisini hem de kucuk metin cekimini (yan dosya, m3u8/MPD,
 HLS-DASH segmenti) ayni secimden gecirir. `_make_opener` urllib opener'ini
 saran h3 farkinda bir nesne doner (proxy/TLS yolu korunur), boylece
 hls.py/dash.py/segments.py imza degistirmeden h3'ten gecer.
+
+Kimlik kapsami: Authorization, Cookie ve kullanicinin ozel basliklari
+YALNIZCA kimlik sahibi kokenine (sema+ana makine+port) gider. Iki yerde
+uygulanir: `DlOptions.headers_for` (ayna baska koken ise dusurur) ve
+`ScopedRedirectHandler` (30x zincirinde yabanci koken ya da https->http
+dususunde dusurur). Kimlik OLMAYAN basliklar her atlama da kalir:
+Proxy-Authorization (gecidin kimligi), Referer (CDN'lerin hotlink
+denetimi) ve If-Range (dogrulayici; yonlendirme hedefi dosyayi sunan
+kaynak oldugu icin devam dogrulamasi orada gerekir).
 """
 from __future__ import annotations
 
@@ -18,6 +27,7 @@ import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from . import h3, socks
 
@@ -34,6 +44,62 @@ def _tune(sock: socket.socket) -> None:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF)
     except OSError:
         pass
+
+
+# ------------------------------------------------------- kimlik kapsami
+# Kimlik sahibi koken disina gonderilirken YALNIZ bu basliklar kalir
+# (varsayilan olarak REDDET). Liste = kimlik TASIMAYAN basliklar: hepsi
+# FerDim'in/urllib'in kendi urettigi ya da herkese acik baglam bilgisi.
+#  - Referer: kimlik degil; CDN'ler yonlendirme sonrasi hotlink denetimi
+#    icin bakar (tarayicilar da kokenler arasi gonderir).
+#  - If-Range: kimlik degil, DOGRULAYICI. Ayna/yonlendirme hedefi dosyayi
+#    fiilen sunan kaynak olabilir (surum sayfasi -> CDN); burada atilirsa
+#    devam dogrulamasi tam da yaygin durumda kaybolur ve degismis dosya
+#    karisik devam ederdi.
+#  - Proxy-Authorization: gecidin kimligi, hedefin degil.
+_OPEN_HEADERS = frozenset({
+    "host", "user-agent", "accept", "accept-encoding", "connection",
+    "range", "if-range", "referer", "proxy-authorization",
+})
+
+
+def origin_of(url: str) -> tuple:
+    """Koken: (sema, ana makine, port) - karsilastirma icin normalised.
+
+    Sema ve ana makine kucuk harfe indirilir, port semaya gore varsayilanla
+    doldurulur (http 80, https 443). Cozulemeyen URL icin ("", "", 0);
+    boyle bir deger hicbir kokenle ayni sayilmaz."""
+    try:
+        p = urlsplit(str(url or ""))
+        scheme = (p.scheme or "").lower()
+        host = (p.hostname or "").lower()
+        port = p.port
+    except ValueError:
+        return ("", "", 0)
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme, 0)
+    return (scheme, host, port)
+
+
+def same_origin(origin: tuple, url: str) -> bool:
+    """`origin` bu URL'in kokeniyle ayni mi?
+
+    Farkli sema (https->http dususu dahil), farkli ana makine ya da farkli
+    port = farkli koken. Gecersiz/eksik koken hicbir zaman ayni sayilmaz:
+    kimlik sizmaz."""
+    if not origin or origin[0] not in ("http", "https"):
+        return False
+    return origin == origin_of(url)
+
+
+def strip_credentials(headers: dict) -> dict:
+    """Kimlik basliklarini atar: Authorization, Cookie ve kullanicinin ozel
+    basliklari. Kimlik OLMAYANLAR kalir: User-Agent, Accept-Encoding,
+    Connection, Range, If-Range, Referer, Proxy-Authorization
+    (bak: `_OPEN_HEADERS`)."""
+    return {k: v for k, v in headers.items()
+            if str(k).strip().lower() in _OPEN_HEADERS
+}
 
 
 class FastHTTPConnection(http.client.HTTPConnection):
@@ -109,6 +175,33 @@ class FastHTTPSHandler(urllib.request.HTTPSHandler):
                             context=self._context)
 
 
+class ScopedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """30x zinciri: kimlik basliklari yalnizca ILK istegin kokeninde kalir.
+
+    stdlib handler'i govde disi butun basliklari (Authorization, Cookie,
+    kullanicinin ozel basliklari) hedefe kopyalar: yabanci bir koken 30x
+    ile parolayi/cerezi toplayabilirdi. Burada hedef koken ilk istegin
+    kokeninden farkliysa (sema/ana makine/port; https->http dususu dahil)
+    kimlik basliklari atilir; kimlik OLMAYANLAR kalir: Range, If-Range
+    (dogrulayici), Referer, Proxy-Authorization (`_OPEN_HEADERS`).
+
+    Zincir boyunca ILK koken tasinir (`_ferdim_origin`): A->B->A donusunde
+    kimlik geri gelmez, cunku A istegi B isteginin (kimliksiz) basliklari
+    uzerine kurulur. Bir kez atilan kimlik o istek icin atilmis kalir."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        origin = getattr(req, "_ferdim_origin", None) \
+            or origin_of(getattr(req, "full_url", ""))
+        new._ferdim_origin = origin
+        if same_origin(origin, newurl):
+            return new
+        new.headers = strip_credentials(new.headers)
+        return new
+
+
 class _Opener:
     """h3 farkinda opener: urllib opener'i gibi `.open` sunar.
 
@@ -151,6 +244,12 @@ class DlOptions:
     # "auto" yalnizca kaynak Alt-Svc ile h3 duyurduysa dener; aioquic
     # kurulu degilse/proxy varsa sessizce TCP'de kalir.
     http3: str = "off"
+    # Kimlik kapsami: (sema, ana makine, port). Bu kokenin disindaki bir
+    # adrese giden istekte kimlik basliklari (Authorization/Cookie/ozel
+    # basliklar) gonderilmez: aynalar ve yonlendirme hedefleri parolayi
+    # toplayamaz. Bos ise istek URL'inin kendi kokeni gecerlidir (tek
+    # kaynak; ad-hoc kullanim) - yonlendirme kurali yine uygulanir.
+    origin: tuple = ()
 
     def base_headers(self) -> dict:
         h = {
@@ -163,9 +262,24 @@ class DlOptions:
         if self.cookies:
             h["Cookie"] = self.cookies
         if self.user:
+            # kimlik YALNIZ bu baslikla gonderilir: urllib'in parola deposu
+            # (HTTPBasicAuthHandler) hic kurulmaz - kurulsaydi bilinmeyen
+            # bir kokenin 401'ine de kimlikle karsilik verirdi
             tok = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
             h["Authorization"] = "Basic " + tok
         return h
+
+    def headers_for(self, url: str) -> dict:
+        """`url`e gonderilecek basliklar.
+
+        `origin` doluysa ve URL baska bir koken/adrese gidiyorsa kimlik
+        basliklari DUSURULUR (ayna baska makinede: parola sizmaz; ayni
+        kokenli ayna kimligi korur). Bak: api._item_params metalink
+        kurali - ayni mantik."""
+        h = self.base_headers()
+        if not self.origin or same_origin(self.origin, url):
+            return h
+        return strip_credentials(h)
 
 
 @dataclass
@@ -211,6 +325,10 @@ def _make_opener(opt: DlOptions, direct: bool = False):
         # baglam uretmez (3.13+ uretir), iki yol ayni davranmali
         handlers.append(FastHTTPSHandler(context=_tls_context(opt.insecure)))
         handlers.append(FastHTTPHandler())
+    # yonlendirme kimlik kapsami: SOCKS/duz yol ayrimi yok, her opener'da
+    # stdlib HTTPRedirectHandler'in yerine gecer (build_opener alt sinifi
+    # gorunce varsayilani atlar)
+    handlers.append(ScopedRedirectHandler())
     opener = urllib.request.build_opener(*handlers)
     return opener if direct else _Opener(opener, opt)
 
@@ -292,7 +410,7 @@ def _probe_from(res) -> ProbeResult:
 
 def probe(url: str, opt: DlOptions) -> ProbeResult:
     """Range: bytes=0-0 ile kaynak ozelliklerini kesfeder."""
-    headers = {**opt.base_headers(), "Range": "bytes=0-0"}
+    headers = {**opt.headers_for(url), "Range": "bytes=0-0"}
     res = _open_any(url, opt, headers, opt.timeout)
     try:
         out = _probe_from(res)
@@ -317,7 +435,7 @@ def open_range(url: str, opt: DlOptions, start: int, end: int,
     akisi bu sure boyunca durursa okuma TimeoutError ile kesilir (stall).
     """
     to = timeout or opt.timeout
-    h = opt.base_headers()
+    h = opt.headers_for(url)
     h["Range"] = f"bytes={start}-{end}"
     if etag or last_modified:
         h["If-Range"] = etag or last_modified
@@ -334,7 +452,12 @@ def open_range(url: str, opt: DlOptions, start: int, end: int,
 
 
 def request_of(url: str, opt: DlOptions) -> urllib.request.Request:
-    return urllib.request.Request(url, headers=opt.base_headers())
+    """Tek istek nesnesi. Basliklar koken kapsamina gore suzulur
+    (`headers_for`): ayna/yan dosya baska koken ise kimlik gitmez."""
+    req = urllib.request.Request(url, headers=opt.headers_for(url))
+    # yonlendirme zinciri boyunca ILK koken korunur (ScopedRedirectHandler)
+    req._ferdim_origin = origin_of(url)
+    return req
 
 
 def fetch_small(url: str, opt: DlOptions, timeout: float = 8.0,
@@ -345,7 +468,7 @@ def fetch_small(url: str, opt: DlOptions, timeout: float = 8.0,
 
     h3 acikken ayni `_open_any` seciminden gecer (yan dosyalar/manifestler
     boylece Range akisiyla ayni baglantiyi paylasir)."""
-    res = _open_any(url, opt, opt.base_headers(), timeout)
+    res = _open_any(url, opt, opt.headers_for(url), timeout)
     try:
         if not allow_html and \
                 "html" in (res.headers.get("Content-Type") or "").lower():

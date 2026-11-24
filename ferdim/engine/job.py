@@ -251,6 +251,10 @@ class JobSpec:
             timeout=int(cfg.get("timeout", 30)),
             retries=int(cfg.get("retries", 5)),
             http3=self.http3 or str(cfg.get("http3", "off")),
+            # kimlik kapsami BIRINCIL adresin kokenidir: farkli kokenli
+            # ayna ya da yonlendirme hedefi parolayi/cerezi almaz (ayni
+            # kokenli ayna kimligi korur). Bak: httpcli.headers_for
+            origin=httpcli.origin_of(self.url),
         )
 
 
