@@ -293,10 +293,17 @@ silently lose the queue.
       (today 8 jobs × 2 MB/s = 16 MB/s).
 - [ ] HLS/DASH per-segment retries with backoff; one transient error
       should not abort a 2000-segment stream (`segments.py:127`).
-- [ ] HLS: detect `#EXT-X-KEY` and `#EXT-X-BYTERANGE` and fail with a
-      clear code instead of saving ciphertext or duplicated bytes;
-      support `BYTERANGE` properly. (AES-128 decryption needs a cipher the
-      stdlib doesn't have, so encrypted playlists keep the clear error.)
+- [ ] HLS: support `#EXT-X-BYTERANGE` (fetch the declared sub-ranges in
+      order instead of whole, duplicated files).
+- [ ] HLS: decrypt `#EXT-X-KEY` `METHOD=AES-128` segments (AES-128-CBC
+      with the playlist's IV or the media-sequence IV, key rotation
+      mid-playlist, keys fetched once per URI with the job's cookies and
+      headers, never written to disk or logs). Uses the `cryptography`
+      library as an optional dependency: imported lazily, `Recommends:` in
+      the packages, `ferdim[hls-aes]` for pip; without it the job fails
+      with a clear `hls_crypto_missing` code. Other methods and key
+      formats (`SAMPLE-AES`, non-`identity` `KEYFORMAT`) are DRM and fail
+      with `hls_drm` (see "Explicitly not planned").
 - [ ] DASH: concatenate every period of a static MPD and add the best
       audio representation instead of dropping it.
 - [ ] Bounded manifest reads (HLS / DASH size limit like `fetch_small`).

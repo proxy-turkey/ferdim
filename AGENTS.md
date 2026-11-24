@@ -2,7 +2,10 @@
 
 FerDim is a dynamic, self-tuning download manager for Linux, built
 Fedora-first, with a Firefox WebExtension. The engine, CLI and daemon
-are **Python stdlib only** — no pip dependencies, ever. The web UI is
+are **Python stdlib only** at their core; a small, well-maintained
+library may back an *optional* feature (imported lazily, the feature
+degrades with a clear error code without it — `aioquic` for HTTP/3,
+`cryptography` for encrypted HLS). The web UI is
 dependency-free vanilla JS. The extension is Manifest V3.
 
 State at authorship: **1.7.0 released**; test suite green (685 tests),
@@ -25,8 +28,10 @@ checks, mock builds cleanly on Fedora 43.
    "browser-integrated download handoff". This is a maintainer-set
    legal constraint; there are no exceptions.
 2. `ferdim/` (engine, CLI, daemon, GTK app) and `tests/` use the
-   Python stdlib only. PyGObject is an optional *runtime* for the GTK
-   front-end, never imported by core modules.
+   Python stdlib only at import time. Optional libraries (PyGObject for
+   the GTK front-end, `aioquic`, `cryptography`) are imported lazily in
+   the module that needs them, never at core import time, and every
+   feature built on one has a clear error code when it is missing.
 3. User-facing strings go through `ferdim/i18n.py` (the `S` dict) and
    `extension/_locales/{en,tr,es,ru}/messages.json` — a new key must be
    added to **all four** languages; CI checks locale parity. Engine
