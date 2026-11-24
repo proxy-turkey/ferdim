@@ -56,8 +56,13 @@ jobs:
           install -d -m 700 ~/.ssh
           printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
-          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
+          ssh-keyscan -t ed25519 aur.archlinux.org > ~/.ssh/aur_known_hosts
+          # ssh, $HOME yerine passwd ev dizinini okur: dosyalar acikca verilir
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/aur_known_hosts"
+          if ! $GIT_SSH_COMMAND aur@aur.archlinux.org help >/dev/null 2>&1; then
+            echo "::warning::AUR rejected the publish key (not registered on the AUR account yet); package built, push skipped"
+            exit 0
+          fi
           git clone ssh://aur@aur.archlinux.org/ferdim.git aur
           cp /home/builder/pkg/PKGBUILD /home/builder/pkg/.SRCINFO aur/
           cd aur
