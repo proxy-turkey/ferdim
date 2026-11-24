@@ -61,38 +61,29 @@ def parse_content_disposition(value: str | None) -> str | None:
     return None
 
 
-def _claim(p: Path) -> bool:
-    """Ad bos bir yer tutucuyla ATOMIK sahiplenilir (O_CREAT|O_EXCL).
-
-    Var olan ad (dizin ya da sembolik bag dahil) EEXIST verir: sahiplenilmis
-    bir ada asla yazilmaz."""
-    try:
-        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
-        return False
-    os.close(fd)
-    return True
-
-
 def unique_path(directory: Path, name: str) -> Path:
     """Hedef dizinde benzersiz bir ad SAHIPLENIR (bos yer tutucu acilir).
 
-    Kontrol-sonra-kullan yarisi yoktur: iki is ayni adi sectiginde yalniz
-    biri kazanir, digeri '(1)' ile devam eder - bitiste biri digerinin
-    uzerine yazamaz. Dondurulen yol cagirana aittir: cagiran onu kendi
-    icerigiyle doldurur (os.replace) ya da vazgecince siler. Hedef dizin
-    onceden var olmalidir."""
-    if _claim(directory / name):
-        return directory / name
+    Kontrol-sonra-kullan yarisi yoktur: ad O_CREAT|O_EXCL ile acilir, iki is
+    ayni adi sectiginde yalniz biri kazanir, digeri '(1)' ile devam eder -
+    bitiste biri digerinin dosyasinin uzerine yazamaz. Var olan ad (dizin ya
+    da sembolik bag dahil) EEXIST verir. Dondurulen yol cagirana aittir:
+    cagiran onu kendi icerigiyle doldurur (os.replace) ya da vazgecince
+    siler. Hedef dizin onceden var olmalidir."""
     stem, dot, ext = name.partition(".")
     if not dot:
         stem, ext = name, ""
-    i = 1
+    i = 0
     while True:
-        cand = directory / f"{stem} ({i}){('.' + ext) if ext else ''}"
-        if _claim(cand):
-            return cand
-        i += 1
+        cand = directory / name if i == 0 else \
+            directory / f"{stem} ({i}){('.' + ext) if ext else ''}"
+        try:
+            fd = os.open(cand, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            i += 1
+            continue
+        os.close(fd)
+        return cand
 
 
 def atomic_write_json(path: Path, obj) -> None:
