@@ -41,6 +41,7 @@ package() {
   local m
   for m in ferdim ferdim-nm ferdim-gui; do
     install -Dm644 "docs/$m.1" "$pkgdir/usr/share/man/man1/$m.1"
+    install -Dm644 "docs/tr/$m.1" "$pkgdir/usr/share/man/tr/man1/$m.1"
   done
 
   install -d "$pkgdir/usr/lib/systemd/user"

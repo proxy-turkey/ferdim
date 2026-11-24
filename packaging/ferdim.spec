@@ -69,6 +69,9 @@ install -D -m 0644 scripts/icons/ferdim.svg \
 install -D -m 0644 docs/%{srcname}.1 %{buildroot}%{_mandir}/man1/%{srcname}.1
 install -D -m 0644 docs/%{srcname}-nm.1 %{buildroot}%{_mandir}/man1/%{srcname}-nm.1
 install -D -m 0644 docs/%{srcname}-gui.1 %{buildroot}%{_mandir}/man1/%{srcname}-gui.1
+for m in %{srcname} %{srcname}-nm %{srcname}-gui; do
+  install -D -m 0644 docs/tr/$m.1 %{buildroot}%{_mandir}/tr/man1/$m.1
+done
 
 # systemd user unit
 mkdir -p %{buildroot}%{_userunitdir}
@@ -113,6 +116,7 @@ python3 -m unittest discover -s tests -v
 %{_mandir}/man1/%{srcname}.1*
 %{_mandir}/man1/%{srcname}-nm.1*
 %{_mandir}/man1/%{srcname}-gui.1*
+%lang(tr) %{_mandir}/tr/man1/%{srcname}*.1*
 
 # systemd USER unit: presets are applied by the user-unit scriptlets
 # (Packaging Guidelines, Scriptlets: User Units); file triggers do not

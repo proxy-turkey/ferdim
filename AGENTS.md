@@ -196,7 +196,8 @@ background task; it will fail on the password prompt.
 
 1. Bump **all** version spots: `ferdim/__init__.py` (`__version__`),
    `packaging/ferdim.spec` (`Version:` + `%changelog` entry),
-   `docs/ferdim.1` / `ferdim-nm.1` / `ferdim-gui.1` (`.TH` string),
+   `docs/ferdim.1` / `ferdim-nm.1` / `ferdim-gui.1` and their Turkish
+   twins in `docs/tr/` (`.TH` string; `tests/test_manpages.py` checks),
    `extension/manifest.json`, `CHANGELOG.md`.
 2. Gates: tests green, web-ext lint 0/0, `bash tests/ui/run.sh all`
    green, `bash tests/cli_smoke.sh` green against the installed build,
