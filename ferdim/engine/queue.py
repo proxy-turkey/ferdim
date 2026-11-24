@@ -33,6 +33,10 @@ class QueueManager:
         self._load()
         self._running = True
         self._size_probed: set[str] = set()
+        # start() agi yoklar (timeout + denemeler): tick iplikciginde
+        # calistirmak tum kuyrugu kilitler. Baslatmasi parcaciga verilmis
+        # isler yuvayi HEMEN tutar (durum 'connecting' olana kadar).
+        self._starting: set[str] = set()
         # birlikte yasam (varsayilan kapali): hat izleyici yalniz acikken
         # ornekler; 'coexist_on' gecisi tavani birakmak icin tutulur
         self.coexist = LineMonitor()
@@ -186,7 +190,6 @@ class QueueManager:
             running = [j for j in self.jobs if j.state in STATES_RUNNING]
             queued = [j for j in self.jobs if j.state == JobState.QUEUED]
         limit = int(self.cfg.get("max_concurrent", 3))
-        started = False
         if self._schedule_active():
             slots = max(0, limit - len(running))
             # kategori penceresi kapali olan isler siralarini bekler
@@ -199,12 +202,10 @@ class QueueManager:
                     ready.sort(key=lambda j: (j.total if j.total > 0
                                               else float("inf"), j.created))
                     for job in ready[:slots]:
-                        job.start(queued_only=True)
-                        started = True
-            else:
+                        self._start_async(job)
+            elif slots:
                 for job in queued[:slots]:
-                    job.start(queued_only=True)
-                    started = True
+                    self._start_async(job)
         for j in self.jobs:
             j.update_speed()
         self._coexist_tick(running)
@@ -213,6 +214,40 @@ class QueueManager:
         if sig != getattr(self, "_last_sig", None):
             self._last_sig = sig
             self._save()
+
+    # -------------------------------------------------------- start dagitimi
+    def _start_async(self, job) -> bool:
+        """Isi tick iplikcigine BAGLAMADAN baslatir.
+
+        start() icindeki ag yoklamasi (timeout x deneme) dakikalarca
+        surebilir; tick iplikciginde calistirmak olu bir ana makinenin
+        diger islerin baslamasini, hiz guncellemesini ve kaliciligi
+        durdurmasina yol aciyordu. Yuva AYNI kilit altinda ayrilir: es
+        zamanli tick'ler max_concurrent'i asamaz (start() durumu
+        'connecting' yapana kadar is _starting'de sayilir)."""
+        with self._lock:
+            busy = len({j.id for j in self.jobs if j.state in STATES_RUNNING}
+                       | self._starting)
+            if busy >= int(self.cfg.get("max_concurrent", 3)):
+                return False
+            self._starting.add(job.id)
+        try:
+            threading.Thread(target=self._run_start, args=(job,), daemon=True,
+                             name=f"ferdim-start-{job.id}").start()
+        except RuntimeError:            # parcacik acilamadi: yuva birakilir
+            with self._lock:
+                self._starting.discard(job.id)
+            return False
+        return True
+
+    def _run_start(self, job):
+        try:
+            job.start(queued_only=True)
+        except Exception:
+            pass
+        finally:
+            with self._lock:
+                self._starting.discard(job.id)
 
     # ------------------------------------------------------- birlikte yasam
     def _coexist_tick(self, running=None):
@@ -502,8 +537,11 @@ class QueueManager:
         self._running = False
         with self._lock:
             jobs = list(self.jobs)
+            # baslatmasi yeni dagitilmis isler de durdurulur: aksi halde
+            # kapanistan sonra indirmeye baslarlardi
+            starting = set(self._starting)
         for j in jobs:
-            if j.state in STATES_RUNNING:
+            if j.state in STATES_RUNNING or j.id in starting:
                 j.pause()
         self._save()
 
