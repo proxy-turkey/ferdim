@@ -5,6 +5,7 @@ import errno
 import json
 import os
 import re
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -86,39 +87,54 @@ def unique_path(directory: Path, name: str) -> Path:
         return cand
 
 
-def atomic_write_json(path: Path, obj) -> None:
-    """Atomik + dayanikli JSON yazimi. Gecici dosya 0600 ile acilir: is/kuyruk
-    dosyalari kimlik bilgisi tasiyan URL'ler icerebilir, dosya izinleri
-    umask'tan bagimsiz olarak kullaniciya ozel kalsin.
+def atomic_write_bytes(path: Path, data: bytes, mode: int = 0o600,
+                       prefix: str | None = None) -> None:
+    """Baytlari atomik + dayanikli yazar (tum durum dosyalarinin tek yolu).
 
-    Dosya icerigi os.replace'ten ONCE fsync edilir, sonra dizin fsync edilir:
-    guc kesintisi yarim ya da sifir dolu bir durum dosyasi birakmaz.
+    Gecici dosya mkstemp ile BENZERSIZ adla hedef dizinde acilir: sabit bir
+    '.tmp' adi yoktur, bu yuzden ayni anda yazan iki surec birbirinin canli
+    gecici dosyasini silip yarim/eski icerik yayinlayamaz. Icerik
+    os.replace'ten ONCE fsync edilir, sonra dizin fsync edilir; herhangi bir
+    hata gecici dosyayi siler. `prefix` yalniz gecici adin onekidir
+    (varsayilan: hedef adi); `mode` son dosyanin iznidir.
     """
     from .paths import fsync_dir      # dongusel import: yalniz cagri aninda
-    data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    p = Path(path)
+    fd = -1
+    tmp = None
     try:
-        fd = os.open(tmp, flags, 0o600)
-    except FileExistsError:
-        # onceki cokme/eski surumden kalan gecici dosya: temizle ve dene
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        fd = os.open(tmp, flags, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
+        fd, tmp = tempfile.mkstemp(dir=str(p.parent),
+                                   prefix=prefix if prefix is not None
+                                   else p.name + ".",
+                                   suffix=".tmp")
         with os.fdopen(fd, "wb") as f:
             fd = -1
+            os.fchmod(f.fileno(), mode)
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        os.replace(tmp, p)
+        tmp = None
+        fsync_dir(p.parent)
     finally:
         if fd >= 0:
             os.close(fd)
-    tmp.replace(path)
-    fsync_dir(path.parent)
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def atomic_write_json(path: Path, obj) -> None:
+    """Atomik + dayanikli JSON yazimi (0600: kimlik bilgisi tasiyabilir).
+
+    Paylasilan `atomic_write_bytes` yolunu kullanir: benzersiz gecici ad,
+    os.replace'ten once fsync, sonra dizin fsync. Guc kesintisi yarim ya da
+    sifir dolu bir durum dosyasi birakmaz.
+    """
+    atomic_write_bytes(path, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                       mode=0o600)
 
 
 def read_json(path: Path):

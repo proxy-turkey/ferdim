@@ -373,11 +373,13 @@ class ConfigWriteTests(unittest.TestCase):
         self.assertIn("\n  ", text, "config okunabilir (indent=2) kalmali")
         self.assertEqual(json.loads(text), self.cfg)
 
-    def test_save_config_replaces_a_stale_tmp_file(self):
+    def test_save_config_leaves_a_foreign_fixed_tmp_file_alone(self):
+        """Sabit '.tmp' adi artik kullanilmaz (benzersiz mkstemp): baska bir
+        yazarin canli gecici dosyasi silinmez; yazim yine tamamlanir."""
         tmp = self.env.config_path.with_suffix(".json.tmp")
         tmp.write_text("yarim", "utf-8")
         self.env.save_config(self.cfg)
-        self.assertFalse(tmp.exists(), "eski gecici dosya temizlenmeli")
+        self.assertTrue(tmp.exists(), "yabanci gecici dosya silinmemeli")
         self.assertEqual(json.loads(self.env.config_path.read_text("utf-8")),
                          self.cfg)
 

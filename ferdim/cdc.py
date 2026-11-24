@@ -20,11 +20,10 @@ import hashlib
 import json
 import mmap
 import os
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .paths import fsync_dir
+from . import util
 
 ALGO = "fastcdc-sha256"
 SUFFIX = ".ferdim-merkle"
@@ -369,28 +368,16 @@ def read_manifest(path) -> Manifest:
 
 
 def write_atomic(path, text: str) -> Path:
-    """Metni atomik yazar: gecici dosya hedef dizinde O_EXCL ile acilir
-    (mkstemp, mevcut bir adi/sembolik bagi asla izlemez), fsync + 0644,
-    sonra os.replace hedefin uzerine koyar, dizin de fsync edilir (guc
-    kesintisinde ad degisikligi kaybolmaz). replace bagin KENDISINI
-    degistirir: onceden kurulmus bir bag varsa gosterdigi dosya degismez."""
+    """Metni atomik yazar (paylasilan `util.atomic_write_bytes` yolu).
+
+    Gecici dosya hedef dizinde `.ferdim-` onekiyle BENZERSIZ acilir (mevcut
+    bir adi/sembolik bagi asla izlemez), fsync + 0644, sonra os.replace
+    hedefin uzerine koyar, dizin de fsync edilir. replace bagin KENDISINI
+    degistirir: onceden kurulmus bir bag varsa gosterdigi dosya degismez.
+    """
     p = Path(path)
-    data = text.encode("utf-8")
-    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=TMP_PREFIX)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fchmod(f.fileno(), 0o644)
-            os.fsync(f.fileno())
-        os.replace(tmp, p)
-        fsync_dir(p.parent)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    util.atomic_write_bytes(p, text.encode("utf-8"), mode=0o644,
+                            prefix=TMP_PREFIX)
     return p
 
 

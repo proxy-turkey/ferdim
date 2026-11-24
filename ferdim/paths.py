@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 
 from . import DEFAULT_USER_AGENT
+from . import util
 
 # config.json'a es zamanli kayitlar (daemon + API) birbirini ezmesin
 _CONFIG_LOCK = threading.Lock()
@@ -221,34 +222,13 @@ class AppEnv:
 
     def save_config(self, cfg: dict) -> None:
         """Atomik + 0600 yazim: config.json kimlik bilgisi tasiyabilir ve
-        umask ne olursa olsun yalniz kullaniciya acik kalmali. Gecici dosya
-        O_EXCL ile acilir; yarim kalan eski gecici temizlenir. Bicim insan
-        tarafindan okunabilir kalir (indent=2). Dosya ve dizin fsync edilir:
-        guc kesintisi yarim/eski config birakmaz."""
+        umask ne olursa olsun yalniz kullaniciya acik kalmali. Paylasilan
+        `util.atomic_write_bytes` kullanilir: benzersiz gecici ad (sabit
+        '.tmp' yok), dosya + dizin fsync. Bicim insan tarafindan okunabilir
+        kalir (indent=2)."""
         out = dict(cfg)
         out.setdefault("version", CONFIG_VERSION)
-        data = json.dumps(out, indent=2, ensure_ascii=False)
-        with _CONFIG_LOCK:
+        data = json.dumps(out, indent=2, ensure_ascii=False).encode("utf-8")
+        with _CONFIG_LOCK:      # surec ici yazarlar sirayla (surecler arasi: benzersiz tmp)
             self.config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            tmp = self.config_path.with_suffix(self.config_path.suffix + ".tmp")
-            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-            try:
-                fd = os.open(tmp, flags, 0o600)
-            except FileExistsError:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                fd = os.open(tmp, flags, 0o600)
-            try:
-                os.fchmod(fd, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    fd = -1
-                    f.write(data)
-                    f.flush()
-                    os.fsync(f.fileno())
-            finally:
-                if fd >= 0:
-                    os.close(fd)
-            os.replace(tmp, self.config_path)
-            fsync_dir(self.config_dir)
+            util.atomic_write_bytes(self.config_path, data, mode=0o600)
