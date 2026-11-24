@@ -17,6 +17,7 @@ DEFAULTS = {
     "retries": 5,
     "user_agent": DEFAULT_USER_AGENT,
     "verify_tls": True,
+    "http3": "off",                # HTTP/3: off | auto | force (aioquic eklentisi)
     "schedule": {"enabled": False, "start": "02:00", "stop": "08:00"},
     "clipboard_watch": False,
     "clipboard_min_size": 5_000_000,

@@ -88,6 +88,8 @@ def _sanitize_config(cfg: dict, env=None) -> None:
         cfg["watch_interval"] = 3
     if cfg.get("watch_done") not in ("delete", "rename", "keep"):
         cfg["watch_done"] = "delete"
+    if cfg.get("http3") not in ("off", "auto", "force"):
+        cfg["http3"] = "off"
     # "learn_hosts": elle duzenlenen config.json'da metin de olabilir
     lh = cfg.get("learn_hosts", True)
     cfg["learn_hosts"] = lh if isinstance(lh, bool) else \
