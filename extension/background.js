@@ -154,6 +154,84 @@ function looksMedia(u, mime) {
   return false;
 }
 
+/* ---------------------------------------------------- site ve cerez kapsami */
+/* PSL yok (stdlib/DOM): kayitli alan adi yerine son iki etiket karsilastirilir.
+ * "a.example.com" ile "b.example.com" ayni site sayilir; "co.uk" gibi cok
+ * etiketli public suffix'lerde fazla eslesme kabul edilir. IP ve tek etiketli
+ * host'larda tam eslesme istenir. */
+function hostOf(u) {
+  try { return new URL(u).hostname.toLowerCase(); } catch (e) { return ""; }
+}
+function isIpHost(h) {
+  return h.startsWith("[") || h.includes(":") ||
+         /^\d{1,3}(\.\d{1,3}){3}$/.test(h);
+}
+function siteOf(u) {
+  const h = hostOf(u);
+  if (!h || isIpHost(h)) return h;
+  const labels = h.split(".");
+  return labels.length <= 2 ? h : labels.slice(-2).join(".");
+}
+function sameSite(a, b) {
+  const sa = siteOf(a);
+  return !!sa && sa === siteOf(b);
+}
+/* Birinci taraf alani (FPI) baglamin host'uyla eslesiyor mu. */
+function fpdMatches(fpd, ctxUrl) {
+  const h = hostOf(ctxUrl);
+  const f = String(fpd || "").toLowerCase();
+  if (!h || !f) return false;
+  return h === f || h.endsWith("." + f) || f.endsWith("." + h);
+}
+/* partitionKey.topLevelSite semali bir sitedir (https://example.com). */
+function topLevelSite(u) {
+  try {
+    const p = new URL(u);
+    if (p.protocol !== "https:" && p.protocol !== "http:") return "";
+    const s = siteOf(u);
+    return s ? p.protocol + "//" + s : "";
+  } catch (e) { return ""; }
+}
+
+/* Cerezler: ayni site indirmede tam, siteler arasi indirmede yalnizca
+ * SameSite=None. Boylece kotu niyetli bir sayfanin baslattigi capraz site
+ * indirme baska sitenin oturum cerezlerini FerDim'e tasimaz (GET CSRF).
+ * Bolumlu (CHIPS) cerezler yalnizca sekmenin ust duzey sitesiyle sinirli
+ * sorguyla ve yalnizca ayni site baglaminda eklenir. */
+async function collectCookies(url, ctxUrl) {
+  const same = sameSite(url, ctxUrl);
+  const seen = new Set();
+  const parts = [];
+  const add = (list) => {
+    for (const c of list || []) {
+      if (!c || !c.name) continue;
+      if (!same && c.sameSite !== "no_restriction") continue;
+      // FPI acik: baska bir birinci taraf baglaminin cerezleri gitmez
+      if (c.firstPartyDomain && !fpdMatches(c.firstPartyDomain, ctxUrl)) {
+        continue;
+      }
+      // Ayni cerez iki sorgudan da gelebilir: birebir tekrari at
+      const key = c.name + "=" + c.value;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      parts.push(key);
+    }
+  };
+  if (same) {
+    const tls = topLevelSite(ctxUrl);
+    if (tls) {
+      try {
+        add(await browser.cookies.getAll(
+          { url, partitionKey: { topLevelSite: tls } }));
+      } catch (e) { /* partitionKey desteklenmiyor */ }
+    }
+  }
+  try {
+    add(await browser.cookies.getAll({ url }));
+  } catch (e) { return ""; }  // cookies izni yok
+  return parts.join("; ");
+}
+
 /* ------------------------------------------------------- indirme yakalama */
 async function onDownloadCreated(item) {
   await ready;
@@ -178,16 +256,23 @@ async function onDownloadCreated(item) {
     await browser.downloads.erase({ id: item.id });
   } catch (e) { /* zaten bitti */ }
 
-  let referer = item.referrer || "";
-  if (!referer) {
-    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
-    referer = tabs[0] && tabs[0].url && /^https?:/.test(tabs[0].url) ? tabs[0].url : "";
-  }
+  // Baglam: indirmeyi baslatan sayfa. Cerez kapsami da buradan gelir.
+  const ctx = item.referrer || await activeTabUrl();
   await handoff(url, {
     filename: item.filename ? item.filename.split(/[\\/]/).pop() : nameFromUrl(url),
-    referer: opts.sendReferer ? referer : "",
+    referer: opts.sendReferer ? ctx : "",
+    ctx,
     mime,
   });
+}
+
+/* Cerez baglami icin: indirmeyi baslatan sekmenin adresi. */
+async function activeTabUrl() {
+  try {
+    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+    const u = tabs && tabs[0] && tabs[0].url;
+    return u && /^https?:/.test(u) ? u : "";
+  } catch (e) { return ""; }
 }
 
 async function handoff(url, extra = {}) {
@@ -200,10 +285,9 @@ async function handoff(url, extra = {}) {
     segments: opts.segments,
   };
   if (opts.sendCookies && /^https?:/i.test(url)) {
-    try {
-      const cs = await browser.cookies.getAll({ url });
-      if (cs.length) msg.cookies = cs.map((c) => c.name + "=" + c.value).join("; ");
-    } catch (e) { /* cookies izni yok */ }
+    const ctx = extra.ctx || extra.referer || await activeTabUrl();
+    const cookies = await collectCookies(url, ctx);
+    if (cookies) msg.cookies = cookies;
   }
   try {
     const r = await sendNative(msg);
@@ -385,9 +469,27 @@ async function grabTab(tabId, selectionOnly) {
 }
 
 /* -------------------------------------------------------- mesajlasma (UI) */
+/* Guven: eklentinin kendi sayfalari (popup, secenekler) tam yetkilidir:
+ * sender.id bizim ve sender.tab yok. Icerik betikleri (sender.tab dolu)
+ * yalnizca kendi sekmeleri icin panel acabilir; sayfadaki bir betik
+ * grab/download/turbo isteyemez. */
+function trustedSender(sender) {
+  return !!sender && sender.id === browser.runtime.id && !sender.tab;
+}
+function ownTabSender(sender) {
+  return !!sender && sender.id === browser.runtime.id && !!sender.tab;
+}
+
 browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     await ready;
+    if (!msg) return sendResponse({ ok: false });
+    if (msg.openPanel) {
+      if (!ownTabSender(sender)) return sendResponse({ ok: false });
+      pageButton.show(sender.tab.id).catch(() => {});
+      return sendResponse({ ok: true });
+    }
+    if (!trustedSender(sender)) return sendResponse({ ok: false });
     if (msg.getMedia) {
       await mediaReady();
       await pingHost();   // popup acildi: ana makine durumunu tazele
@@ -424,10 +526,6 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
     }
     if (msg.getTurbo) return sendResponse({ ok: true, turbo: hostTurbo });
-    if (msg.openPanel && sender.tab) {
-      pageButton.show(sender.tab.id).catch(() => {});
-      return sendResponse({ ok: true });
-    }
     sendResponse({ ok: false });
   })();
   return true; // async yanit

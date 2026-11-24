@@ -41,11 +41,16 @@ const sniffSrc = fs.readFileSync(process.argv[3], "utf8");
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
+const EXT_ID = "ferdim@test";
+const POPUP_SENDER = () => ({ id: EXT_ID, url: "moz-extension://test/popup.html" });
+const TAB_SENDER = (tabId) => ({ id: EXT_ID, tab: { id: tabId } });
+
 /* Sahte tarayici: yalnizca background.js'in kullandigi yuzey. */
 function makeEnv(o) {
   o = o || {};
   const log = { scripting: [], executeScript: [], created: [], removed: 0,
-                sessionSet: [], localSet: [] };
+                sessionSet: [], localSet: [], native: [], cookieQueries: [],
+                pageShows: [] };
   const listeners = {};
   const on = (name) => ({
     addListener: (fn) => { (listeners[name] = listeners[name] || []).push(fn); },
@@ -71,7 +76,12 @@ function makeEnv(o) {
       onChanged: on("storageChanged"),
     },
     runtime: {
-      sendNativeMessage: async () => ({ ok: true, port: 8378, turbo: false }),
+      id: EXT_ID,
+      /* sendNativeMessage(uygulama, mesaj): ikinci arguman yuk. */
+      sendNativeMessage: async (app, msg) => {
+        log.native.push(JSON.parse(JSON.stringify(msg || {})));
+        return { ok: true, port: 8378, turbo: false };
+      },
       getURL: (p) => "moz-extension://test/" + p,
       getManifest: () => ({ version: "0.0.0" }),
       onMessage: on("message"),
@@ -82,7 +92,10 @@ function makeEnv(o) {
       setBadgeText: async () => {},
       setBadgeBackgroundColor: async () => {},
     },
-    pageAction: { show: async () => {}, hide: async () => {} },
+    pageAction: {
+      show: async (tabId) => { log.pageShows.push(tabId); },
+      hide: async () => {},
+    },
     contextMenus: {
       removeAll: async () => { log.removed += 1; liveMenus.clear(); },
       create: (d) => {
@@ -107,7 +120,19 @@ function makeEnv(o) {
       erase: async () => {},
     },
     webRequest: { onHeadersReceived: on("headers") },
-    cookies: { getAll: async () => [] },
+    /* partitionKey'siz sorgu bolumlenmemis cerezleri doner; partitionKey'li
+     * sorgu yalnizca o ust duzey siteye ait bolumlu cerezleri (Firefox
+     * davranisi: ikisi ayri sorulur). */
+    cookies: {
+      getAll: async (details) => {
+        log.cookieQueries.push(JSON.parse(JSON.stringify(details)));
+        const all = o.cookies || [];
+        const want = details.partitionKey;
+        return all.filter((c) => want
+          ? !!c.partitionKey && c.partitionKey.topLevelSite === want.topLevelSite
+          : !c.partitionKey);
+      },
+    },
     notifications: { create: () => {} },
   };
   if (o.scripting !== false) {
@@ -140,12 +165,12 @@ function makeEnv(o) {
   return { log: log, listeners: listeners, fire: fire };
 }
 
-const sendMessage = (env, msg) => new Promise((resolve, reject) => {
+const sendMessage = (env, msg, sender) => new Promise((resolve, reject) => {
   const timer = setTimeout(() => reject(new Error("sendResponse yok")), 5000);
   const sendResponse = (r) => { clearTimeout(timer); resolve(r); };
   try {
     for (const fn of env.listeners.message || []) {
-      fn(msg, { tab: { id: 1 } }, sendResponse);
+      fn(msg, sender || POPUP_SENDER(), sendResponse);
     }
   } catch (e) { clearTimeout(timer); reject(e); }
 });
@@ -271,6 +296,86 @@ const sendMessage = (env, msg) => new Promise((resolve, reject) => {
       },
     });
     out.extract = vm.runInContext("(" + source + ")", page)(false);
+  }
+
+  /* cerezler: ayni site indirme tam cerez tasir; bolumlu cerez sekmenin
+   * ust duzey sitesiyle sinirli sorgudan gelir */
+  {
+    const env = makeEnv({ cookies: [
+      { name: "sid", value: "S1", domain: "files.example.com",
+        sameSite: "strict", firstPartyDomain: "" },
+      { name: "part", value: "P1", domain: "files.example.com",
+        sameSite: "lax", firstPartyDomain: "",
+        partitionKey: { topLevelSite: "https://example.com" } },
+    ] });
+    await env.fire("downloadCreated", {
+      id: 1, state: "in_progress",
+      url: "https://files.example.com/f/big.zip",
+      referrer: "https://www.example.com/page",
+      filename: "/home/u/Downloads/big.zip", mime: "application/zip",
+    });
+    out.sameSiteCookies = {
+      cookies: (env.log.native.filter((m) => m.cmd === "download")[0] || {})
+        .cookies,
+      queries: env.log.cookieQueries,
+    };
+  }
+
+  /* cerezler: kotu niyetli sayfanin baslattigi capraz site indirme yalnizca
+   * SameSite=None cerezleri tasir, baska bir birinci taraf baglaminin (FPI)
+   * cerezleri hic eklenmez */
+  {
+    const env = makeEnv({ cookies: [
+      { name: "sid", value: "SECRET", sameSite: "strict", firstPartyDomain: "" },
+      { name: "lax", value: "LAX", sameSite: "lax", firstPartyDomain: "" },
+      { name: "none", value: "N1", sameSite: "no_restriction",
+        firstPartyDomain: "" },
+      { name: "fpiOther", value: "X", sameSite: "no_restriction",
+        firstPartyDomain: "other.example" },
+      { name: "fpiOk", value: "OK", sameSite: "no_restriction",
+        firstPartyDomain: "evil.test" },
+    ] });
+    await env.fire("downloadCreated", {
+      id: 2, state: "in_progress",
+      url: "https://victim.example/f/invoice.pdf",
+      referrer: "https://evil.test/hostile",
+      mime: "application/pdf",
+    });
+    out.crossSiteCookies = {
+      cookies: (env.log.native.filter((m) => m.cmd === "download")[0] || {})
+        .cookies,
+      queries: env.log.cookieQueries,
+    };
+  }
+
+  /* mesaj guveni: icerik betigi (sender.tab dolu) ve yabanci eklenti
+   * grab/download/turbo isteyemez; popup isteyebilir; panel yalnizca kendi
+   * sekmesi icin acilir */
+  {
+    const env = makeEnv({ scriptingResult: [{ url: "https://x.example/a.zip" }] });
+    out.senders = {
+      contentGrab: await sendMessage(env, { grab: true, tabId: 7 },
+                                     TAB_SENDER(3)),
+      contentDownload: await sendMessage(
+        env, { download: true, url: "https://victim.example/x" }, TAB_SENDER(3)),
+      contentTurbo: await sendMessage(env, { turbo: true }, TAB_SENDER(3)),
+      contentGetMedia: await sendMessage(env, { getMedia: true, tabId: 7 },
+                                         TAB_SENDER(3)),
+      foreignGrab: await sendMessage(env, { grab: true, tabId: 7 },
+                                     { id: "other@ext" }),
+      foreignPanel: await sendMessage(env, { openPanel: true },
+                                      { id: "other@ext", tab: { id: 3 } }),
+      popupGrab: await sendMessage(env, { grab: true, tabId: 7 }),
+      popupTurbo: await sendMessage(env, { turbo: true }),
+      popupDownload: await sendMessage(
+        env, { download: true, url: "https://page.example/a.zip" }),
+      contentPanel: await sendMessage(env, { openPanel: true }, TAB_SENDER(3)),
+      scriptingTabs: env.log.scripting.map((c) => c.tabId),
+      downloads: env.log.native.filter((m) => m.cmd === "download")
+        .map((m) => m.url),
+      turbos: env.log.native.filter((m) => m.cmd === "turbo").length,
+      pageShows: env.log.pageShows,
+    };
   }
 
   process.stdout.write(JSON.stringify(out));
@@ -457,6 +562,53 @@ class BackgroundBehaviorTests(unittest.TestCase):
     def test_injected_extractor_is_self_contained(self):
         self.assertEqual(self.out["extract"],
                          [{"url": "https://cdn.example/a.zip", "text": "A"}])
+
+    def test_same_site_download_carries_cookies(self):
+        """Ayni site indirme cerezleri korur; bolumlu cerez sekmenin ust
+        duzey sitesiyle sinirli sorgudan, digerleri bolumlenmemis sorgudan."""
+        s = self.out["sameSiteCookies"]
+        self.assertEqual(s["cookies"], "part=P1; sid=S1", s)
+        self.assertEqual(len(s["queries"]), 2, s)
+        self.assertEqual(s["queries"][0]["partitionKey"],
+                         {"topLevelSite": "https://example.com"})
+        self.assertNotIn("partitionKey", s["queries"][1])
+        self.assertEqual(
+            s["queries"][1]["url"], "https://files.example.com/f/big.zip")
+
+    def test_cross_site_download_only_sends_samesite_none(self):
+        """Capraz site indirmede Strict/Lax cerez yok: kotu niyetli sayfa
+        baska sitenin oturumuyla GET yaptiramaz."""
+        c = self.out["crossSiteCookies"]
+        self.assertEqual(c["cookies"], "none=N1; fpiOk=OK", c)
+        # bolumlu sorgu yok: bolum anahtari sekmenin sitesi, hedef baska site
+        self.assertEqual(c["queries"],
+                         [{"url": "https://victim.example/f/invoice.pdf"}])
+
+    def test_content_script_sender_cannot_act(self):
+        s = self.out["senders"]
+        self.assertFalse(s["contentGrab"]["ok"])
+        self.assertFalse(s["contentDownload"]["ok"])
+        self.assertFalse(s["contentTurbo"]["ok"])
+        self.assertFalse(s["contentGetMedia"]["ok"])
+        # grab enjeksiyonu yalnizca popup isteginde calisti
+        self.assertEqual(s["scriptingTabs"], [7])
+        # indirme ve turbo yalnizca popup isteklerinden gitti
+        self.assertEqual(s["downloads"], ["https://page.example/a.zip"])
+        self.assertEqual(s["turbos"], 1)
+
+    def test_popup_sender_can_act(self):
+        s = self.out["senders"]
+        self.assertTrue(s["popupGrab"]["ok"])
+        self.assertEqual(s["popupGrab"]["links"],
+                         [{"url": "https://x.example/a.zip"}])
+        self.assertTrue(s["popupTurbo"]["ok"])
+        self.assertTrue(s["popupDownload"]["ok"])
+
+    def test_overlay_panel_only_own_tab(self):
+        s = self.out["senders"]
+        self.assertTrue(s["contentPanel"]["ok"])
+        self.assertFalse(s["foreignPanel"]["ok"])
+        self.assertEqual(s["pageShows"], [3])
 
 
 class LocaleParityTests(unittest.TestCase):
