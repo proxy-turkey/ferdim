@@ -284,6 +284,9 @@ class DownloadJob:
         # --- akilli guclendirici: hedef = hat VEYA sunucu tavani ---
         self._seg_max = self._allowed       # kesif ust siniri
         self._server_floor = 1              # sunucu cezasi tabani
+        # birlikte yasam tavani (kuyruk kurar): hat mesgulken baglanti
+        # sayisi bunu asamaz; None = tavan yok (varsayilan)
+        self._ext_cap: int | None = None
         self._last_limit_ts = 0.0
         self._gov = {
             "ema": 0.0, "best": 0.0, "best_workers": self._allowed,
@@ -623,7 +626,7 @@ class DownloadJob:
             # sunucunun kabul ettigi isci sayisini hatirla
             if resume_meta.get("allowed"):
                 self._allowed = max(1, min(int(resume_meta["allowed"]),
-                                           self._allowed))
+                                           self._ceiling_locked()))
                 self.extra["adaptive"] = self._allowed
         else:
             self._fresh_start(p)
@@ -742,9 +745,42 @@ class DownloadJob:
     def _pending_bytes_locked(self) -> int:
         return sum(e - s + 1 for s, e in self._pending)
 
+    def _ceiling_locked(self) -> int:
+        """Baglanti tavani: sunucu tavani ile dis (birlikte yasam)
+        tavaninin kucugu. Dis tavan yoksa yalniz sunucu tavani."""
+        if self._ext_cap is None:
+            return self._seg_max
+        return max(1, min(self._seg_max, self._ext_cap))
+
+    def set_external_cap(self, cap: int | None) -> None:
+        """Kuyrugun kurdugu dis tavan (birlikte yasam modu).
+
+        Hat mesgulken baglanti sayisi bu siniri asamaz: governor tavani
+        asla yoklamaz. Tavan kalkinca (None) kesif hemen yeniden baslar;
+        varsayilan azami guc davranisi degismez.
+        """
+        with self._cond:
+            new = None if cap is None else max(1, int(cap))
+            if new == self._ext_cap:
+                return
+            self._ext_cap = new
+            if new is None:
+                if self.extra.get("adaptive_reason") == "coexist":
+                    self.extra.pop("adaptive_reason", None)
+                self._gov["next_up"] = time.monotonic()
+                self._gov["cooldown"] = 0.0
+                self._cond.notify_all()
+                return
+            if self._allowed > new:
+                self._allowed = self._ceiling_locked()
+                self._gov["probe"] = False       # yarim kesif iptal
+                self.extra["adaptive"] = self._allowed
+                self.extra["adaptive_reason"] = "coexist"
+                self._cond.notify_all()
+
     def _set_allowed(self, n: int) -> None:
         with self._cond:
-            n = max(1, min(int(n), self._seg_max))
+            n = max(1, min(int(n), self._ceiling_locked()))
             if n != self._allowed:
                 self._allowed = n
                 if n < self._seg_max:
@@ -822,7 +858,7 @@ class DownloadJob:
                 return
             limit_free = (now - self._last_limit_ts) > 60.0
             allowed = self._allowed
-            if allowed < self._seg_max and limit_free and (
+            if allowed < self._ceiling_locked() and limit_free and (
                     ema < g["best"] * 0.8 or now >= g["next_up"]):
                 self._start_probe(+1, ema, now)
             elif (ema >= g["best"] * 0.9
@@ -1150,7 +1186,7 @@ class DownloadJob:
         if not prof:
             return
         try:
-            links = min(int(prof.get("links") or 0), self._seg_max)
+            links = min(int(prof.get("links") or 0), self._ceiling_locked())
         except (TypeError, ValueError):
             return
         if links < 1:

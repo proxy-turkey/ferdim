@@ -385,6 +385,14 @@ function renderStatus() {
                    : tr("turbo_title");
   $("#turboBar").hidden = !turbo;
 
+  // birlikte yasam: yalniz acikken gorunur; hat mesgulse tavan uygulanir
+  const co = lastStats.coexist || {};
+  const cs = $("#coexistState");
+  cs.textContent = co.enabled
+    ? "⇄ " + tr(co.active ? "coexist_active" : "coexist_on") : "";
+  cs.className = "conn " + (co.active ? "ok" : "dim");
+  cs.title = tr("coexist_hint");
+
   // hiz limiti secimi o an uygulanan limiti gosterir (CLI'dan degismis olsa
   // bile); sabit seceneklerde olmayan deger ozel secenekle gosterilir
   const sel = $("#limitSel"), lim = Number(lastStats.speed_limit || 0);
@@ -747,6 +755,7 @@ $("#settingsBtn").onclick = async () => {
   $("#setWatchDirs").value = (cfg.watch_dirs || []).join("\n");
   $("#setWatchDone").value = cfg.watch_done || "delete";
   $("#setSidecar").checked = !!cfg.checksum_sidecar;
+  $("#setCoexist").checked = !!cfg.coexist;
   $("#setRetries").value = cfg.retries ?? 5;
   $("#setTimeout").value = cfg.timeout ?? 30;
   $("#setStall").value = cfg.stall_timeout ?? 20;
@@ -775,6 +784,7 @@ $("#setSave").onclick = async () => {
       .map((s) => s.trim()).filter(Boolean),
     watch_done: $("#setWatchDone").value,
     checksum_sidecar: $("#setSidecar").checked,
+    coexist: $("#setCoexist").checked,
     retries: num("#setRetries", 0, 20, cfg.retries ?? 5),
     timeout: num("#setTimeout", 5, 300, cfg.timeout ?? 30),
     stall_timeout: num("#setStall", 5, 120, cfg.stall_timeout ?? 20),

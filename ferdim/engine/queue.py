@@ -5,6 +5,7 @@ import threading
 import time
 
 from .. import util
+from ..coexist import DEFAULT_THRESHOLD, LineMonitor
 from ..history import STATES as HISTORY_STATES, open_history
 from ..paths import AppEnv
 from .job import DownloadJob, JobSpec, JobState
@@ -32,6 +33,10 @@ class QueueManager:
         self._load()
         self._running = True
         self._size_probed: set[str] = set()
+        # birlikte yasam (varsayilan kapali): hat izleyici yalniz acikken
+        # ornekler; 'coexist_on' gecisi tavani birakmak icin tutulur
+        self.coexist = LineMonitor()
+        self._coexist_on = False
         self._prober = threading.Thread(target=self._prober_loop, daemon=True)
         self._prober.start()
         self._ticker = threading.Thread(target=self._tick_loop, daemon=True)
@@ -202,11 +207,59 @@ class QueueManager:
                     started = True
         for j in self.jobs:
             j.update_speed()
+        self._coexist_tick(running)
         # durum degisimlerini kalici kaydet (biten/iptal edilen isler)
         sig = [(j.id, j.state) for j in self.jobs]
         if sig != getattr(self, "_last_sig", None):
             self._last_sig = sig
             self._save()
+
+    # ------------------------------------------------------- birlikte yasam
+    def _coexist_tick(self, running=None):
+        """Opt-in birlikte yasam: hat mesgulse baglanti sayisini yarilar,
+        sessizlesince tavani birakir. Kapaliyken hat hic okunmaz; varsayilan
+        azami guc davranisi aynen surer."""
+        if not bool(self.cfg.get("coexist")):
+            if self._coexist_on:            # kapanma gecisi: tavani birak
+                self._coexist_on = False
+                self.coexist.reset()
+                self._apply_coexist_cap(False)
+            return
+        try:
+            self.coexist.threshold = max(
+                0.02, min(0.9, float(self.cfg.get("coexist_threshold",
+                                                  DEFAULT_THRESHOLD))))
+        except (TypeError, ValueError):
+            self.coexist.threshold = DEFAULT_THRESHOLD
+        self._coexist_on = True
+        if running is None:
+            with self._lock:
+                running = [j for j in self.jobs if j.state in STATES_RUNNING]
+        # kendi hizimizi duseriz: yalniz YABANCI (etkilesimli) trafik kalir
+        own = sum(max(0.0, j.speed) for j in running)
+        self.coexist.sample(own)
+        self._apply_coexist_cap(self.coexist.active)
+
+    def _apply_coexist_cap(self, active: bool) -> None:
+        """Basinc aktifken her is baglantilarinin yarisini birakir (en az 1
+        kalir); basinc gecince tavan kalkar, governor yukari yoklar."""
+        with self._lock:
+            jobs = list(self.jobs)
+        for j in jobs:
+            if j.state not in STATES_RUNNING and j.state != JobState.QUEUED:
+                continue
+            j.set_external_cap(max(1, j._seg_max // 2) if active else None)
+
+    def coexist_status(self) -> dict:
+        """stats/CLI icin: mod acik mi, basinc ne, tavan uygulaniyor mu."""
+        m = self.coexist
+        enabled = bool(self.cfg.get("coexist"))
+        return {
+            "enabled": enabled,
+            "pressure": round(float(m.pressure), 3),
+            "active": bool(enabled and m.active),
+            "threshold": float(m.threshold),
+        }
 
     def set_speed_limit(self, bytes_per_sec: int):
         self.cfg["speed_limit"] = int(bytes_per_sec)
@@ -353,6 +406,7 @@ class QueueManager:
             "schedule_active": self._schedule_active(),
             "nm_connected": (time.time() - self.last_nm_ping) < 120,
             "turbo": bool(self.cfg.get("turbo_mode")),
+            "coexist": self.coexist_status(),
             "language": self.cfg.get("language", "auto"),
             "version": _version(),
         }

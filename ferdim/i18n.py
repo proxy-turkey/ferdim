@@ -43,6 +43,20 @@ S = {
         "tr": "sunucu limiti → {n} bağlantı",
         "es": "límite del servidor → {n} conexiones",
         "ru": "лимит сервера → {n} соединений"},
+    # --------------------------------------------------------- birlikte yasam
+    "coexist":       {"en": "Coexistence", "tr": "Birlikte yaşam", "es": "Convivencia", "ru": "Совместный режим"},
+    "coexist_on":    {"en": "on", "tr": "açık", "es": "activado", "ru": "вкл"},
+    "coexist_off":   {"en": "off", "tr": "kapalı", "es": "desactivado", "ru": "выкл"},
+    "coexist_active": {
+        "en": "line busy — links reduced",
+        "tr": "hat meşgul — bağlantı azaltıldı",
+        "es": "línea ocupada — conexiones reducidas",
+        "ru": "канал занят — соединений меньше"},
+    "coexist_hint": {
+        "en": "Sheds connections while other traffic is seen on the line and rebuilds them once it goes quiet. Maximum power stays the default.",
+        "tr": "Hatta başka trafik görülünce bağlantıları azaltır, trafik susunca yeniden kurar. Varsayılan yine azami güçtür.",
+        "es": "Reduce las conexiones cuando se ve otro tráfico en la línea y las restaura al quedar en silencio. La potencia máxima sigue siendo lo predeterminado.",
+        "ru": "Снижает число соединений при чужом трафике в канале и восстанавливает их после затишья. По умолчанию по-прежнему максимальная мощность."},
     # ----------------------------------------------------------- baglanti durumu
     "daemon_ok":     {"en": "daemon connected", "tr": "daemon bağlı", "es": "demonio conectado", "ru": "демон подключён"},
     "daemon_down":   {"en": "daemon offline", "tr": "daemon kapalı", "es": "demonio desconectado", "ru": "демон отключён"},
@@ -104,6 +118,7 @@ S = {
     "lbl_sched_start": {"en": "Start time (night mode)", "tr": "Başlangıç saati (gece modu)", "es": "Hora de inicio (modo noche)", "ru": "Время начала (ночной режим)"},
     "lbl_sched_stop": {"en": "End time", "tr": "Bitiş saati", "es": "Hora de fin", "ru": "Время окончания"},
     "lbl_sched_only": {"en": "Download only in schedule window", "tr": "Sadece zamanlama penceresinde indir", "es": "Descargar solo en la ventana de horario", "ru": "Скачивать только в окне расписания"},
+    "lbl_coexist":   {"en": "Shed connections while the line is busy (coexistence)", "tr": "Hat meşgulken bağlantı azalt (birlikte yaşam)", "es": "Reducir conexiones cuando la línea esté ocupada (convivencia)", "ru": "Уменьшать соединения, когда канал занят (совместный режим)"},
     "lbl_lang":      {"en": "Language / Dil", "tr": "Dil", "es": "Idioma", "ru": "Язык"},
     "lbl_speed":     {"en": "Speed limit", "tr": "Hız limiti", "es": "Límite de velocidad", "ru": "Лимит скорости"},
     "btn_save":      {"en": "Save", "tr": "Kaydet", "es": "Guardar", "ru": "Сохранить"},

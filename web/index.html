@@ -112,6 +112,7 @@
 
 <footer>
   <span id="schedState"></span>
+  <span id="coexistState"></span>
   <span id="notice" class="notice" role="status" hidden></span>
   <span class="dim" id="dirLabel"></span>
 </footer>
@@ -169,6 +170,7 @@
         <option value="rename" data-i18n="watch_rename">.done olarak yeniden adlandır</option>
       </select></label>
     <label class="chk"><input type="checkbox" id="setSidecar"> <span data-i18n="lbl_sidecar">Sağlamaları otomatik doğrula (.sha256 / .md5 yan dosyaları)</span></label>
+    <label class="chk"><input type="checkbox" id="setCoexist"> <span data-i18n="lbl_coexist">Hat meşgulken bağlantı azalt (birlikte yaşam)</span></label>
     <label><span data-i18n="hist_days">Geçmiş saklama (gün; 0 = sınırsız)</span> <input id="setHistDays" type="number" min="0" max="3650"></label>
     <details class="adv">
       <summary data-i18n="lbl_advanced">Gelişmiş</summary>

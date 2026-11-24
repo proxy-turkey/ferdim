@@ -88,12 +88,24 @@ sınır ile turbo durumu asla çelişmez.
 Maksimum güç varsayılanlarını açar veya kapatır (32 bağlantı, sınırsız
 hız, 8 eşzamanlı iş).
 .TP
+.BI coexist " on|off|status"
+İsteğe bağlı birlikte yaşam modu; varsayılan kapalıdır, yani varsayılan
+davranış azami güçtür. Açıkken hat saniyede bir örneklenir
+(\fI/proc/net/dev\fR; loopback ve sanal arayüzler dışarıda bırakılır),
+FerDim'in kendi hızı düşülür ve kalan yabancı trafik bulunur. Bu trafik
+\fIcoexist_threshold\fR değerini (varsayılan \fB0.15\fR, yani gözlenen hat
+kapasitesinin %15'i) birkaç saniye aşarsa her iş bağlantılarının yarısını
+bırakır (en az biri kalır) ve denetleyici yukarı yoklamayı durdurur; on
+saniyelik sessizlikten sonra tavan kalkar ve bağlantılar yeniden kurulur.
+Durum web arayüzünün alt bilgisinde görünür.
+.TP
 .BI config " [\-\-set JSON]"
 Ayarları gösterir ya da değiştirir: parçalar, eşzamanlılık, zamanlayıcı
 penceresi ve kategori başına pencereler (\fIschedule.categories\fR), dil,
 izlenen klasörler (\fIwatch_dirs\fR, \fIwatch_done\fR = delete | rename |
 keep), otomatik yan dosya doğrulaması (\fIchecksum_sidecar\fR), yeniden
-denemeler ve zaman aşımları (\fItimeout\fR, \fIstall_timeout\fR) ve indirme
+denemeler ve zaman aşımları (\fItimeout\fR, \fIstall_timeout\fR), birlikte
+yaşam modu (\fIcoexist\fR, \fIcoexist_threshold\fR) ve indirme
 geçmişinin saklanma süresi (\fIhistory_days\fR, varsayılan 365 gün,
 \fB0\fR sonsuza kadar saklar).
 .TP
