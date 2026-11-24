@@ -34,6 +34,8 @@
     <button type="button" class="btn turbo" id="turboBtn" aria-pressed="false" data-i18n-title="turbo_title" title="Turbo: azami güç">⚡ Turbo</button>
     <button type="button" class="btn primary" id="addBtn" data-i18n="h_new">Yeni İndirme</button>
     <button type="button" class="btn ghost" id="settingsBtn" data-i18n="h_settings">Ayarlar</button>
+    <!-- i18n: hosts_title anahtari eklendiginde data-i18n baglanacak -->
+    <button type="button" class="btn ghost" id="hostsBtn" aria-haspopup="dialog">Ana makineler</button>
   </div>
 </header>
 
@@ -195,6 +197,19 @@
     <button type="button" class="btn ghost" id="zipRepair" data-i18n="zip_repair">Çıkarmayı onar</button>
     <button type="button" class="btn ghost" id="zipClose" data-i18n="btn_close">Kapat</button>
     <button type="button" class="btn primary" id="zipExtract" data-i18n="zip_extract">Seçilenleri çıkar</button>
+  </div>
+</dialog>
+
+<!-- Ogrenilmis ana makine profilleri: satirlar ana makineye gore anahtarlanir,
+     yerinde guncellenir; tum metin textContent ile yazilir. -->
+<dialog id="hostsDlg" aria-labelledby="hostsTitle">
+  <h2 id="hostsTitle">Ana makineler</h2>
+  <div id="hostsList" class="hostlist" role="list" aria-labelledby="hostsTitle"></div>
+  <p id="hostsEmpty" class="dim" data-i18n="hosts_empty">Henüz öğrenilmiş ana makine profili yok.</p>
+  <p id="hostsStatus" class="dim" role="status" aria-live="polite" hidden></p>
+  <div class="dlg-actions">
+    <button type="button" class="btn ghost" id="hostsForgetAll" hidden>Tümünü unut</button>
+    <button type="button" class="btn ghost" id="hostsClose" data-i18n="btn_close">Kapat</button>
   </div>
 </dialog>
 
