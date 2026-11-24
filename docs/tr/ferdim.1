@@ -1,0 +1,139 @@
+.\" -*- coding: UTF-8 -*-
+.TH FERDIM 1 "2026-11-24" "ferdim 1.5.1" "Kullanıcı Komutları"
+.SH AD
+ferdim \- dinamik, kendini ayarlayan indirme yöneticisi
+.SH ÖZET
+.B ferdim
+\fIKOMUT\fR [\fISEÇENEKLER\fR]
+.SH AÇIKLAMA
+\fBFerDim\fR, Linux için parçalı ve kendini ayarlayan bir indirme
+yöneticisidir. Motoru dosya başına 32 paralel bağlantı açar ve ulaşılabilir
+tavan hangisiyse \(em yerel hat ya da uzak sunucu \(em onu doyurmak için
+bağlantı sayısını sürekli kalibre eder. Uyarlanabilir akış medyası (HLS ve
+DASH manifestleri) paralel parçalar hâlinde indirilir, metalink
+(\&.metalink / .meta4) belgeleri sağlama toplamlarıyla birlikte kuyruğa
+alınan yansı kümelerine açılır ve tamamlanmış ZIP arşivleri yerinde
+önizlenebilir. İndirmeler çökme güvenlidir (düzenli üst veri kontrol
+noktaları ve ETag/If-Range doğrulaması kullanan seyrek parça dosyaları),
+sunucu kısıtlamalarına (HTTP 429/503) sorunsuz uyum sağlar ve yeniden
+başlatmalardan sonra kaldığı yerden devam eder. Kaynaklar (asıl URL ve
+yansıları) sağlık puanına sahiptir: iş yükü ölçülen bağlantı başına hıza
+göre dengelenir, başarısız olan, takılan ya da farklı bir dosya sunan
+kaynağın önceliği düşürülür ve yarıda kalan bayt aralığı başka bir
+kaynaktan sürdürülür. URL'nin yanındaki sağlama toplamı yan dosyaları
+(\&.sha256, .md5, .sha512, .sha1) otomatik olarak alınır ve doğrulama, iş
+tamamlandı olarak bildirilmeden önce biter. Bir arka plan servisi Unix
+soketi üzerinden JSON-RPC API'si ve jetonla korunan yerel HTTP API'si
+sunar; ön yüzler bu CLI, bir web arayüzü (http://127.0.0.1:8378) ve bir
+GTK 4 uygulamasıdır. Bir Firefox WebExtension tarayıcı indirmelerini ve
+algıladığı medyayı arka plan servisine devreder.
+.SH KOMUTLAR
+.TP
+.BI add " URL"
+Bir indirmeyi kuyruğa ekler. Seçenekler:
+.B \-o " DOSYA"
+çıktı adı,
+.B \-d " DIZIN"
+hedef dizin,
+.BI \-n " N"
+bağlantı sayısı (1\(en32),
+.BI \-H " \"Başlık: Değer\""
+ek HTTP başlığı (tekrarlanabilir),
+.B \-c " ÇEREZ"
+Cookie başlığı,
+.B \-r " YÖNLENDİREN"
+Referer başlığı,
+.BI \-u / \-p " KULLANICI/PAROLA"
+HTTP Basic kimlik doğrulaması,
+.BI \-\-proxy " URL"
+vekil sunucu (http, https, socks5 veya socks5h; socks5h adları vekil
+sunucuda çözer),
+.BI \-\-mirror " URL"
+aynı dosya için ek yansı (tekrarlanabilir; asıl kaynak ve yansılar ölçülen
+hıza göre harmanlanır, başarısız kaynakların önceliği düşürülür),
+.BI \-\-sha256 " HEX" " / " \-\-md5 " / " \-\-sha1 " / " \-\-sha512
+tamamlanan dosyayı bir özetle doğrular (verilen tüm özetler tek geçişte
+hesaplanır; geçersiz bir değer reddedilir),
+.BI \-\-checksum " ALG:HEX"
+desteklenen herhangi bir özet (sha256, sha512, md5, sha1); özet
+uzunluğundan tek anlamlı olduğunda algoritma atlanabilir,
+.BI \-\-limit " HIZ"
+iş başına hız sınırı (ör. 2MB; KB, MB ve GB 1024 tabanlıdır),
+.B \-k
+TLS doğrulamasını atla,
+.B \-\-wait
+tamamlanana kadar ilerlemeyi izle; yalnızca doğrulama bittikten sonra
+döner.
+.IP
+\fB@\fR ile başlayan bir URL, her satırında bir URL bulunan yerel bir metin
+dosyasını belirtir (yorumlar # ile başlar).
+.TP
+.BI add-file " DOSYA..."
+Bir metin dosyasında listelenen tüm URL'leri ya da yerel bir
+\&.metalink / .meta4 belgesinde tanımlanan tüm dosyaları kuyruğa ekler.
+.TP
+.BI list
+Kuyruğu gösterir.
+.TP
+.BI pause " ID|all" \ ( resume ", " cancel ", " restart ", " remove )
+İşleri denetler; \fBremove \-\-delete\-files\fR yarım kalan verileri de
+siler.
+.TP
+.BI limit " HIZ"
+Genel hız sınırı (\fB0\fR sınırı kaldırır). KB, MB ve GB 1024 tabanlıdır.
+Turbo modu açıkken sınır belirlemek turbo modundan çıkar; böylece uygulanan
+sınır ile turbo durumu asla çelişmez.
+.TP
+.BI turbo " on|off|status"
+Maksimum güç varsayılanlarını açar veya kapatır (32 bağlantı, sınırsız
+hız, 8 eşzamanlı iş).
+.TP
+.BI config " [\-\-set JSON]"
+Ayarları gösterir ya da değiştirir: parçalar, eşzamanlılık, zamanlayıcı
+penceresi ve kategori başına pencereler (\fIschedule.categories\fR), dil,
+izlenen klasörler (\fIwatch_dirs\fR, \fIwatch_done\fR = delete | rename |
+keep), otomatik yan dosya doğrulaması (\fIchecksum_sidecar\fR), yeniden
+denemeler ve zaman aşımları (\fItimeout\fR, \fIstall_timeout\fR) ve indirme
+geçmişinin saklanma süresi (\fIhistory_days\fR, varsayılan 365 gün,
+\fB0\fR sonsuza kadar saklar).
+.TP
+.BI history " [SORGU]"
+Kalıcı iş geçmişini (durum dizinindeki SQLite veritabanı) en yeniden
+eskiye doğru gösterir. \fB\-\-state\fR \fBdone\fR, \fBerror\fR veya
+\fBcanceled\fR durumuna göre süzer; \fB\-\-limit\fR sonuç sayısını
+sınırlar. \fB\-\-stats\fR toplam aktarılan baytı, kayıt sayısını ve sunucu
+başına ortalamaları (bağlantı ve hız) yazdırır. \fB\-\-redownload\fR
+\fIID\fR kayıtlı URL'yi ve seçenekleri yeniden kuyruğa ekler.
+\fB\-\-clear\fR her şeyi siler; \fB\-\-older\-than\fR \fIGÜN\fR ile
+yalnızca o kadar günden eski kayıtlar silinir. Bir URL'ye gömülü parola
+saklanan adreste tutulmaz; yalnızca yeniden indirme için saklanır.
+.TP
+.BI daemon
+RPC/HTTP arka plan servisini ön planda çalıştırır (normalde
+\fBferdim.service\fR systemd kullanıcı birimiyle başlatılır).
+.TP
+.BI web
+Web arayüzünü varsayılan tarayıcıda açar.
+.SH DOSYALAR
+.TP
+.I ~/.local/state/ferdim/
+Soket, jeton, PID, kuyruk durumu, iş üst verisi ve indirme geçmişi
+veritabanı (\fIhistory.db\fR, kip 0600).
+.TP
+.I ~/.config/ferdim/config.json
+Kullanıcı yapılandırması (bkz. \fBferdim config\fR; geçersiz değerler
+başlangıçta varsayılanlarına döndürülür).
+.TP
+İzlenen bir klasöre bırakılan dosyalar otomatik olarak kuyruğa eklenir:
+\&.metalink / .meta4 belgeleri ve her satırında bir URL bulunan .txt /
+\&.urls / .list metin dosyaları. Varsayılan olarak dosya kuyruğa
+eklendikten sonra silinir.
+.TP
+.I ~/.local/share/ferdim/ferdim-extension.zip
+İmzasız Firefox eklenti paketi; bir kez
+.BR web\-ext (1)
+ile imzalayın ya da about:debugging üzerinden geçici olarak yükleyin.
+.SH "AYRICA BAKINIZ"
+Proje belgeleri: https://github.com/proxy-turkey/ferdim
+.SH YAZAR
+Enes Aksu <eaksu@pm.me>
