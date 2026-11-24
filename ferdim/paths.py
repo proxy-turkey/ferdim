@@ -47,6 +47,9 @@ DEFAULTS = {
     # gozlenen kapasitenin bu oranini gecerse) baglanti sayisi yarilanir.
     "coexist": False,
     "coexist_threshold": 0.15,
+    # Kendi baglantilarimizin TTFB sismesi esigi: guncel EMA / taban
+    # (1.2-20). Hat doymadan yavaslamayi yakalar.
+    "coexist_latency": 2.5,
 }
 
 

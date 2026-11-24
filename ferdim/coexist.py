@@ -9,6 +9,11 @@ kapasitesine oranlanir. Oran esigi belirgin sure asarsa 'active' olur,
 daha uzun bir sessizlikten sonra birakilir (histerezis: baglanti sayisi
 titremez).
 
+Ikinci sinyal GECIKME: kendi baglantilarimizin yanit suresi (TTFB) ana
+makine basina izlenir; guncel EMA tabanin (gozlenen en iyi deger)
+`latency_factor` kati kadar ustundeyse hat doymadan da basinc sayilir.
+Yabanci trafik ve gecikme AYNI histerezis pencerelerini paylasir.
+
 Saat ve okuyucu enjekte edilebilir; testler uyumaz (FakeTime tarzi).
 """
 from __future__ import annotations
@@ -26,6 +31,7 @@ DEFAULT_THRESHOLD = 0.15
 DEFAULT_INTERVAL = 1.0
 DEFAULT_ENTER = 3.0
 DEFAULT_LEAVE = 10.0
+DEFAULT_LATENCY = 2.5     # TTFB sismesi esigi: guncel EMA / taban
 
 
 def is_line_iface(name: str) -> bool:
@@ -65,6 +71,61 @@ def read_net_dev() -> int:
         return -1
 
 
+class LatencySignal:
+    """Kendi baglantilarimizin yanit suresi (TTFB): ana makine basina
+    taban + guncel EMA.
+
+    Taban "EMA-min"dir: gozlenen en iyi TTFB, her ornekte binde 2 sisme
+    payi ile (tek bir asiri hizli ornek tabani kilitleyip kalici yanlis
+    alarm uretmesin). Oran 1.0 = normal; 2.0 = yanitlar iki kat yavas.
+    Isin tum kosusu boyunca birikir; ornek yoksa 1.0 (bilinmiyor = basinc
+    yok).
+    """
+
+    ALPHA = 0.3            # guncel EMA agirligi (yeni ornegin payi)
+    DECAY = 1.002          # tabanin ornek basina yumusak sismesi
+    WARM = 3               # taban/guncel icin en az ornek
+    LIMIT = 3600.0         # bundan uzun olcum (saat sicramasi) sayilmaz
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._hosts: dict[str, dict] = {}
+
+    def reset(self) -> None:
+        """Taban sifirlanir (kaynak degisti / is yeniden basladi)."""
+        with self._lock:
+            self._hosts.clear()
+
+    def add(self, host: str, ttfb: float) -> None:
+        """Bir yanit suresi ornegi ekler (gecersiz deger yok sayilir)."""
+        try:
+            ttfb = float(ttfb)
+        except (TypeError, ValueError):
+            return
+        if not 0.0 < ttfb < self.LIMIT:
+            return
+        key = host or ""
+        with self._lock:
+            st = self._hosts.get(key)
+            if st is None:
+                self._hosts[key] = {"n": 1, "base": ttfb, "ema": ttfb}
+                return
+            st["n"] += 1
+            st["ema"] += self.ALPHA * (ttfb - st["ema"])
+            st["base"] = ttfb if ttfb < st["base"] \
+                else min(ttfb, st["base"] * self.DECAY)
+
+    def inflation(self) -> float:
+        """En kotu ana makinenin guncel/taban orani; bilinmiyorsa 1.0."""
+        with self._lock:
+            worst = 1.0
+            for st in self._hosts.values():
+                if st["n"] < self.WARM or st["base"] <= 0:
+                    continue
+                worst = max(worst, st["ema"] / st["base"])
+            return worst
+
+
 class LineMonitor:
     """Yabanci trafik basinci: 0..1 arasi seviye + histerezisli 'active'.
 
@@ -74,13 +135,15 @@ class LineMonitor:
 
     def __init__(self, read=None, clock=None, threshold=DEFAULT_THRESHOLD,
                  interval=DEFAULT_INTERVAL, enter_secs=DEFAULT_ENTER,
-                 leave_secs=DEFAULT_LEAVE):
+                 leave_secs=DEFAULT_LEAVE,
+                 latency_factor=DEFAULT_LATENCY):
         self._read = read or read_net_dev
         self.clock = clock or time.monotonic
         self.threshold = float(threshold)
         self.interval = float(interval)
         self.enter_secs = float(enter_secs)
         self.leave_secs = float(leave_secs)
+        self.latency_factor = float(latency_factor)
         # kuyruk tick'i ve API ayni izleyiciyi cagirabilir
         self._lock = threading.Lock()
         self.reset()
@@ -92,18 +155,28 @@ class LineMonitor:
             self.active = False
             self.capacity = 0.0       # bayt/sn: gozlenen hat kapasitesi
             self.foreign = 0.0        # bayt/sn: bizim disimizdaki trafik
+            self.latency = 1.0        # guncel/taban TTFB orani (1 = normal)
             self._last = None         # son okunan sayac
             self._last_t = None
             self._hot_since = None
             self._quiet_since = None
 
-    def sample(self, own_speed: float = 0.0) -> bool:
-        """Bir ornek alir; guncel 'active' cevabini dondurur."""
-        with self._lock:
-            return self._sample_locked(own_speed)
+    def sample(self, own_speed: float = 0.0, latency: float | None = None) -> bool:
+        """Bir ornek alir; guncel 'active' cevabini dondurur.
 
-    def _sample_locked(self, own_speed: float) -> bool:
+        latency: kendi baglantilarimizin TTFB sismesi (1.0 = normal);
+        verilmezse son deger korunur."""
+        with self._lock:
+            return self._sample_locked(own_speed, latency)
+
+    def _sample_locked(self, own_speed: float,
+                       latency: float | None = None) -> bool:
         now = self.clock()
+        if latency is not None:
+            try:
+                self.latency = max(1.0, float(latency))
+            except (TypeError, ValueError):
+                pass
         total = self._read()
         if total < 0:             # /proc yok/okunamaz: fail-open (azami guc)
             self._fail_open()
@@ -119,12 +192,25 @@ class LineMonitor:
         self.foreign = max(0.0, rate - max(0.0, float(own_speed)))
         # kapasite: %2/sn azalan tepe; taban hat hizinin kendisi
         self.capacity = max(rate, self.capacity * (0.98 ** dt))
-        self.pressure = (min(1.0, self.foreign / self.capacity)
-                         if self.capacity > 0 else 0.0)
-        hot = self.capacity > 0 \
-            and self.foreign > self.threshold * self.capacity
+        foreign_pressure = (min(1.0, self.foreign / self.capacity)
+                            if self.capacity > 0 else 0.0)
+        self.pressure = max(foreign_pressure, self._latency_pressure())
+        hot = (self.capacity > 0
+               and self.foreign > self.threshold * self.capacity) \
+            or self._latency_hot()
         self._update_active(now, hot)
         return self.active
+
+    def _latency_hot(self) -> bool:
+        """TTFB esigi asti mi (kendi baglantilarimiz yavasladi)?"""
+        return self.latency > max(1.01, float(self.latency_factor))
+
+    def _latency_pressure(self) -> float:
+        """Gecikme basinci 0..1: esikte 1.0 (yabanci trafik gibi raporlanir)."""
+        if self.latency <= 1.0:
+            return 0.0
+        span = max(0.01, max(1.01, float(self.latency_factor)) - 1.0)
+        return min(1.0, (self.latency - 1.0) / span)
 
     def _fail_open(self) -> None:
         """Sayac okunamazsa basinc BILINMIYOR demektir: tavan tutulmaz.
@@ -137,6 +223,7 @@ class LineMonitor:
         self.active = False
         self.pressure = 0.0
         self.foreign = 0.0
+        self.latency = 1.0
         self._last = None
         self._last_t = None
         self._hot_since = None
