@@ -77,9 +77,14 @@ def unique_path(directory: Path, name: str) -> Path:
 
 
 def atomic_write_json(path: Path, obj) -> None:
-    """Atomik JSON yazimi. Gecici dosya 0600 ile acilir: is/kuyruk
+    """Atomik + dayanikli JSON yazimi. Gecici dosya 0600 ile acilir: is/kuyruk
     dosyalari kimlik bilgisi tasiyan URL'ler icerebilir, dosya izinleri
-    umask'tan bagimsiz olarak kullaniciya ozel kalsin."""
+    umask'tan bagimsiz olarak kullaniciya ozel kalsin.
+
+    Dosya icerigi os.replace'ten ONCE fsync edilir, sonra dizin fsync edilir:
+    guc kesintisi yarim ya da sifir dolu bir durum dosyasi birakmaz.
+    """
+    from .paths import fsync_dir      # dongusel import: yalniz cagri aninda
     data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     tmp = path.with_suffix(path.suffix + ".tmp")
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
@@ -97,10 +102,13 @@ def atomic_write_json(path: Path, obj) -> None:
         with os.fdopen(fd, "wb") as f:
             fd = -1
             f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
     finally:
         if fd >= 0:
             os.close(fd)
     tmp.replace(path)
+    fsync_dir(path.parent)
 
 
 def read_json(path: Path):
