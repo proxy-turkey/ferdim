@@ -55,7 +55,7 @@ FerDim is a dynamic, self-tuning download manager for Linux:
 %install
 # application payload (arch-independent)
 mkdir -p %{buildroot}%{_datadir}/%{srcname}
-cp -a ferdim web data %{buildroot}%{_datadir}/%{srcname}/
+cp -a ferdim web data gnome-shell-extension %{buildroot}%{_datadir}/%{srcname}/
 find %{buildroot}%{_datadir}/%{srcname} -name '__pycache__' -type d -exec rm -rf {} +
 
 # executables
@@ -113,7 +113,7 @@ python3 -m unittest discover -s tests -v
 
 %files
 %license LICENSE
-%doc README.md CHANGELOG.md
+%doc README.md CHANGELOG.md gnome-shell-extension/INSTALL.md
 %{_bindir}/ferdim
 %{_bindir}/ferdim-nm
 %{_bindir}/ferdim-gui

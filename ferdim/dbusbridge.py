@@ -30,6 +30,38 @@ OBJECT_PATH = "/org/ferdim/Daemon"
 INTERFACE = "org.ferdim.Daemon1"
 XML_FILE = "org.ferdim.Daemon1.xml"
 
+# Dosya kurulu olmasa da kopru calissin: data/ ile ayni arayuz.
+_FALLBACK_XML = """<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node>
+  <interface name="org.ferdim.Daemon1">
+    <method name="Add">
+      <arg type="s" name="url" direction="in"/>
+      <arg type="s" name="id" direction="out"/>
+    </method>
+    <method name="Pause">
+      <arg type="s" name="id" direction="in"/>
+    </method>
+    <method name="Resume">
+      <arg type="s" name="id" direction="in"/>
+    </method>
+    <method name="Cancel">
+      <arg type="s" name="id" direction="in"/>
+    </method>
+    <method name="List">
+      <arg type="s" name="json" direction="out"/>
+    </method>
+    <method name="Stats">
+      <arg type="s" name="json" direction="out"/>
+    </method>
+    <property name="Version" type="s" access="read"/>
+    <signal name="Changed">
+      <arg type="s" name="json"/>
+    </signal>
+  </interface>
+</node>
+"""
+
 
 class BridgeError(Exception):
     pass
@@ -78,8 +110,11 @@ class Bridge:
         return None
 
 
-def introspection_xml() -> str:
-    """Arayuz XML'i: depo 'data/' dizini ya da kurulu standart yollar."""
+def introspection_xml(candidates=None) -> str:
+    """Arayuz XML'i: depo 'data/' dizini ya da kurulu standart yollar.
+
+    Hicbiri yoksa gomulu kopya doner; boylece eksik veri dosyasi
+    yuzunden kopru acilista olmez."""
     here = Path(__file__).resolve().parent
     data_home = Path(os.environ.get("XDG_DATA_HOME")
                      or Path.home() / ".local/share")
@@ -89,12 +124,12 @@ def introspection_xml() -> str:
         Path("/usr/local/share/dbus-1/interfaces") / XML_FILE,
         Path("/usr/share/dbus-1/interfaces") / XML_FILE,
     ]
-    for path in cands:
+    for path in (cands if candidates is None else candidates):
         try:
             return path.read_text("utf-8")
         except OSError:
             continue
-    raise FileNotFoundError("arayuz XML'i bulunamadi: %s" % XML_FILE)
+    return _FALLBACK_XML
 
 
 if Gio is not None:

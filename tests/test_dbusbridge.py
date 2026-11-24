@@ -107,6 +107,34 @@ class BridgeMappingTests(unittest.TestCase):
             self.assertEqual(node.interfaces[0].name,
                              "org.ferdim.Daemon1")
 
+    def test_embedded_xml_matches_data_file(self):
+        disk = (ROOT / "data" / "org.ferdim.Daemon1.xml").read_text("utf-8")
+        self.assertEqual(dbusbridge.introspection_xml([]).strip(),
+                         disk.strip())
+
+    def test_missing_xml_files_fall_back_to_embedded_copy(self):
+        xml = dbusbridge.introspection_xml([Path("/nonexistent/daemon.xml")])
+        self.assertIn("org.ferdim.Daemon1", xml)
+        if HAVE_GI:
+            Gio.DBusNodeInfo.new_for_xml(xml)
+
+
+class DesktopIntegrationTests(unittest.TestCase):
+    EXT = (ROOT / "gnome-shell-extension" /
+           "ferdim@proxy-turkey.github.io" / "extension.js")
+
+    def test_extension_menu_rebuild_ignores_speed(self):
+        src = self.EXT.read_text("utf-8")
+        self.assertNotIn("j.id, j.state, j.filename, j.speed", src)
+        self.assertIn("this.menu.isOpen", src)
+        self.assertIn("this._menuDirty", src)
+
+    def test_install_script_installs_and_removes_dbus_xml(self):
+        src = (ROOT / "scripts" / "install.sh").read_text("utf-8")
+        self.assertIn("dbus-1/interfaces", src)
+        self.assertIn("org.ferdim.Daemon1.xml", src)
+        self.assertIn('rm -f "$DBUS_IFACE/org.ferdim.Daemon1.xml"', src)
+
 
 class _FakeDaemonHandler(socketserver.StreamRequestHandler):
     def handle(self):
