@@ -16,11 +16,15 @@ yoklamalar kullanilir.
 """
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
+import io
 import os
 import sys
 import threading
 import time
+import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,7 +39,7 @@ from ferdim.engine import segments
 from ferdim.engine.job import (DownloadJob, JobSpec, JobState, _verify_pass)
 from ferdim.i18n import LANGS, S
 from ferdim.paths import AppEnv
-from tests.helpers import DATA, TINY, start_server, tmp_root
+from tests.helpers import DATA, SEG, TINY, start_server, tmp_root
 
 
 def wait_until(pred, timeout=30.0, step=0.02):
@@ -69,6 +73,8 @@ class _Srv(ThreadingHTTPServer):
         self.content_type = "application/octet-stream"
         self.delay = 0.0
         self.served = 0
+        self.no_length = False     # Content-Length yok: boyut bilinmez (-1)
+        self.no_ranges = False     # Range yok sayilir: tek akis (200)
 
     @property
     def base(self) -> str:
@@ -97,18 +103,21 @@ class RangeHandler(BaseHTTPRequestHandler):
             return
         data = srv.payload
         rng = self.headers.get("Range")
-        if rng and rng.startswith("bytes="):
+        if rng and rng.startswith("bytes=") and not srv.no_ranges:
             a, b = rng[6:].split("-", 1)
             a = int(a)
             b = min(int(b), len(data) - 1)
             body = data[a:b + 1]
             self.send_response(206)
             self.send_header("Content-Range", f"bytes {a}-{b}/{len(data)}")
+            self.send_header("Accept-Ranges", "bytes")
         else:
             body = data
             self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Accept-Ranges", "bytes")
+        if srv.no_length:
+            self.send_header("Connection", "close")
+        else:
+            self.send_header("Content-Length", str(len(body)))
         self.send_header("Content-Type", srv.content_type)
         if srv.etag:
             self.send_header("ETag", srv.etag)
@@ -123,6 +132,8 @@ class RangeHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body[i:i + 65536])
             except Exception:
                 return
+        if srv.no_length:
+            self.close_connection = True
 
     def _send(self, code, body):
         self.send_response(code)
@@ -315,7 +326,9 @@ class DurabilityTests(_Base):
         j._fd = os.open(j.part_path, os.O_RDWR | os.O_CREAT, 0o644)
         self.addCleanup(j._close_fd)
         j.total = 16
-        j._pending = [(0, 15)]
+        j.done = 16                 # yazilan bayt var: fsync gerekir
+        j._wrote = 16               # ... ve henuz fsync edilmedi
+        j._pending = []
         events = []
         with mock.patch.object(job_mod.os, "fsync",
                                lambda fd: events.append(("fsync", fd))), \
@@ -678,10 +691,6 @@ class VerifyPassTests(_Base):
         j.cancel()
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class RemoveCleanupTests(unittest.TestCase):
     def test_remove_paused_job_drops_part_and_meta(self):
         import tempfile
@@ -703,3 +712,377 @@ class RemoveCleanupTests(unittest.TestCase):
                 self.assertFalse(job.meta_path.exists())
             finally:
                 qm.shutdown()
+
+
+# ---------------------------------------------------------------- inceleme
+class FreshStartTruncateTests(_Base):
+    """H1: bastan baslayan kosu .part'i kirpar.
+
+    Bilinmeyen boyutta (total = -1) `ftruncate(total)` yoktur: eski kosunun
+    kuyrugu kirpilmazsa yeni icerigin ardinda kalir ve is yanlislikla DONE
+    olur."""
+
+    def test_unknown_size_fresh_start_truncates_stale_tail(self):
+        srv = serve(RangeHandler)
+        self.addCleanup(srv.shutdown)
+        body = DATA[:300_000]
+        srv.payload = body
+        srv.no_length = True       # Content-Length yok: boyut bilinmez (-1)
+        srv.no_ranges = True       # tek akis
+        j = self.job(f"{srv.base}/data.bin", filename="bilinmeyen.bin")
+        j.target_dir.mkdir(parents=True, exist_ok=True)
+        j.part_path.write_bytes(b"X" * (1 << 20))     # eski, uzun kuyruk
+        j.start()
+        self.assertTrue(wait_state(j, (JobState.DONE, JobState.ERROR)),
+                        f"{j.state} {j.error}")
+        self.assertEqual(j.state, JobState.DONE, j.error)
+        self.assertEqual(j.final_path.read_bytes(), body,
+                         "eski .part kuyrugu yeni dosyaya kaldi")
+        self.assertEqual(j.final_path.stat().st_size, len(body))
+
+
+class FinalizeDurabilityTests(_Base):
+    """H2: yayinlanan ad diske iner; yalniz EXDEV kopyalamaya duser."""
+
+    def test_dir_fsync_after_rename(self):
+        j = self.job(f"{self.base}/tiny.bin", filename="ad-fsync.bin")
+        events = []
+        real_replace = os.replace
+
+        def replace(src, dst):
+            events.append(("replace", str(src), str(dst)))
+            return real_replace(src, dst)
+
+        with mock.patch.object(job_mod.os, "replace", replace), \
+                mock.patch.object(job_mod, "fsync_dir",
+                                  lambda p: events.append(("fsync_dir", str(p)))):
+            j.start()
+            self.assertTrue(wait_state(j, (JobState.DONE, JobState.ERROR)),
+                            f"{j.state} {j.error}")
+        self.assertEqual(j.state, JobState.DONE, j.error)
+        part = str(j.part_path)
+        idx = next(i for i, e in enumerate(events)
+                   if e[0] == "replace" and e[1] == part)
+        self.assertTrue(any(e[0] == "fsync_dir" for e in events[idx + 1:]),
+                        f"replace sonrasi dizin fsync yok: {events}")
+
+    def test_non_exdev_rename_error_is_not_hidden(self):
+        j = self.job(f"{self.base}/tiny.bin", filename="exdev.bin")
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if str(src) == str(j.part_path):
+                raise OSError(errno.EACCES, "yok")
+            return real_replace(src, dst)
+
+        with mock.patch.object(job_mod.os, "replace", replace), \
+                mock.patch("shutil.move") as moved:
+            j.start()
+            self.assertTrue(wait_state(j, (JobState.DONE, JobState.ERROR)),
+                            f"{j.state} {j.error}")
+        self.assertEqual(j.state, JobState.ERROR)
+        self.assertEqual(j.error_code, "disk", j.error)
+        moved.assert_not_called()
+
+    def test_exdev_fallback_fsyncs_the_copy(self):
+        j = self.job(f"{self.base}/tiny.bin", filename="exdev2.bin")
+        synced = []
+        real_fsync = os.fsync
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if str(src) == str(j.part_path):
+                raise OSError(errno.EXDEV, "baska fs")
+            return real_replace(src, dst)
+
+        def fsync(fd):
+            synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+            return real_fsync(fd)
+
+        with mock.patch.object(job_mod.os, "replace", replace), \
+                mock.patch.object(job_mod.os, "fsync", fsync):
+            j.start()
+            self.assertTrue(wait_state(j, (JobState.DONE, JobState.ERROR)),
+                            f"{j.state} {j.error}")
+        self.assertEqual(j.state, JobState.DONE, j.error)
+        self.assertEqual(j.final_path.read_bytes(), TINY)
+        self.assertTrue(any(n.endswith(j.final_path.name) for n in synced),
+                        f"kopya fsync edilmedi: {synced}")
+
+
+class CheckpointSyncTests(_Base):
+    """M2: checkpoint fsync'i kilidin DISINDA ve yalniz yeni bayt varsa."""
+
+    def _job_with_fd(self, size=64):
+        j = self.job(f"{self.base}/file.bin")
+        j.target_dir.mkdir(parents=True, exist_ok=True)
+        j._fd = os.open(j.part_path, os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(j._close_fd)
+        j.total = size
+        j._pending = [(0, size - 1)]
+        j._inflight = {1: (16, size - 1)}
+        j.done = 16
+        j._wrote = 16          # 16 bayt yazildi, henuz fsync edilmedi
+        return j
+
+    def test_fsync_runs_without_the_lock(self):
+        j = self._job_with_fd()
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_fsync(fd):
+            entered.set()
+            release.wait(10)
+
+        with mock.patch.object(job_mod.os, "fsync", slow_fsync):
+            th = threading.Thread(target=j._checkpoint, kwargs={"force": True})
+            th.start()
+            try:
+                self.assertTrue(entered.wait(10), "fsync calismadi")
+                free = j._lock.acquire(timeout=2.0)
+                if free:
+                    j._lock.release()
+                self.assertTrue(free, "fsync kilit tutulurken calisiyor")
+            finally:
+                release.set()
+                th.join(10)
+        self.assertFalse(th.is_alive())
+        self.assertTrue(j.meta_path.exists())
+
+    def test_no_fsync_when_nothing_new_was_written(self):
+        j = self._job_with_fd()
+        calls = []
+        with mock.patch.object(job_mod.os, "fsync",
+                               lambda fd: calls.append(fd)):
+            j._checkpoint(force=True)      # ilerleme var -> fsync
+            j._checkpoint(force=True)      # yeni bayt yok -> fsync yok
+        self.assertEqual(calls.count(j._fd), 1, calls)
+        self.assertEqual(len(util.read_json(j.meta_path)["ranges"]), 2)
+
+    def test_fsync_error_keeps_the_previous_checkpoint(self):
+        j = self._job_with_fd()
+        j._checkpoint(force=True)
+        before = j.meta_path.read_text("utf-8")
+        j.done = 32
+        j._wrote = 32               # yeni baytlar: fsync gerekir (ve patlar)
+        j._pending = [(0, 31)]
+        real_fsync = os.fsync
+
+        def fsync(fd):
+            if fd == j._fd:
+                raise OSError(errno.EIO, "yok")
+            return real_fsync(fd)
+
+        with mock.patch.object(job_mod.os, "fsync", fsync):
+            j._checkpoint(force=True)
+        self.assertEqual(j.meta_path.read_text("utf-8"), before,
+                         "fsync hatasinda nokta yazilmamali")
+
+
+class EncodingTokenTests(_Base):
+    """M3: Content-Encoding token listesi; sikistirma reddedilir."""
+
+    def test_identity_token_matrix(self):
+        for val in ("", " ", "identity", "none", "identity, identity",
+                    "NONE,Identity", " Identity , none "):
+            self.assertTrue(job_mod._identity_encoding(val), repr(val))
+        for val in ("gzip", "br", "deflate", "identity, gzip", "gzip, br"):
+            self.assertFalse(job_mod._identity_encoding(val), repr(val))
+
+    def test_none_encoding_is_accepted(self):
+        srv = serve(RangeHandler)
+        self.addCleanup(srv.shutdown)
+        srv.payload = DATA[:1 << 20]
+        srv.etag = '"none"'
+        srv.encoding = "none"
+        j = self.run_job(f"{srv.base}/data.bin", segments=2)
+        self.assertEqual(j.state, JobState.DONE, j.error)
+        self.assertEqual(j.final_path.read_bytes(), srv.payload)
+
+    def test_unranged_200_with_gzip_fails_with_content_encoding(self):
+        srv = serve(RangeHandler)
+        self.addCleanup(srv.shutdown)
+        srv.payload = DATA[:200_000]
+        srv.no_ranges = True           # 200 + tam govde (tek akis)
+        srv.encoding = "gzip"
+        j = self.job(f"{srv.base}/data.bin")
+        j.start()
+        self.assertTrue(wait_state(j, (JobState.DONE, JobState.ERROR)),
+                        f"{j.state} {j.error}")
+        self.assertEqual(j.state, JobState.ERROR)
+        self.assertEqual(j.error_code, "content_encoding")
+
+
+class ReservationRecoveryTests(_Base):
+    """L1: yayinlanmis dosya yer tutucu sanilip silinmez; cokme kaydi kurtarilir."""
+
+    def test_published_file_survives_drop_reservation(self):
+        j = self.run_job(f"{self.base}/tiny.bin", filename="yayin.bin")
+        self.assertEqual(j.state, JobState.DONE, j.error)
+        with j._lock:
+            j._reserved = j.final_path        # yayinlanmis dosyaya isaret
+        j._drop_reservation()
+        self.assertTrue(j.final_path.exists(), "yayinlanmis dosya silindi")
+
+    def test_stale_placeholder_is_removed_on_prepare(self):
+        j = self.job(f"{self.base}/tiny.bin", filename="artik.bin")
+        j.target_dir.mkdir(parents=True, exist_ok=True)
+        ph = util.unique_path(j.target_dir, "eski.bin")     # bos yer tutucu
+        st = ph.stat()
+        util.atomic_write_json(j.meta_path, {
+            "url": j.url, "etag": "", "last_modified": "",
+            "ranges": [[0, len(TINY) - 1]], "done": 0,
+            "reserved": [ph.name, st.st_dev, st.st_ino]})
+        j.start()
+        self.assertTrue(wait_state(j, (JobState.DONE, JobState.ERROR)),
+                        f"{j.state} {j.error}")
+        self.assertFalse(ph.exists(), "bos yer tutucu silinmedi")
+
+    def test_non_empty_reserved_file_is_kept(self):
+        j = self.job(f"{self.base}/tiny.bin", filename="dolu.bin")
+        j.target_dir.mkdir(parents=True, exist_ok=True)
+        keep = j.target_dir / "dolu.bin"
+        keep.write_bytes(b"gercek veri")
+        st = keep.stat()
+        util.atomic_write_json(j.meta_path, {
+            "url": j.url, "etag": "", "last_modified": "",
+            "ranges": [[0, len(TINY) - 1]], "done": 0,
+            "reserved": [keep.name, st.st_dev, st.st_ino]})
+        j.start()
+        self.assertTrue(wait_state(j, (JobState.DONE, JobState.ERROR)),
+                        f"{j.state} {j.error}")
+        self.assertEqual(keep.read_bytes(), b"gercek veri",
+                         "dolu dosya yer tutucu sanilip silindi")
+
+
+class PublishOnlyTests(_Base):
+    """L4: tam inmis ama yayinlanmamis .part yeniden indirilmez."""
+
+    def _job_with_complete_part(self, srv, filename="hazir.bin", etag='"v1"'):
+        j = self.job(f"{srv.base}/data.bin", filename=filename)
+        j.target_dir.mkdir(parents=True, exist_ok=True)
+        j.part_path.write_bytes(DATA)
+        util.atomic_write_json(j.meta_path, {
+            "url": j.url, "etag": etag, "last_modified": "",
+            "ranges": [], "done": len(DATA), "total": len(DATA)})
+        return j
+
+    def test_complete_part_is_published_without_redownload(self):
+        srv = serve(RangeHandler)
+        self.addCleanup(srv.shutdown)
+        srv.payload = DATA
+        srv.etag = '"v1"'
+        j = self._job_with_complete_part(srv)
+        srv.served = 0
+        j.start()
+        self.assertTrue(wait_state(j, (JobState.DONE, JobState.ERROR)),
+                        f"{j.state} {j.error}")
+        self.assertEqual(j.state, JobState.DONE, j.error)
+        self.assertEqual(j.final_path.read_bytes(), DATA)
+        self.assertLess(srv.served, len(DATA), "tamamlanmis dosya yeniden indi")
+
+    def test_complete_part_without_validator_is_redownloaded(self):
+        srv = serve(RangeHandler)
+        self.addCleanup(srv.shutdown)
+        srv.payload = DATA
+        srv.etag = ""
+        j = self._job_with_complete_part(srv, etag="")
+        srv.served = 0
+        j.start()
+        self.assertTrue(wait_state(j, (JobState.DONE, JobState.ERROR)),
+                        f"{j.state} {j.error}")
+        self.assertEqual(j.state, JobState.DONE, j.error)
+        self.assertEqual(j.final_path.read_bytes(), DATA)
+        self.assertGreaterEqual(srv.served, len(DATA),
+                                "dogrulayicisiz tam dosya guvenilip yayinlandi")
+
+
+class WarningSurfaceTests(unittest.TestCase):
+    """L5: yumusak 404 uyarisi GTK rozetinde ve `ferdim list` ciktisinda."""
+
+    def test_badge_shows_soft_404(self):
+        from ferdim.gui import present
+        badge = present.integrity_badge({"warning": "soft_404"}, "en")
+        self.assertIsNotNone(badge)
+        _symbol, tip, css = badge
+        self.assertEqual(css, "warning")
+        self.assertIn(S["warn_soft_404"]["en"], tip)
+
+    def test_cli_list_shows_soft_404_warning(self):
+        from ferdim import cli
+
+        class Fake:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def request(self, cmd, **kw):
+                return {"jobs": [{"id": "abc123", "state": "done", "done": 10,
+                                  "size": 10, "speed": 0, "filename": "x.iso",
+                                  "warning": "soft_404"}]}
+
+        args = types.SimpleNamespace(json=False)
+        out = io.StringIO()
+        with mock.patch.object(cli, "_client", lambda env: Fake()), \
+                mock.patch.object(
+                    cli, "_",
+                    lambda key, **kw: (S.get(key) or {}).get("en", key)), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(cli.cmd_list(args, None), 0)
+        text = out.getvalue()
+        self.assertIn("x.iso", text)
+        self.assertIn(S["warn_soft_404"]["en"], text)
+
+
+class SegmentsDurabilityTests(_Base):
+    """M4: segment dosyalari ve birlesmis cikti, nokta ilerlemeden fsync edilir."""
+
+    def test_every_meta_write_follows_an_output_fsync(self):
+        events = []
+        real_fsync = os.fsync
+
+        def fsync(fd):
+            try:
+                name = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                name = ""
+            events.append(("fsync", name))
+            return real_fsync(fd)
+
+        real_write = util.atomic_write_json
+
+        def write_meta(path, obj):
+            events.append(("meta", str(path)))
+            return real_write(path, obj)
+
+        with mock.patch.object(segments.os, "fsync", fsync), \
+                mock.patch.object(segments.util, "atomic_write_json", write_meta):
+            j = self.job(f"{self.base}/master.m3u8", segments=4,
+                         filename="segment-disk.ts")
+            j.start()
+            self.assertTrue(wait_state(j, (JobState.DONE, JobState.ERROR), 60),
+                            f"{j.state} {j.error}")
+        self.assertEqual(j.state, JobState.DONE, j.error)
+        self.assertEqual(j.final_path.read_bytes(), b"".join(SEG))
+        # 1) segment gecici dosyasi ad degistirmeden once fsync edilir
+        self.assertTrue(any(kind == "fsync" and name.endswith(".part")
+                            and ".segs/" in name for kind, name in events),
+                        "segment gecici dosyasi fsync edilmedi")
+        # 2) is noktasi, birlesmis ciktinin fsync'inden once hic yazilmaz
+        part = j.part_path.name
+        meta = str(j.meta_path)
+        seen_out = False
+        wrote = 0
+        for kind, name in events:
+            if kind == "fsync" and name and Path(name).name == part:
+                seen_out = True
+            elif kind == "meta" and name == meta:
+                wrote += 1
+                self.assertTrue(seen_out,
+                                f"meta cikti fsync'inden once yazildi: {events}")
+        self.assertGreater(wrote, 0, "hic nokta yazilmadi")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
