@@ -27,7 +27,7 @@ from tests.helpers import DATA, DATA_SHA, REQUEST_COUNTS, start_server, tmp_root
 CODES = ("not_found", "forbidden", "auth", "source_changed", "no_sources",
          "checksum_mismatch", "disk", "network", "stall", "size_mismatch",
          "incompatible", "rate_limited", "mirror_dead", "unknown",
-         "merkle_mismatch", "merkle_manifest")
+         "merkle_mismatch", "merkle_manifest", "content_encoding")
 
 
 def wait_for(pred, timeout=30.0, step=0.05):
