@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import http.client
 import os
 import random
@@ -41,6 +42,10 @@ TCP_SAMPLE_BYTES = 4 << 20  # TCP_INFO ornekleme araligi (link basina)
 CONGESTION_UP_BACKOFF = 30.0  # sn: tikaniklik tavaninda yukari kesif arasi
 CONGESTION_GAIN = 1.05     # "+1 link" kazanci esigi (altinda kazanc yok)
 PEER_PREFILL_BUDGET = 3.5  # sn: esbaz taramasi (pause 8 sn bekler)
+# yumusak 404: govdesi HTML olan yanit, adi baska tur vaat ediyorsa uyari
+_HTML_EXT = frozenset({".html", ".htm", ".xhtml", ".shtml", ".php",
+                       ".asp", ".aspx", ".jsp", ".cgi"})
+_HTML_HEAD = (b"<!doctype html", b"<html", b"<head", b"<body")
 
 
 def backoff_delay(attempt: int, cap: float = 15.0,
@@ -119,6 +124,103 @@ class SourceInvalid(Exception):
         self.code = code
 
 
+class _ChunkCheck:
+    """Merkle parcalarini AKIS uzerinde dogrular (tek okuma).
+
+    Bildirim ofsetleri bitisiktir (cdc.Manifest.parse dogrular), bu yuzden
+    okunan baytlar parca sinirlariyla sirayla eslesir: yeniden parcalama
+    (pahali FastCDC taramasi) ya da ikinci okuma gerekmez."""
+
+    def __init__(self, man):
+        self._chunks = man.chunks
+        self.bad: list[tuple[int, int]] = []
+        self._i = 0
+        self._h = None
+        self._left = 0
+        self._off = 0
+        self._len = 0
+        self._hx = ""
+
+    def feed(self, _offset: int, block: bytes) -> None:
+        pos = 0
+        n = len(block)
+        while pos < n and self._i < len(self._chunks):
+            if self._h is None:
+                self._off, self._len, self._hx = self._chunks[self._i]
+                self._h = hashlib.sha256()
+                self._left = self._len
+            take = min(self._left, n - pos)
+            self._h.update(block[pos:pos + take])
+            self._left -= take
+            pos += take
+            if self._left == 0:
+                if self._h.hexdigest() != self._hx:
+                    self.bad.append((self._off, self._len))
+                self._h = None
+                self._i += 1
+
+
+def _verify_pass(path, algos, man=None, halt=None, progress=None):
+    """Dosyayi TEK okumayla: istenen ozetler + (varsa) merkle parcalari.
+
+    Donus: ({algo: ozet}, merkle). merkle: None (bildirim yok) ya da
+    (boyut uygun mu, bozuk parcalar) - cdc.verify_file ile ayni anlam.
+    Duraklat/iptal (halt) keserse ({}, None): karar yazilmaz."""
+    chk = None
+    size_ok = True
+    if man is not None:
+        try:
+            size_ok = os.stat(path).st_size == man.size
+        except OSError:
+            size_ok = False
+        if size_ok:
+            chk = _ChunkCheck(man)
+    got = util.file_digests(path, algos, halt=halt, progress=progress,
+                            on_block=chk.feed if chk is not None else None)
+    if man is None:
+        return got, None
+    return got, (size_ok, chk.bad if chk is not None else [])
+
+
+def _stat_key(path) -> tuple:
+    """Dogrulama sonucunun hangi dosya durumuna ait oldugu (onbellek anahtari)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ()
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _looks_html(head: bytes) -> bool:
+    """Govde bir HTML sayfasi gibi mi basliyor? (BOM/bosluk atlanir.)"""
+    s = head.lstrip(b"\xef\xbb\xbf \t\r\n")[:512].lower()
+    return s.startswith(_HTML_HEAD)
+
+
+def _looks_like_soft_404(name: str, content_type: str, path, kind: str) -> bool:
+    """Yumusak 404: sunucu 'dosya yok' sayfasi (HTML) donduyse ama adi
+    baska bir tur vaat ediyorsa indirme sessizce 'done' olmamali.
+
+    Tetiklenmez: ad zaten HTML (uzanti .html/.htm...) ya da uzantisiz.
+    Content-Type HTML ise dosya acilmadan karar verilir; tur
+    bildirilmemisse govdenin ilk baytlari koklanir (yalniz HTTP islerinde:
+    FTP/HLS'te tur yok, yanlis alarm uretmemeli).
+    """
+    ext = Path(name or "").suffix.lower()
+    if not ext or ext in _HTML_EXT:
+        return False
+    if "html" in (content_type or "").lower():
+        return True
+    if kind != "http":
+        return False
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1024)
+    except OSError:
+        return False
+    return _looks_html(head)
+
+
 class MerkleError(Exception):
     """Acikca verilen merkle bildirimi okunamadi/gecersiz (kalici hata)."""
 
@@ -126,7 +228,7 @@ class MerkleError(Exception):
 _SRC_CODES = {           # kaynak basarisizlik nedeni -> kararli hata kodu
     "gone": "not_found", "conn": "network", "stall": "stall",
     "reset": "network", "read": "network", "http": "unknown",
-    "size": "size_mismatch",
+    "size": "size_mismatch", "encoding": "content_encoding",
 }
 
 
@@ -353,6 +455,10 @@ class DownloadJob:
         self._merkle = None        # cdc.Manifest: parca bazli dogrulama
         self._merkle_auto = False  # kaynak: yan dosya (bayat olabilir)
         self._merkle_tries = 0     # yapilan parca onarim turu
+        self._merkle_res = None    # verilen dosya durumu icin merkle sonucu
+        self._merkle_key = ()      # sonucun ait oldugu dosya (_stat_key)
+        self._content_type = ""    # sunucunun bildirdigi tur (yumusak 404)
+        self._reserved: Path | None = None   # sahiplenilmis son ad (yer tutucu)
         self._sc_lock = threading.Lock()   # yan dosya <-> bitis el skmasmasi
         self._finalized = threading.Event()
         self._dir: Path | None = None    # hedef klasor: ilk erisimde sabitlenir
@@ -463,6 +569,8 @@ class DownloadJob:
                 warnings.append("checksum_mismatch")
             if self.extra.get("merkle") == "warn":
                 warnings.append("merkle_mismatch")
+            if self.extra.get("warning"):
+                warnings.append(self.extra["warning"])
             return {
                 "id": self.id, "url": util.redact_url(self.url),
                 "state": self.state,
@@ -497,6 +605,9 @@ class DownloadJob:
                 "window": window,
                 "sched_wait": bool(window),
                 "verifying": bool(self.extra.get("verifying")),   # dogrulaniyor
+                "verify_done": int(self.extra.get("verify_done") or 0),
+                "verify_total": int(self.extra.get("verify_total") or 0),
+                "warning": str(self.extra.get("warning") or ""),
                 "best_speed": int(self._gov["best"]),
             }
 
@@ -530,6 +641,10 @@ class DownloadJob:
                 if self._stop.is_set():
                     self._fold_stopped()
                     return
+                # hazirlik yarida kaldi: acilan .part taniticisi sizmasin
+                # (ve hata, onceki iyi denetim noktasini ezmesin: fd yoksa
+                # _checkpoint yazmaz)
+                self._close_fd()
                 self._fail(_describe_error(e), _code_for(e))
                 return
             # _prepare() bu arada pause()/cancel() gormus olabilir. Karari
@@ -575,6 +690,27 @@ class DownloadJob:
                 os.close(fd)
             except OSError:
                 pass
+
+    def _drop_reservation(self) -> None:
+        """Sahiplenilmis ama doldurulmamis son ad yer tutucusunu siler."""
+        p, self._reserved = self._reserved, None
+        if p is not None:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    def _cleanup_temp(self) -> None:
+        """Isin gecici dosyalari: yarim `.part` ve HLS/DASH `.segs/` klasoru.
+
+        Iptal/kaldirmada kosulsuz silinir (is artik devam etmez). HATA
+        durumunda cagrilmaz: ERROR isi `resume`/`restart` ile yarim dosyadan
+        surdurulebilir (bkz. `_prepare` devam yolu, FTP REST noktasi)."""
+        try:
+            self.part_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        segments.cleanup(self.meta_path)
 
     def _prepare(self):
         opt = self.spec.options(self.cfg)
@@ -674,10 +810,9 @@ class DownloadJob:
                 p.final_url or self.url)
         self.total = p.total
         self._etag, self._last_modified = p.etag, p.last_modified
+        self._content_type = p.content_type or ""
 
-        if resume_meta.get("url") == self.url and resume_meta.get("etag") == p.etag \
-                and resume_meta.get("last_modified") == p.last_modified \
-                and self.part_path.exists() and resume_meta.get("ranges"):
+        if self._resumable(resume_meta, p):
             self._pending = [tuple(r) for r in resume_meta["ranges"]]
             self.done = max(0, self.total - sum(e - s + 1 for s, e in self._pending)) \
                 if self.total > 0 else int(resume_meta.get("done", 0))
@@ -708,7 +843,26 @@ class DownloadJob:
         self._peer_prefill(opt)     # esbaz onbellegi (istege bagli): eksik parcalar
         self._start_sidecar(opt)
 
+    def _resumable(self, resume_meta: dict, p: httpcli.ProbeResult) -> bool:
+        """Onceki denetim noktasindan devam edilebilir mi?
+
+        Sunucu ne ETag ne Last-Modified verdiyse ('"" == ""') esitlik her
+        zaman saglanir ve degismis bir dosya sessizce birlestirilirdi:
+        dogrulayici yoksa BASTAN indirilir. Acik bir saglama/merkle
+        verilmisse devam guvenlidir - degisim bitis dogrulamasinda yakalanir.
+        """
+        if resume_meta.get("url") != self.url \
+                or resume_meta.get("etag") != p.etag \
+                or resume_meta.get("last_modified") != p.last_modified \
+                or not resume_meta.get("ranges") or not self.part_path.exists():
+            return False
+        if not (p.etag or p.last_modified) \
+                and not (self.spec.wanted() or self.spec.merkle):
+            return False
+        return True
+
     def _fresh_start(self, p: httpcli.ProbeResult):
+        self._reset_verify_extra()      # bastan: eski uyarilar tasinmaz
         if self.total > 0:
             self._pending = [(0, self.total - 1)]
             self.done = 0
@@ -745,11 +899,13 @@ class DownloadJob:
             # yerel dosya sunucudakinden buyuk: ayna/eski kalinti, bastan
             os.ftruncate(self._fd, 0)
             part = 0
+            self._reset_verify_extra()
         old = (self._meta or {}).get("ftp_mtime")
         if part > 0 and mtime and old and old != mtime:
             # kaynak degismis: yarim dosya yeni icerikle karistirilamaz
             os.ftruncate(self._fd, 0)
             part = 0
+            self._reset_verify_extra()
         self._ftp_mtime = mtime
         self.total = size
         self.done = part if size < 0 else min(part, size)
@@ -1086,7 +1242,7 @@ class DownloadJob:
             s.cur = 0.0
             s.reason = kind
             s.code = code or _SRC_CODES.get(kind, "unknown")
-            if kind == "gone" or s.streak > self._retries:
+            if kind in ("gone", "encoding") or s.streak > self._retries:
                 self._mark_dead_locked(s)
             elif cooldown:
                 base = min(2.0 * (2 ** (s.streak - 1)), 30.0)
@@ -1160,7 +1316,8 @@ class DownloadJob:
         names = {"conn": "baglanti hatasi", "http": "HTTP hatasi",
                  "gone": "dosya yok", "stall": "akis durdu",
                  "reset": "baglanti kesildi", "read": "okuma hatasi",
-                 "size": "farkli dosya"}
+                 "size": "farkli dosya",
+                 "encoding": "sikistirilmis yanit"}
         with self._lock:
             why = sorted({names.get(s.reason, s.reason)
                           for s in self._srcs if s.dead and s.reason})
@@ -1446,6 +1603,16 @@ class DownloadJob:
             if src.primary:
                 raise
             raise SourceInvalid("Range desteklenmiyor", "incompatible") from None
+        # SIKISTIRMA: istekler Accept-Encoding: identity ile gider (bkz.
+        # httpcli.base_headers). Sunucu yine de sikistirdiysa govde Range
+        # araliklariyla eslesmez: baytlar 'geldigi gibi' yazilirsa dosya
+        # sessizce bozulur. Boyle bir kaynak bu is icin gecersizdir.
+        enc = (resp.headers.get("Content-Encoding") or "").strip().lower()
+        if enc and enc != "identity":
+            resp.close()
+            raise SourceInvalid(
+                f"sikistirilmis yanit (Content-Encoding: {enc})",
+                "content_encoding")
         m = re.match(r"bytes\s+(\d+)-\d+(?:/(\d+|\*))?",
                      resp.headers.get("Content-Range") or "")
         if m:
@@ -1528,14 +1695,16 @@ class DownloadJob:
                                   time.monotonic() - t_open)
                     self._sample_tcp(resp, wid)
             except SourceInvalid as ex:
-                # ayna baska dosya veriyor / Range desteklemiyor: isi bastan
-                # baslatmak YANLIS olur (sonsuz restart dongusu); ayna elenir,
-                # kalan kaynaklar surdurur
-                self._src_fail(src, "gone", code=ex.code)
+                # ayna baska dosya veriyor / Range desteklemiyor / sikistirilmis
+                # yanit: isi bastan baslatmak YANLIS olur (sonsuz restart
+                # dongusu); kaynak elenir, kalan kaynaklar surdurur
+                self._src_fail(src, "gone" if ex.code != "content_encoding"
+                               else "encoding", code=ex.code)
                 if self._others_alive(src):
                     continue
                 requeue()
-                self._fail(f"ayna gecersiz: {ex}", ex.code)
+                self._fail(f"{'ayna' if not src.primary else 'kaynak'} "
+                           f"gecersiz: {ex}", ex.code)
                 return (0.0, True)
             except httpcli.RangeInvalid:
                 # birincil kaynak degismis (If-Range 200 / 416) -> bastan indir
@@ -2075,6 +2244,7 @@ class DownloadJob:
                             with self._lock:
                                 os.ftruncate(self._fd, 0)
                                 self.done = 0
+                            self._reset_verify_extra()
                             mark = 0
                             verify = False
                             run(0)
@@ -2162,6 +2332,7 @@ class DownloadJob:
                 self.done = 0
                 if self._fd is not None:
                     os.ftruncate(self._fd, self.total)
+        self._reset_verify_extra()     # bastan: eski dogrulama izleri kalmasin
         if self._stop.is_set():
             return
         if self._restarts > 3:
@@ -2222,6 +2393,8 @@ class DownloadJob:
         if not size_ok:
             return False              # boyut: aralikla onarilamaz
         if not bad:
+            # ayni dosya bitis dogrulamasinda YENIDEN okunmaz (_stat_key)
+            self._merkle_res, self._merkle_key = res, _stat_key(self.part_path)
             if self._merkle_tries:
                 self.extra["merkle"] = "repaired"
             else:
@@ -2250,17 +2423,23 @@ class DownloadJob:
     def _finalize_file(self):
         try:
             if self._fd is not None:
-                os.fsync(self._fd)
-                os.close(self._fd)
-                self._fd = None
+                try:
+                    # os.replace oncesi: dosya diske inmeli (.part -> son ad)
+                    os.fsync(self._fd)
+                finally:
+                    self._close_fd()
+            self.target_dir.mkdir(parents=True, exist_ok=True)
+            # Son ad ATOMIK sahiplenilir (O_CREAT|O_EXCL yer tutucu): ayni
+            # adli iki is birbirinin dosyasini ezemez; adi alan is bitirir.
             dest = util.unique_path(self.target_dir,
                                     self.final_filename or "download.bin")
-            self.target_dir.mkdir(parents=True, exist_ok=True)
+            self._reserved = dest
             try:
-                os.replace(self.part_path, dest)
+                os.replace(self.part_path, dest)   # yer tutucunun uzerine
             except OSError:  # nadiren baska FS: kopyala+sil
                 import shutil
                 shutil.move(str(self.part_path), str(dest))
+            self._reserved = None      # ad artik dosyanin kendisi
             self.final_filename = dest.name
             self.meta_path.unlink(missing_ok=True)
             self.speed = 0
@@ -2277,7 +2456,7 @@ class DownloadJob:
             with self._sc_lock:
                 found = dict(self._sidecar)
                 self._finalized.set()
-            self._verify(dest, found)
+            self._verify(dest, found)          # ozetler + merkle: TEK okuma
             if self.state != JobState.ERROR and not self._stopped():
                 self._verify_merkle(dest)
                 if self.extra.get("merkle") in ("ok", "repaired"):
@@ -2285,28 +2464,81 @@ class DownloadJob:
                     self._peer_index_add(dest)
             self.extra.pop("verifying", None)
             if self.state != JobState.ERROR and not self._stopped():
+                if _looks_like_soft_404(self.final_filename, self._content_type,
+                                        dest, self.kind):
+                    # yumusak 404: dosya yerinde kalir, is DONE; yalnizca uyari
+                    self.extra["warning"] = "soft_404"
+            if self.state != JobState.ERROR and not self._stopped():
                 # duraklat/iptal dogrulama sirasinda geldiyse DONE yazilmaz
                 self.state = JobState.DONE
         except Exception as ex:
             self.extra.pop("verifying", None)
+            self._drop_reservation()      # doldurulmamis ad yer tutucusu
             self._fail(str(ex), _code_for(ex))
         if self.state == JobState.DONE:
             self._report_profile()      # biten isin olcumu ana makine profiline
         self._changed()
+
+    def _reset_verify_extra(self) -> None:
+        """Bastan baslayan kosu eski dogrulama/uyari izlerini tasimaz.
+
+        `checksum`/`merkle`/`verified` gibi alanlar ONCEKI denemeye aittir;
+        sifirdan indirilen dosya icin gecersizdir (bayat uyari rozeti)."""
+        with self._lock:
+            for k in ("checksum", "checksum_note", "merkle", "merkle_note",
+                      "verified", "merkle_repaired_bytes", "peer_bytes",
+                      "peer_chunks", "verifying", "verify_done",
+                      "verify_total", "warning"):
+                self.extra.pop(k, None)
+            self._merkle_res = None
+            self._merkle_key = ()
+
+    def _verify_progress(self, done: int) -> None:
+        """Dogrulama ilerlemesi (bayt) - arayuz bu sirada % gosterebilir."""
+        with self._lock:
+            self.extra["verify_done"] = int(done)
 
     def _verify(self, dest: Path, found: dict | None = None) -> None:
         """Saglama. Acikca istenen ozetler uyusmazsa is HATA (veri silinmez).
         Otomatik bulunan yan dosya (sidecar) uyusmazsa dosya yerinde
         birakilir ve UYARI ile isaretlenir - sunucudaki bayat yan dosya
         yanlis alarm uretebilir, dosya kendi kendine supheli sayilmaz.
-        'found': bu ana kadar bulunan yan dosya ozetleri (None = hepsi)."""
+        'found': bu ana kadar bulunan yan dosya ozetleri (None = hepsi).
+
+        Butun ozetler ve (varsa) merkle parcalari TEK okumada hesaplanir;
+        merkle sonucu `_verify_merkle` icin saklanir. Duraklat/iptal her
+        okuma blogunda gorulur: karar yazilmaz."""
         explicit = self.spec.wanted()
         found = {k: v for k, v in (self._sidecar if found is None
                                    else found).items()
                  if k not in explicit}
-        if not explicit and not found:
+        man = self._merkle
+        algos = {**found, **explicit}
+        if not algos and man is None:
             return
-        got = util.file_digests(str(dest), {**found, **explicit})
+        if not algos and self._merkle_res is not None \
+                and _stat_key(dest) == self._merkle_key:
+            return                     # ayni dosya zaten dogrulandi: okuma yok
+        self._merkle_res, self._merkle_key = None, ()
+        try:
+            total = dest.stat().st_size
+        except OSError:
+            total = 0
+        with self._lock:
+            self.extra["verify_total"] = total
+            self.extra["verify_done"] = 0
+        got, mres = _verify_pass(dest, algos, man, halt=self._stopped,
+                                 progress=self._verify_progress)
+        with self._lock:
+            self.extra.pop("verify_done", None)
+            self.extra.pop("verify_total", None)
+        if self._stopped():
+            return                     # kesildi: karar yazilmaz
+        if mres is not None:
+            self._merkle_res = mres
+            self._merkle_key = _stat_key(dest)
+        if not explicit and not found:
+            return                     # yalniz merkle dogrulandi
         bad_expl = [a for a, v in explicit.items() if got.get(a) != v]
         bad_found = [a for a, v in found.items() if got.get(a) != v]
         self.extra["verified"] = [a for a in got
@@ -2333,11 +2565,17 @@ class DownloadJob:
         olabilecegi icin yalnizca UYARI isaretidir: dosya yerinde kalir,
         is bitmis sayilir (yan dosya saglamasindaki kuralin aynisi).
 
+        `_verify` ayni okumada merkle sonucunu zaten urettiyse (ya da onarim
+        turu ayni dosyayi dogruladiysa) yeniden okunmaz.
+
         True: dogrulama tamamlandi. False: duraklat/iptal nedeniyle kesildi."""
         man = self._merkle
         if man is None:
             return True
-        res = cdc.verify_file(dest, man, halt=self._stopped)
+        res = self._merkle_res
+        if res is None or _stat_key(dest) != self._merkle_key:
+            res = cdc.verify_file(dest, man, halt=self._stopped)
+            self._merkle_res, self._merkle_key = res, _stat_key(dest)
         if res is None:
             return False
         size_ok, bad = res
@@ -2473,6 +2711,12 @@ class DownloadJob:
             self.start()
 
     def cancel(self, delete_files: bool = False):
+        """Iptal: is bir daha devam etmez.
+
+        Gecici dosyalar (`.part`, HLS/DASH `.segs/`, sahiplenilmis son ad
+        yer tutucusu) HER DURUMDA silinir - iptal edilmis isin yarim dosyasi
+        yetim kalirdi. `delete_files` eski imza icin korunur (bitmis dosyayi
+        kuyruk `remove` tarafinda siler); yarim dosya zaten silinmistir."""
         with self._cond:
             self._stop.set()
             self._run += 1          # eski hazirlik sonucu artik uygulanmaz
@@ -2485,8 +2729,8 @@ class DownloadJob:
         with self._lock:
             self.state = JobState.CANCELED
         self.meta_path.unlink(missing_ok=True)
-        if delete_files:
-            self.part_path.unlink(missing_ok=True)
+        self._drop_reservation()
+        self._cleanup_temp()
         self._changed()
 
     # ------------------------------------------------------------- checkpoint
@@ -2505,6 +2749,16 @@ class DownloadJob:
         if self.kind in ("hls", "dash") or self._fd is None:
             return
         with self._lock:
+            fd = self._fd
+            if fd is not None:
+                try:
+                    # 'tamamlanan aralik' kaydi ancak baytlar DISKE indikten
+                    # sonra yazilir: elektrik kesintisi sifir dolu araligi
+                    # tamam saymaz. Blok basina degil, nokta basina bir kez.
+                    os.fsync(fd)
+                except OSError:
+                    # yazilamiyor: eski (daha geri) nokta kalir - guvenli yon
+                    return
             util.atomic_write_json(self.meta_path, {
                 "url": self.url,
                 "filename": self.final_filename,

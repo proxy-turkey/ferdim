@@ -309,6 +309,8 @@ function notesFor(j) {
     out.push(["info", "⏱ " + trf("sched_wait", { w: j.window })]);
   if (j.sources_dead > 0)
     out.push(["warn", "⛔ " + trf("mirrors_dead", { n: j.sources_dead })]);
+  if (j.warning === "soft_404")
+    out.push(["warn", "⚠ " + tr("warn_soft_404")]);
   out.push(...integrityNotes(j));
   return out;
 }
@@ -368,7 +370,14 @@ function updateRow(r, j) {
 
   const label = tr(j.verifying ? "st_verifying" : "st_" + j.state);
   const pct = j.size > 0 ? Math.min(100, Math.floor(j.done * 100 / j.size)) : null;
-  if (pct == null) {            // boyut bilinmiyor: belirsiz cubuk
+  if (j.verifying && j.verify_total > 0) {
+    // dogrulama ilerlemesi: aktarim bitti, tek okuma suzuluyor
+    const vpct = Math.min(100, Math.floor(j.verify_done * 100 / j.verify_total));
+    r.bar.classList.remove("unk");
+    r.fill.style.width = vpct + "%";
+    r.bar.setAttribute("aria-valuenow", String(vpct));
+    r.plabel.textContent = vpct + "% — " + label;
+  } else if (pct == null) {     // boyut bilinmiyor: belirsiz cubuk
     r.bar.classList.add("unk");
     r.fill.style.width = "100%";
     r.bar.removeAttribute("aria-valuenow");

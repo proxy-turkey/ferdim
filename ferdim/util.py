@@ -61,17 +61,36 @@ def parse_content_disposition(value: str | None) -> str | None:
     return None
 
 
+def _claim(p: Path) -> bool:
+    """Ad bos bir yer tutucuyla ATOMIK sahiplenilir (O_CREAT|O_EXCL).
+
+    Var olan ad (dizin ya da sembolik bag dahil) EEXIST verir: sahiplenilmis
+    bir ada asla yazilmaz."""
+    try:
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return False
+    os.close(fd)
+    return True
+
+
 def unique_path(directory: Path, name: str) -> Path:
-    p = directory / name
-    if not p.exists():
-        return p
+    """Hedef dizinde benzersiz bir ad SAHIPLENIR (bos yer tutucu acilir).
+
+    Kontrol-sonra-kullan yarisi yoktur: iki is ayni adi sectiginde yalniz
+    biri kazanir, digeri '(1)' ile devam eder - bitiste biri digerinin
+    uzerine yazamaz. Dondurulen yol cagirana aittir: cagiran onu kendi
+    icerigiyle doldurur (os.replace) ya da vazgecince siler. Hedef dizin
+    onceden var olmalidir."""
+    if _claim(directory / name):
+        return directory / name
     stem, dot, ext = name.partition(".")
     if not dot:
         stem, ext = name, ""
     i = 1
     while True:
         cand = directory / f"{stem} ({i}){('.' + ext) if ext else ''}"
-        if not cand.exists():
+        if _claim(cand):
             return cand
         i += 1
 
@@ -181,22 +200,37 @@ def file_digest(path, algo: str = "sha256") -> str:
     return file_digests(path, [algo]).get(algo, "")
 
 
-def file_digests(path, algos) -> dict:
+def file_digests(path, algos, halt=None, progress=None, on_block=None) -> dict:
     """Dosyayi TEK okumayla birden fazla algoritmayla ozetler. `algos`
     algoritma adlarinin listesi ya da {algo: ozet} sozlugu olabilir; yalniz
-    DIGEST_LEN'deki algoritmalar kabul edilir."""
+    DIGEST_LEN'deki algoritmalar kabul edilir.
+
+    halt   : her okuma blogunda sorulur; True donerse okuma kesilir ve {}
+          doner (cagiran karari yazmaz - duraklat/iptal bekletilmez).
+    progress: okunan toplam bayt sayisiyla cagrilir (arayuz ilerlemesi).
+    on_block(offset, block): akis uzerinde ek denetim; verilirse algoritma
+          istenmese de dosya okunur (merkle parcalari ayni okumada dogrulanir).
+    """
     import hashlib
     hs = {}
     for a in (algos or {}):
         name = str(a).lower().replace("-", "")
         if name in DIGEST_LEN and name not in hs:
             hs[name] = hashlib.new(name)
-    if not hs:                 # gecerli algoritma yok: dosyayi acmaya bile gerek yok
+    if not hs and on_block is None:   # gecerli algoritma yok: dosyayi acma
         return {}
+    read = 0
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
+            if halt is not None and halt():
+                return {}
             for h in hs.values():
                 h.update(chunk)
+            if on_block is not None:
+                on_block(read, chunk)
+            read += len(chunk)
+            if progress is not None:
+                progress(read)
     return {a: h.hexdigest() for a, h in hs.items()}
 
 

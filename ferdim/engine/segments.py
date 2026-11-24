@@ -23,6 +23,28 @@ SEG_MAX = 8               # segment havuzu tavani (aralik islerinden bagimsiz)
 SEG_LEARN_MIN = 4         # ogrenmek icin en az bu kadar segment inmeli
 
 
+def temp_dir(meta_path) -> Path:
+    """Segment gecici klasoru: meta dosyasinin yaninda (ayni dosya sistemi)."""
+    return Path(str(meta_path) + ".segs")
+
+
+def cleanup(meta_path) -> None:
+    """Yarim segment dosyalarini ve `.segs` klasorunu siler.
+
+    Iptal/kaldirmada kosulsuz cagrilir; hata durumunda cagrilmaz (yarim
+    segmentler devam/restart ile yeniden kullanilir)."""
+    d = temp_dir(meta_path)
+    try:
+        for f in d.glob("*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        d.rmdir()
+    except OSError:
+        pass
+
+
 def pool_size(n_segments: int, seed: int = 0, cap: int = SEG_MAX) -> int:
     """Havuz isci sayisi: ogrenilmis tohum, segment sayisi ve tavan.
 
@@ -93,7 +115,7 @@ def assemble(opt: httpcli.DlOptions, fd: int, meta: dict,
     rtt: bu kosudaki manifest yanit suresi (RTT bandi icin)."""
     done: set[int] = set(int(i) for i in meta.get("done_segments", []))
     meta["segments_total"] = len(seg_urls)
-    segs_dir = Path(str(meta_path) + ".segs")
+    segs_dir = temp_dir(meta_path)
     segs_dir.mkdir(parents=True, exist_ok=True)
 
     host_url = seg_urls[0] if seg_urls else ""
@@ -191,12 +213,4 @@ def assemble(opt: httpcli.DlOptions, fd: int, meta: dict,
     persist(force=True)
     if progress_cb:
         progress_cb(0)
-    for f in segs_dir.glob("*.seg"):
-        try:
-            f.unlink()
-        except OSError:
-            pass
-    try:
-        segs_dir.rmdir()
-    except OSError:
-        pass
+    cleanup(meta_path)

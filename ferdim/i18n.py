@@ -593,6 +593,17 @@ S = {
         "tr": "API jetonu yenilenemedi.",
         "es": "No se pudo renovar el jeton de API.",
         "ru": "Не удалось обновить токен API."},
+    # ---- 1.11 engine
+    "err_content_encoding": {
+        "en": "the server compressed the response although byte ranges were requested",
+        "tr": "sunucu aralık istendiği hâlde yanıtı sıkıştırdı",
+        "es": "el servidor comprimió la respuesta aunque se pidieron rangos de bytes",
+        "ru": "сервер сжал ответ, хотя запрашивались диапазоны байтов"},
+    "warn_soft_404": {
+        "en": "the server sent an HTML page instead of the file (soft 404); the file was kept",
+        "tr": "sunucu dosya yerine bir HTML sayfası gönderdi (yumuşak 404); dosya korundu",
+        "es": "el servidor envió una página HTML en lugar del archivo (404 suave); el archivo se conservó",
+        "ru": "сервер отправил HTML-страницу вместо файла (мягкая 404); файл сохранён"},
 }
 
 
