@@ -680,3 +680,26 @@ class VerifyPassTests(_Base):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class RemoveCleanupTests(unittest.TestCase):
+    def test_remove_paused_job_drops_part_and_meta(self):
+        import tempfile
+        from pathlib import Path
+        from ferdim.paths import AppEnv
+        from ferdim.engine.queue import QueueManager
+        from ferdim.engine.job import JobSpec
+        from ferdim.paths import DEFAULTS
+        with tempfile.TemporaryDirectory() as d:
+            env = AppEnv(root=Path(d))
+            qm = QueueManager(env, dict(DEFAULTS))
+            try:
+                job = qm.add(JobSpec(url="http://127.0.0.1:9/x.bin"), paused=True)
+                job.part_path.parent.mkdir(parents=True, exist_ok=True)
+                job.part_path.write_bytes(b"x" * 10)
+                job.meta_path.write_text("{}")
+                self.assertTrue(qm.remove(job.id))
+                self.assertFalse(job.part_path.exists())
+                self.assertFalse(job.meta_path.exists())
+            finally:
+                qm.shutdown()

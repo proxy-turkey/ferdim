@@ -226,11 +226,20 @@ class QueueManager:
             self._starting.discard(job.id)
         if job.state in STATES_RUNNING or dispatching:
             job.cancel(delete_files)
-        elif delete_files:
-            try:
-                job.final_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+        else:
+            # duran/hatali is devam etmeyecek: yarim .part, .segs/ ve
+            # denetim noktasi kuyruktan cikinca sahipsiz kalirdi
+            if job.state != JobState.DONE:
+                try:
+                    job.meta_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                job._cleanup_temp()
+            if delete_files:
+                try:
+                    job.final_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
         with self._lock:
             if job not in self.jobs:        # es zamanli iki remove
                 return False
