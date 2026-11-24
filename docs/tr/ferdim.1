@@ -60,7 +60,9 @@ uzunluğundan tek anlamlı olduğunda algoritma atlanabilir,
 .BI \-\-merkle " URL|DOSYA"
 parça bazlı bütünlük bildirimi (\fB.ferdim-merkle\fR, aşağıdaki \fBmerkle\fR
 komutuna bakın); doğrulamada başarısız olan parçaların yalnızca bayt
-aralıkları yeniden indirilir,
+aralıkları yeniden indirilir. Yalnızca HTTP(S) işlerinde kabul edilir;
+kendiliğinden bulunan yan dosya bildirimi uyuşmazsa uyarı, onarılamayan
+açık bildirim hata olur.
 .BI \-\-limit " HIZ"
 iş başına hız sınırı (ör. 2MB; KB, MB ve GB 1024 tabanlıdır),
 .B \-k

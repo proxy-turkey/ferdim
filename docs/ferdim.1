@@ -56,7 +56,9 @@ any supported digest (sha256, sha512, md5, sha1); the algorithm may be
 omitted when it is unambiguous from the digest length,
 .BI \-\-merkle " URL|FILE"
 per-chunk integrity manifest (\fB.ferdim-merkle\fR, see \fBmerkle\fR below);
-only the byte ranges of chunks that fail verification are fetched again,
+only the byte ranges of chunks that fail verification are fetched again.
+Accepted for HTTP(S) jobs only; a discovered sidecar manifest that does not
+match is a warning, an explicit one that cannot be repaired is an error.
 .BI \-\-limit " RATE"
 per-job speed limit (e.g. 2MB; KB, MB and GB are 1024-based),
 .B \-k

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import threading
 import time
@@ -17,11 +18,12 @@ import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ferdim import cdc
-from ferdim.engine import httpcli
+from ferdim.engine import httpcli, job as job_mod
 from ferdim.engine.job import MERKLE_REPAIR_MAX, JobSpec, JobState
 from ferdim.paths import AppEnv
 from tests.helpers import tmp_root
@@ -96,9 +98,10 @@ class ChunkerTests(unittest.TestCase):
         self.assertEqual(len(cdc.merkle_root([])), 64)
 
     def test_04_manifest_roundtrip(self):
-        root = cdc.merkle_root([h for _, _, h in chunk_bytes(self.buf,
-                                                             **SMALL)])
-        man = cdc.Manifest.of(chunk_bytes(self.buf, **SMALL))
+        # bildirim bicimi varsayilan parametreleri tasir (parse bunlari
+        # dogrular); kucuk parametreler yalnizca uretici API'sinde kalir
+        root = cdc.merkle_root([h for _, _, h in chunk_bytes(self.buf)])
+        man = cdc.Manifest.of(chunk_bytes(self.buf))
         self.assertEqual(man.root, root)
         self.assertEqual(man.size, len(self.buf))
         again = cdc.Manifest.parse(man.dumps())
@@ -107,7 +110,7 @@ class ChunkerTests(unittest.TestCase):
         self.assertTrue(off <= 70000 < off + ln)
 
     def test_05_manifest_rejects_bad_input(self):
-        man = cdc.Manifest.of(chunk_bytes(self.buf, **SMALL))
+        man = cdc.Manifest.of(chunk_bytes(self.buf))
         bad = [
             "bozuk json",
             man.dumps().replace('"v":1', '"v":2'),
@@ -367,6 +370,273 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual(sha(out.read_bytes()), sha(PAYLOAD))
         finally:
             srv.shutdown()
+
+
+class GuardTests(unittest.TestCase):
+    """Inceleme bulgulari: dur/iptal, kaynak (provenance), sinirlar."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = tmp_root(cls, "ferdim-cdc-guard-")
+        cls.env = AppEnv(root=cls.root)
+        cls.cfg = cls.env.load_config()
+        src = cls.root / "remote.bin"
+        src.write_bytes(PAYLOAD)
+        cls.man = cdc.make_manifest(src)
+        cls.man_text = cls.man.dumps()
+        cls.man_path = cdc.write_manifest(
+            cls.man, cls.root / "remote.bin.ferdim-merkle")
+        cls.bad_at = len(PAYLOAD) // 3
+        assert cls.man.offset_of(cls.bad_at)[0] >= 0
+
+    def _job(self, url, **kw):
+        return cdc_job(self.env, self.cfg, url, **kw)
+
+    # ---------------------------------------------------------- dogrulama dur
+    def test_07_verify_halt_stops_early(self):
+        root = tmp_root(self, "ferdim-cdc-halt-")
+        p = root / "f.bin"
+        p.write_bytes(PAYLOAD)
+        man = cdc.make_manifest(p, **SMALL)
+        self.assertGreater(len(man.chunks), 20)
+        # dur sinyali once sorulur: dosya hic acilmaz
+        self.assertIsNone(cdc.verify_file(root / "yok.bin", man,
+                                          halt=lambda: True))
+        calls = []
+
+        def halt():
+            calls.append(1)
+            return len(calls) >= 5
+
+        self.assertIsNone(cdc.verify_file(p, man, halt=halt))
+        self.assertLessEqual(len(calls), 6, "durdurma gecikmemeli")
+        self.assertEqual(cdc.verify_file(p, man), (True, []))
+
+    def test_16_cancel_during_repair_decision_wins(self):
+        """Onarim karari verilirken gelen iptal DONE/onarim yazmaz."""
+        srv, base = start_cdc_server(self.man_text, self.bad_at, 1)
+        try:
+            job = self._job(f"{base}/cdc.bin", segments=1,
+                            merkle=str(self.man_path))
+            real = cdc.verify_file
+            fired = {"n": 0}
+
+            def hooked(path, man, halt=None):
+                res = real(path, man, halt=halt)
+                if not fired["n"]:
+                    fired["n"] = 1
+                    job.cancel()     # monitor is parcayi dogrularken
+                return res
+
+            with mock.patch.object(job_mod.cdc, "verify_file", hooked):
+                job.start()
+                self.assertTrue(wait_state(job, (JobState.CANCELED,), 30),
+                                job.state)
+            self.assertEqual(job.state, JobState.CANCELED)
+            self.assertFalse(job.final_path.exists(), "iptal DONE'a donusmemeli")
+            self.assertNotIn("merkle_repaired_bytes", job.extra)
+            first, repair = phases(srv.ranges, len(PAYLOAD))
+            self.assertEqual(repair, [], "iptalden sonra onarim istegi olmamali")
+        finally:
+            srv.shutdown()
+
+    def test_17_pause_across_repair_verification_is_synchronous(self):
+        """Dogrulama uzun surerken gelen duraklatma: pause() dondugunde
+        durum 'paused' ve denetim noktasi yazilmis olmali."""
+        srv, base = start_cdc_server(self.man_text, self.bad_at, 1)
+        try:
+            job = self._job(f"{base}/cdc.bin", segments=1,
+                            merkle=str(self.man_path))
+            real = cdc.verify_file
+            fired = {"n": 0}
+            seen: dict = {}
+
+            def do_pause():
+                job.pause()
+                seen["state"] = job.state
+
+            def hooked(path, man, halt=None):
+                res = real(path, man, halt=halt)
+                if not fired["n"]:
+                    fired["n"] = 1
+                    threading.Thread(target=do_pause, daemon=True,
+                                     name="pause-merkle").start()
+                    end = time.monotonic() + 10
+                    while not job._stop.is_set() and time.monotonic() < end:
+                        time.sleep(0.005)
+                return res
+
+            with mock.patch.object(job_mod.cdc, "verify_file", hooked):
+                job.start()
+                self.assertTrue(wait_state(job, (JobState.PAUSED,), 30),
+                                job.state)
+                th = next((t for t in threading.enumerate()
+                           if t.name == "pause-merkle"), None)
+                if th is not None:
+                    th.join(20)
+            self.assertEqual(seen.get("state"), JobState.PAUSED)
+            self.assertTrue(job.meta_path.exists(), "denetim noktasi yok")
+            self.assertTrue(job.part_path.exists(), "yarim dosya korunmali")
+            self.assertFalse(job.final_path.exists())
+            job.cancel(delete_files=True)
+        finally:
+            srv.shutdown()
+
+    # ------------------------------------------------------- bildirim kaynagi
+    def test_18_auto_manifest_mismatch_warns_without_repair(self):
+        """Kendiliginden bulunan yan dosya bayat olabilir: onarim denenmez,
+        is DONE kalir ve uyari kodu yazilir."""
+        srv, base = start_cdc_server(self.man_text, self.bad_at, 1)
+        try:
+            job = self._job(f"{base}/cdc.bin", segments=1)
+            job.start()
+            self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR)),
+                            f"{job.state} {job.error}")
+            self.assertEqual(job.state, JobState.DONE, job.error)
+            snap = job.snapshot()
+            self.assertEqual(snap["merkle"], "warn")
+            self.assertIn("merkle_mismatch", snap["warning_codes"])
+            first, repair = phases(srv.ranges, len(PAYLOAD))
+            self.assertEqual(repair, [], "yan dosya bildirimi onarilmamali")
+            self.assertNotIn("merkle_repaired_bytes", job.extra)
+        finally:
+            srv.shutdown()
+
+    def test_19_auto_manifest_size_mismatch_warns_only(self):
+        other = cdc.Manifest.of(chunk_bytes(PAYLOAD[: 2 << 20]))
+        srv, base = start_cdc_server(other.dumps())
+        try:
+            job = self._job(f"{base}/cdc.bin", segments=1)
+            job.start()
+            self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR)),
+                            f"{job.state} {job.error}")
+            self.assertEqual(job.state, JobState.DONE, job.error)
+            self.assertEqual(job.snapshot()["merkle"], "warn")
+            self.assertEqual(job.extra["merkle_note"], "size")
+            self.assertIn("merkle_mismatch",
+                          job.snapshot()["warning_codes"])
+        finally:
+            srv.shutdown()
+
+    def test_24_explicit_manifest_size_mismatch_errors(self):
+        short = cdc.Manifest.of(chunk_bytes(PAYLOAD[: 2 << 20]))
+        path = cdc.write_manifest(short, tmp_root(self, "ferdim-cdc-short-")
+                                  / "short.ferdim-merkle")
+        srv, base = start_cdc_server(short.dumps())
+        try:
+            job = self._job(f"{base}/cdc.bin", segments=1, merkle=str(path))
+            job.start()
+            self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR)),
+                            f"{job.state} {job.error}")
+            self.assertEqual(job.state, JobState.ERROR)
+            self.assertEqual(job.error_code, "merkle_mismatch")
+            self.assertIn("boyut", job.error)
+        finally:
+            srv.shutdown()
+
+    # --------------------------------------------------------------- sinirlar
+    def test_08_manifest_rejects_oversized_and_tiny_chunks(self):
+        size = cdc.MIN_CHUNK * 4
+
+        def doc(chunks):
+            return json.dumps({"v": 1, "algo": cdc.ALGO, "size": size,
+                               "root": "0" * 64, "chunks": chunks})
+
+        with self.assertRaisesRegex(ValueError, "ust sinir"):
+            cdc.Manifest.parse(doc([[0, cdc.MAX_CHUNK + 1, "a" * 64]]))
+        with self.assertRaisesRegex(ValueError, "alt sinir"):
+            cdc.Manifest.parse(doc([[0, 1024, "a" * 64],
+                                    [1024, size - 1024, "b" * 64]]))
+        ok = cdc.Manifest.of([(0, cdc.MIN_CHUNK, sha(b"x")),
+                              (cdc.MIN_CHUNK, 1024, sha(b"y"))])
+        self.assertEqual(cdc.Manifest.parse(ok.dumps()), ok)
+
+    def test_20_local_manifest_is_bounded_and_regular(self):
+        root = tmp_root(self, "ferdim-cdc-lim-")
+        big = root / "big.ferdim-merkle"
+        big.touch()
+        os.truncate(big, cdc.MAX_MANIFEST + 1)
+        env = AppEnv(root=root)
+        cfg = env.load_config()
+        srv, base = start_cdc_server(self.man_text)
+        try:
+            for path, why in ((str(big), "cok buyuk"),
+                              ("/dev/null", "normal dosya degil"),
+                              (str(root / "yok.ferdim-merkle"), "okunamadi")):
+                with self.subTest(path=path):
+                    job = cdc_job(env, cfg, f"{base}/cdc.bin", segments=1,
+                                  merkle=path)
+                    job.start()
+                    self.assertTrue(wait_state(job, (JobState.ERROR,
+                                                    JobState.DONE), 30),
+                                    job.state)
+                    self.assertEqual(job.state, JobState.ERROR, job.state)
+                    self.assertEqual(job.error_code, "merkle_manifest")
+                    self.assertIn(why, job.error)
+        finally:
+            srv.shutdown()
+
+    def test_21_cli_absolutises_relative_merkle(self):
+        from ferdim.cli import _abs_merkle
+        self.assertEqual(_abs_merkle("m.ferdim-merkle"),
+                         os.path.abspath("m.ferdim-merkle"))
+        self.assertEqual(_abs_merkle("~/m.ferdim-merkle"),
+                         os.path.abspath(os.path.expanduser("~/m.ferdim-merkle")))
+        url = "https://ornek.example/x.ferdim-merkle"
+        self.assertEqual(_abs_merkle(url), url)
+        self.assertEqual(_abs_merkle(""), "")
+        cli = (Path(__file__).resolve().parents[1] / "ferdim" / "cli.py")
+        self.assertIn("merkle=_abs_merkle(a.merkle)",
+                      cli.read_text("utf-8"))
+
+    def test_22_merkle_is_http_only(self):
+        env = AppEnv(root=tmp_root(self, "ferdim-cdc-kind-"))
+        cfg = env.load_config()
+        for url in ("ftp://127.0.0.1:1/x.bin",
+                    "http://127.0.0.1:1/media.m3u8",
+                    "http://127.0.0.1:1/manifest.mpd"):
+            with self.subTest(url=url):
+                job = cdc_job(env, cfg, url, segments=1,
+                              merkle=str(self.man_path))
+                job.start()
+                self.assertTrue(wait_state(job, (JobState.ERROR,
+                                                JobState.DONE), 30),
+                                job.state)
+                self.assertEqual(job.state, JobState.ERROR, job.state)
+                self.assertEqual(job.error_code, "merkle_manifest")
+                self.assertIn("HTTP(S)", job.error)
+
+    # ------------------------------------------------------------ hiz ornekleri
+    def test_23_repair_rebases_speed_marks(self):
+        root = tmp_root(self, "ferdim-cdc-marks-")
+        env = AppEnv(root=root)
+        cfg = env.load_config()
+        good = root / "remote.bin"
+        good.write_bytes(PAYLOAD)
+        man = cdc.make_manifest(good)
+        srv, base = start_cdc_server(self.man_text)
+        self.addCleanup(srv.shutdown)
+        job = cdc_job(env, cfg, f"{base}/cdc.bin", segments=1)
+        job.kind = "http"
+        job.total = job.done = man.size
+        raw = bytearray(PAYLOAD)
+        off, ln = man.chunks[1][0], man.chunks[1][1]
+        raw[off + 5] ^= 0xFF
+        job.target_dir.mkdir(parents=True, exist_ok=True)
+        job.part_path.write_bytes(bytes(raw))
+        job._fd = os.open(str(job.part_path), os.O_RDWR)
+        job._merkle = man
+        job.state = JobState.DOWNLOADING
+        job._speed_done_mark = man.size      # eski olcum: tam boy
+        job._gov["done"] = man.size
+        try:
+            self.assertTrue(job._merkle_repair())
+            self.assertEqual(job.done, man.size - ln)
+            self.assertEqual(job._speed_done_mark, job.done,
+                             "hiz ornegi negatife dusmemeli")
+            self.assertEqual(job._gov["done"], job.done)
+        finally:
+            job.cancel(delete_files=True)
 
 
 class ApiPersistenceTests(unittest.TestCase):
