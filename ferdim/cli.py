@@ -152,9 +152,13 @@ def cmd_list(a, env):
         print(_("cli_queue_empty"))
         return 0
     for j in st["jobs"]:
+        # uyari kodu (or. yumusak 404) satirin sonunda gorunur: 'done' gorunen
+        # bir is sessizce supheli kalmasin
+        warn = str(j.get("warning") or "")
+        tail = f"  ! {_('warn_' + warn)}" if warn else ""
         print(f"{j['id']:<10} {_('st_' + j['state']):<14} "
               f"{util.human_size(j['done']):>9}/{util.human_size(j['size']):<9} "
-              f"{util.human_size(j['speed']):>10}/sn  {j['filename']}")
+              f"{util.human_size(j['speed']):>10}/sn  {j['filename']}{tail}")
     return 0
 
 

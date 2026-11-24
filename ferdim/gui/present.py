@@ -56,6 +56,10 @@ def integrity_badge(job: dict, lang: str):
     elif merkle:              # ok / repaired / repairing
         parts.append(t("merkle_ok", lang))
         worst = max(worst, 1)
+    warn = str(job.get("warning") or "")
+    if warn:                  # or. soft_404: dosya yerinde, yalnizca uyari
+        parts.append(t("warn_" + warn, lang))
+        worst = max(worst, 2)
     if not parts:
         return None
     symbol, css = _BADGE[worst]

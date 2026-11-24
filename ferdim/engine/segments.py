@@ -16,6 +16,7 @@ import time
 import urllib.error
 from pathlib import Path
 
+from .. import util
 from ..ratelimit import TokenBucket
 from . import httpcli
 
@@ -134,14 +135,28 @@ def assemble(opt: httpcli.DlOptions, fd: int, meta: dict,
     throttled = [False]
 
     def persist(force=False):
-        import json as _j
         now = time.monotonic()
         if not force and now - last_save[0] < 2.0:
             return
         last_save[0] = now
-        tmp = Path(str(meta_path) + ".tmp")
-        tmp.write_text(_j.dumps(meta, ensure_ascii=False), "utf-8")
-        tmp.replace(meta_path)
+        # atomik + dayanikli: yarim/sifir dolu nokta dosyasi kalmasin
+        util.atomic_write_json(meta_path, meta)
+
+    def save_cursor(cur: int, tail: bool = False):
+        """Cikti fd'sini fsync eder, SONRA ilerlemeyi meta'ya yazar.
+
+        Kayit ancak baytlar diske indikten sonra ilerler: guc kesintisi
+        'tamamlanan segment' diye sifir dolu bolum birakmaz. Aralikli
+        yazimda 2 sn'de bir, bitiste kosulsuz."""
+        now = time.monotonic()
+        if not tail and now - last_save[0] < 2.0:
+            return
+        os.fsync(fd)
+        meta["done_segments"] = sorted(done)
+        meta["cursor"] = cur
+        if tail:
+            meta["tail"] = cur
+        persist(force=True)
 
     def seg_file(idx: int) -> Path:
         return segs_dir / f"{idx:06d}.seg"
@@ -167,7 +182,10 @@ def assemble(opt: httpcli.DlOptions, fd: int, meta: dict,
             if stop_event.is_set():
                 return
             tmp = f.with_suffix(".part")
-            tmp.write_bytes(data)
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())     # .seg adi ancak icerik diske inince
             tmp.replace(f)
             with lock:
                 fetched[0] += 1
@@ -193,6 +211,7 @@ def assemble(opt: httpcli.DlOptions, fd: int, meta: dict,
             return
         os.pwrite(fd, data, 0)
         cursor = len(data)
+        os.fsync(fd)                  # meta 'init_done' derken veri diskte
         meta["init_done"] = True
         meta["cursor"] = cursor
     for idx in range(len(seg_urls)):
@@ -205,12 +224,9 @@ def assemble(opt: httpcli.DlOptions, fd: int, meta: dict,
         os.pwrite(fd, data, cursor)
         cursor += len(data)
         done.add(idx)
-        meta["done_segments"] = sorted(done)
-        meta["cursor"] = cursor
-        persist()
+        save_cursor(cursor)
     os.ftruncate(fd, cursor)
-    meta["tail"] = cursor
-    persist(force=True)
+    save_cursor(cursor, tail=True)
     if progress_cb:
         progress_cb(0)
     cleanup(meta_path)
