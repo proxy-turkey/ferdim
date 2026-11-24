@@ -26,6 +26,8 @@ Requires:       hicolor-icon-theme
 # openSUSE: /usr/share/mozilla dizini bu pakete ait (mozilla-filesystem yok)
 %else
 Requires:       mozilla-filesystem
+# /usr/share/dbus-1/{services,interfaces} sahibi
+Requires:       dbus-common
 %endif
 Recommends:     python3-gobject
 Recommends:     firefox
@@ -70,7 +72,8 @@ install -D -m 0644 scripts/icons/ferdim.svg \
 install -D -m 0644 docs/%{srcname}.1 %{buildroot}%{_mandir}/man1/%{srcname}.1
 install -D -m 0644 docs/%{srcname}-nm.1 %{buildroot}%{_mandir}/man1/%{srcname}-nm.1
 install -D -m 0644 docs/%{srcname}-gui.1 %{buildroot}%{_mandir}/man1/%{srcname}-gui.1
-for m in %{srcname} %{srcname}-nm %{srcname}-gui; do
+install -D -m 0644 docs/%{srcname}-dbus.1 %{buildroot}%{_mandir}/man1/%{srcname}-dbus.1
+for m in %{srcname} %{srcname}-nm %{srcname}-gui %{srcname}-dbus; do
   install -D -m 0644 docs/tr/$m.1 %{buildroot}%{_mandir}/tr/man1/$m.1
 done
 
@@ -116,6 +119,11 @@ python3 -m unittest discover -s tests -v
 %{_datadir}/%{srcname}/
 %{_datadir}/applications/%{srcname}.desktop
 %{_datadir}/icons/hicolor/scalable/apps/%{srcname}.svg
+%if 0%{?suse_version}
+%dir %{_datadir}/dbus-1
+%dir %{_datadir}/dbus-1/interfaces
+%dir %{_datadir}/dbus-1/services
+%endif
 %{_datadir}/dbus-1/interfaces/org.%{srcname}.Daemon1.xml
 %{_datadir}/dbus-1/services/org.%{srcname}.Daemon.service
 %if 0%{?suse_version}
@@ -127,6 +135,7 @@ python3 -m unittest discover -s tests -v
 %{_mandir}/man1/%{srcname}.1*
 %{_mandir}/man1/%{srcname}-nm.1*
 %{_mandir}/man1/%{srcname}-gui.1*
+%{_mandir}/man1/%{srcname}-dbus.1*
 %lang(tr) %{_mandir}/tr/man1/%{srcname}*.1*
 
 # systemd USER unit: presets are applied by the user-unit scriptlets

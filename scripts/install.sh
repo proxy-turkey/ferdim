@@ -15,8 +15,9 @@ msg() { printf '\033[1;36m==> %s\033[0m\n' "$*"; }
 uninstall() {
   msg "FerDim kaldiriliyor..."
   rm -rf "$LIB"
-  rm -f "$BIN/ferdim" "$BIN/ferdim-nm" "$BIN/ferdim-gui"
+  rm -f "$BIN/ferdim" "$BIN/ferdim-nm" "$BIN/ferdim-gui" "$BIN/ferdim-dbus"
   rm -f "$ICONS/ferdim.svg" "$APPS/ferdim.desktop"
+  rm -f "$HOME/.local/share/dbus-1/services/org.ferdim.Daemon.service"
   rm -f "$HOME/.mozilla/native-messaging-hosts/ferdim.json"
   rm -f "$HOME/.var/app/org.mozilla.firefox/.mozilla/native-messaging-hosts/ferdim.json"
   rm -f "$HOME/.librewolf/native-messaging-hosts/ferdim.json"
@@ -46,6 +47,12 @@ msg "Calistirilabilirler -> $BIN"
 install -m 755 "$SRC/bin/ferdim" "$BIN/ferdim"
 install -m 755 "$SRC/bin/ferdim-nm" "$BIN/ferdim-nm"
 install -m 755 "$SRC/bin/ferdim-gui" "$BIN/ferdim-gui"
+install -m 755 "$SRC/bin/ferdim-dbus" "$BIN/ferdim-dbus"
+
+# D-Bus koprusu: oturum veri yolu etkinlestirmesi (istek uzerine baslar)
+mkdir -p "$HOME/.local/share/dbus-1/services"
+sed "s|@BIN@|$BIN/ferdim-dbus|g" "$SRC/data/org.ferdim.Daemon.service" \
+  > "$HOME/.local/share/dbus-1/services/org.ferdim.Daemon.service"
 
 msg "Masaustu entegrasyonu"
 install -m 644 "$SRC/scripts/icons/ferdim.svg" "$ICONS/ferdim.svg"

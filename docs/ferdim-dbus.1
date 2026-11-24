@@ -1,0 +1,31 @@
+.TH FERDIM-DBUS 1 "2026-11-24" "ferdim 1.5.1" "User Commands"
+.SH NAME
+ferdim-dbus \- D-Bus bridge for the FerDim download manager
+.SH SYNOPSIS
+.B ferdim-dbus
+.SH DESCRIPTION
+Optional session-bus service that owns the name
+.B org.ferdim.Daemon
+and exports the object
+.I /org/ferdim/Daemon
+with the interface
+.BR org.ferdim.Daemon1 :
+methods \fBAdd\fR(url), \fBPause\fR(id), \fBResume\fR(id), \fBCancel\fR(id),
+\fBList\fR() and \fBStats\fR() (both return JSON), the \fBVersion\fR property
+and the \fBChanged\fR(json) signal. It forwards every call to the
+.BR ferdim (1)
+daemon over its local socket. D-Bus activation starts the bridge on demand;
+desktop shells and the bundled GNOME Shell extension use it. Requires
+PyGObject (Gio).
+.SH FILES
+/usr/share/dbus-1/services/org.ferdim.Daemon.service
+.br
+/usr/share/dbus-1/interfaces/org.ferdim.Daemon1.xml
+.SH EXAMPLES
+gdbus call \-\-session \-\-dest org.ferdim.Daemon \-\-object\-path
+/org/ferdim/Daemon \-\-method org.ferdim.Daemon1.Stats
+.SH SEE ALSO
+.BR ferdim (1),
+.BR gdbus (1)
+.SH AUTHOR
+Enes Aksu <eaksu@pm.me>

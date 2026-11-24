@@ -1,0 +1,32 @@
+.\" -*- coding: UTF-8 -*-
+.TH FERDIM-DBUS 1 "2026-11-24" "ferdim 1.5.1" "Kullanıcı Komutları"
+.SH AD
+ferdim-dbus \- FerDim indirme yöneticisi için D-Bus köprüsü
+.SH ÖZET
+.B ferdim-dbus
+.SH AÇIKLAMA
+.B org.ferdim.Daemon
+adını alan ve
+.I /org/ferdim/Daemon
+nesnesini
+.B org.ferdim.Daemon1
+arayüzüyle sunan isteğe bağlı oturum veri yolu hizmeti: \fBAdd\fR(url),
+\fBPause\fR(id), \fBResume\fR(id), \fBCancel\fR(id), \fBList\fR() ve
+\fBStats\fR() (ikisi de JSON döndürür) yöntemleri, \fBVersion\fR özelliği ve
+\fBChanged\fR(json) sinyali. Her çağrıyı yerel soket üzerinden
+.BR ferdim (1)
+arka plan hizmetine iletir. D-Bus etkinleştirmesi köprüyü gerektiğinde
+başlatır; masaüstü kabukları ve paketle gelen GNOME Shell eklentisi onu
+kullanır. PyGObject (Gio) gerektirir.
+.SH DOSYALAR
+/usr/share/dbus-1/services/org.ferdim.Daemon.service
+.br
+/usr/share/dbus-1/interfaces/org.ferdim.Daemon1.xml
+.SH ÖRNEKLER
+gdbus call \-\-session \-\-dest org.ferdim.Daemon \-\-object\-path
+/org/ferdim/Daemon \-\-method org.ferdim.Daemon1.Stats
+.SH AYRICA BAKINIZ
+.BR ferdim (1),
+.BR gdbus (1)
+.SH YAZAR
+Enes Aksu <eaksu@pm.me>

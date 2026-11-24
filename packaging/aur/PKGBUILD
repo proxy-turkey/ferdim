@@ -32,6 +32,12 @@ package() {
   install -Dm755 bin/ferdim     "$pkgdir/usr/bin/ferdim"
   install -Dm755 bin/ferdim-nm  "$pkgdir/usr/bin/ferdim-nm"
   install -Dm755 bin/ferdim-gui "$pkgdir/usr/bin/ferdim-gui"
+  install -Dm755 bin/ferdim-dbus "$pkgdir/usr/bin/ferdim-dbus"
+  install -Dm644 data/org.ferdim.Daemon1.xml \
+    "$pkgdir/usr/share/dbus-1/interfaces/org.ferdim.Daemon1.xml"
+  install -d "$pkgdir/usr/share/dbus-1/services"
+  sed 's|@BIN@|/usr/bin/ferdim-dbus|' data/org.ferdim.Daemon.service \
+    > "$pkgdir/usr/share/dbus-1/services/org.ferdim.Daemon.service"
 
   install -d "$pkgdir/usr/share/applications"
   sed 's|@BIN@|/usr/bin/ferdim-gui|' scripts/ferdim.desktop \
@@ -39,7 +45,7 @@ package() {
   install -Dm644 scripts/icons/ferdim.svg \
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/$pkgname.svg"
   local m
-  for m in ferdim ferdim-nm ferdim-gui; do
+  for m in ferdim ferdim-nm ferdim-gui ferdim-dbus; do
     install -Dm644 "docs/$m.1" "$pkgdir/usr/share/man/man1/$m.1"
     install -Dm644 "docs/tr/$m.1" "$pkgdir/usr/share/man/tr/man1/$m.1"
   done

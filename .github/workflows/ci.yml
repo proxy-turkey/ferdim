@@ -31,7 +31,8 @@ jobs:
       - name: Syntax-check extension and web JS
         run: |
           for f in extension/background.js extension/popup.js \
-                   extension/options.js extension/overlay.js web/app.js; do
+                   extension/options.js extension/overlay.js extension/sniff.js \
+                   web/app.js; do
             node --check "$f"
           done
       - name: Validate JSON (manifest + locales)
