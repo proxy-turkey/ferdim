@@ -3,7 +3,7 @@
 FerDim is a dynamic, self-tuning download manager for Linux, built
 Fedora-first, with a Firefox WebExtension. The engine, CLI and daemon
 are **Python stdlib only** — no pip dependencies, ever. The web UI is
-dependency-free vanilla JS. The extension is Manifest V2.
+dependency-free vanilla JS. The extension is Manifest V3.
 
 State at authorship: **1.6.0 released**; test suite green (381 tests),
 `web-ext lint` 0 errors / 0 warnings, UI smoke checks green
@@ -58,6 +58,10 @@ checks, mock builds cleanly on Fedora 43.
 | `ferdim/notify.py`, `ferdim/dbusbridge.py` | Desktop notifications (gdbus/notify-send argv, coalesced); optional Gio session-bus bridge `org.ferdim.Daemon1` |
 | `gnome-shell-extension/` | GNOME Shell 47–49 panel extension (talks to `ferdim-dbus`) |
 | `extension/sniff.js` | Pure, testable response-header media classifier used by `background.js` |
+| `ferdim/peer.py`, `ferdim/tcpinfo.py` | Opt-in LAN peer cache (chunks by SHA-256, explicit manifests only); `TCP_INFO` reader + congestion signal |
+| `ferdim/metrics.py`, `ferdim/publish.py` | Prometheus `/metrics` collector; `ferdim publish` sidecar writer |
+| `tests/fuzz/` | Stdlib fuzz harness (`python3 -m tests.fuzz --seconds 60 --seed 1`); `known.json` must stay empty |
+| `packaging/flatpak/`, `docs/flatpak.md` | Flatpak manifests, AppStream metadata, native-messaging wrapper |
 | `packaging/aur/PKGBUILD` | Arch package; `.github/workflows/aur.yml` publishes it on tag |
 | `ferdim/metalink.py` | `.metalink` / `.meta4` (RFC 5854) parsing |
 | `ferdim/api.py` | Command handlers shared by socket and HTTP: token-auth API, metalink expansion (remote + local `add-file`), config sanitising (`_sanitize_config`), turbo/limit consistency, ZIP preview |
@@ -191,6 +195,13 @@ Read `job.py` before touching the engine. The invariants that matter:
 - **HTTP/3 is off by default** and `aioquic` must never be imported at core
   import time (a test checks `sys.modules`). `auto` falls back to TCP;
   `force` does not; proxies disable h3.
+- **Queue starts are asynchronous.** `_tick` dispatches `job.start` on a
+  short-lived thread; `_starting` reserves the slot until `start()` sets
+  `CONNECTING`, so `max_concurrent` holds across overlapping ticks.
+- **Peer prefill is explicit-only and bounded.** It runs only with an
+  explicit Merkle manifest, verifies every chunk, honours `_stop`, drops
+  its result when the run token changed, and stays within 3.5 s so pause
+  stays synchronous.
 - Archive extraction writes `member.part` then `os.replace` and records the
   member in `.ferdim-extract.json`; link and device members are never
   created; files FerDim did not write are not overwritten without `force`.
@@ -226,7 +237,9 @@ background task; it will fail on the password prompt.
    `docs/ferdim.1` / `ferdim-nm.1` / `ferdim-gui.1` and their Turkish
    twins in `docs/tr/` (`.TH` string; `tests/test_manpages.py` checks),
    `extension/manifest.json`, `pyproject.toml`, `packaging/aur/PKGBUILD`
-   (`pkgver`), `CHANGELOG.md`.
+   (`pkgver`), the GNOME extension `metadata.json` (`version-name`),
+   `packaging/flatpak/*.metainfo.xml` (`<release>`) and the Flatpak
+   manifest's tag archive + sha256, `CHANGELOG.md`.
 2. Gates: tests green, web-ext lint 0/0, `bash tests/ui/run.sh all`
    green, `bash tests/cli_smoke.sh` green against the installed build,
    rpmlint 0/0, mock build OK (its `%check` re-runs the suite),

@@ -4,6 +4,61 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [Unreleased]
+
+### Added
+- The Firefox extension is Manifest V3: links are grabbed through the
+  `scripting` API, per-tab media state lives in `storage.session` (it
+  survives event-page suspension), menus are registered on install and
+  startup. `scripts/build_mv3.sh` checks, lints and zips the build.
+- Host profiles in the web UI (Hosts dialog, per-host and "forget all")
+  and in the GTK app; HLS/DASH segment pools learn their worker count per
+  host and FTP jobs record RTT band and throughput.
+- Checksum / Merkle badges (ok, warning, mismatch) with the note as tooltip
+  in the web UI and the GTK app.
+- GTK app: archive browsing (nested listing, selective extraction,
+  repair), history window (search, state filter, re-download, totals),
+  host profiles, coexistence toggle and status. The GTK application id is
+  now `io.github.proxy_turkey.FerDim`.
+- HTTP/3: one QUIC connection per origin carries every range as its own
+  stream (32 per connection, 30 s idle close, shared event loop); sidecars,
+  m3u8/MPD manifests and segments use HTTP/3 when it is enabled. Each
+  stream buffers at most 1 MiB before the connection stops reading.
+- Coexistence mode also reacts to rising response times on our own links
+  (`coexist_latency`, default 2.5×), not only to foreign traffic.
+- Metalink documents may carry a Merkle manifest
+  (`<metaurl mediatype="application/x-ferdim-merkle">`, optional
+  `<hash type="ferdim-merkle-root">`); it is treated like `--merkle`.
+- `ferdim merkle make` is about ten times faster (≈58 MB/s); chunk
+  boundaries are byte-for-byte unchanged, published manifests stay valid.
+- Time-of-day speed plan (`speed_plan`, `ferdim speedplan`, web editor);
+  a manual `limit` overrides it until `limit plan`.
+- `GET /metrics` (token header) in Prometheus text format.
+- Congestion awareness from the kernel's `TCP_INFO` (`tcp_info`).
+- LAN peer cache (opt-in, `peer_cache`): chunks of explicitly
+  Merkle-verified downloads are shared by SHA-256 on the local network,
+  every chunk is verified before it is written.
+- `ferdim publish`: `.ferdim-merkle`, `.sha256` and `.meta4` files for
+  release directories.
+- Parser fuzzing (`python3 -m tests.fuzz`) for m3u8, MPD, metalink, Merkle
+  manifests, archive listings and SOCKS replies, with a CI job.
+- Flatpak manifests (`packaging/flatpak/`), AppStream metadata and a
+  native-messaging wrapper; tags attach a `.flatpak` bundle.
+- GNOME Shell extension prepared for extensions.gnome.org (review rules,
+  `scripts/pack_gnome_extension.sh`, tag workflow).
+
+### Fixed
+- One job stuck connecting to an unreachable host blocked every other
+  queued job: starts are dispatched off the queue tick now.
+- `retries` was ignored while probing the first connection.
+- A job could be reported `error` before its error text was set.
+- DASH: a `$Time$` value was used as a regex template; unbounded segment
+  counts (`SegmentTimeline`, `duration`, `SegmentList`) are capped.
+- Corrupt, encrypted or unsupported members inside nested archives no
+  longer abort listing or extraction.
+- Deeply nested JSON in a Merkle manifest raised `RecursionError`.
+- Pausing an HLS/DASH download under a speed limit was not synchronous.
+
 ## [1.6.0] — 2026-11-24
 
 ### Added

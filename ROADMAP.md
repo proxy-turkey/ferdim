@@ -98,48 +98,54 @@ Shipped in **1.6.0** together with the 2.0 research items below.
 
 ## 1.7 — finish what 1.6 started
 
+Shipped in **1.7.0** together with the 1.8 and 2.x items below.
+
 Every item here closes a gap that 1.6 shipped knowingly.
 
-- [ ] Manifest V3 build: replace `tabs.executeScript` in the link-grab path
+- [x] Manifest V3 build: replace `tabs.executeScript` in the link-grab path
       with the `scripting` API, keep event-page state in
       `storage.session`, ship MV3 once `scripts/build_mv3.sh` lints 0/0
       and loads (`docs/mv3-spike.md` has the plan).
-- [ ] Host profiles in the web UI and GTK app (today: CLI and API only),
+- [x] Host profiles in the web UI and GTK app (today: CLI and API only),
       with per-host "forget"; let HLS/DASH segment pools and FTP jobs learn
       too.
-- [ ] HTTP/3: reuse one QUIC connection per origin instead of one per
+- [x] HTTP/3: reuse one QUIC connection per origin instead of one per
       range; carry sidecars and HLS/DASH segments over h3 when enabled.
-- [ ] Coexistence mode: add a latency signal (RTT inflation on our own
+- [x] Coexistence mode: add a latency signal (RTT inflation on our own
       links) next to foreign-traffic accounting, so a busy line is detected
       before it saturates.
-- [ ] Merkle: show `merkle` / `checksum` warnings in the web UI and GTK
+- [x] Merkle: show `merkle` / `checksum` warnings in the web UI and GTK
       app; accept Merkle manifests inside metalink documents.
-- [ ] GTK app parity: archive browsing, history and coexistence toggle.
+- [x] GTK app parity: archive browsing, history and coexistence toggle.
 - [ ] GNOME Shell extension on extensions.gnome.org (reviewed, versioned
-      with the release).
+      with the release). (Review-ready and packed on every tag by
+      `.github/workflows/gnome-ext.yml`; the upload needs the maintainer's
+      EGO account.)
 
 ## 1.8 — reach and robustness
 
 - [ ] Flatpak on Flathub (daemon + GTK app + native-messaging bridge
-      for sandboxed Firefox).
-- [ ] Fuzz the parsers that read untrusted input — m3u8, MPD, metalink,
+      for sandboxed Firefox). (Manifests in `packaging/flatpak/` build,
+      lint and run locally; `.github/workflows/flatpak.yml` bundles every
+      tag; the Flathub submission is a maintainer PR — `docs/flatpak.md`.)
+- [x] Fuzz the parsers that read untrusted input — m3u8, MPD, metalink,
       `.ferdim-merkle`, archive listings, SOCKS replies — with a
       stdlib-only harness in CI.
-- [ ] Time-of-day speed profiles (e.g. 2 MB/s during work hours, maximum
+- [x] Time-of-day speed profiles (e.g. 2 MB/s during work hours, maximum
       power at night) on top of the existing schedule windows.
-- [ ] Metrics endpoint: per-host and aggregate counters (bytes, links,
+- [x] Metrics endpoint: per-host and aggregate counters (bytes, links,
       retries, throttles) in a plain text format for local monitoring.
-- [ ] Faster chunker for `ferdim merkle make` (today ~6 MB/s in pure
+- [x] Faster chunker for `ferdim merkle make` (today ~6 MB/s in pure
       Python; verification is already hashlib-bound).
 
 ## 2.x — research
 
-- [ ] LAN peer cache (opt-in): machines on the same network share
+- [x] LAN peer cache (opt-in): machines on the same network share
       already-verified chunks by Merkle hash instead of fetching them again
       from the internet.
-- [ ] Publisher tooling: a small static-site helper that emits
+- [x] Publisher tooling: a small static-site helper that emits
       `.ferdim-merkle` and metalink files next to release artefacts.
-- [ ] Congestion awareness: read the kernel's TCP info (RTT, retransmits)
+- [x] Congestion awareness: read the kernel's TCP info (RTT, retransmits)
       per link to steer the governor, not only throughput.
 
 ## Explicitly not planned

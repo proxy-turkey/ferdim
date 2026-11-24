@@ -53,9 +53,14 @@ front-ends: CLI, web UI, and GTK 4.
 | **Learned host profiles** | Each host remembers the link count the governor settled at, its safe ceiling after 429/503, a response-time band and the per-link speed (`hosts.json`, 500 hosts, 90-day expiry). New jobs start there instead of cold; the governor still probes both ways. `ferdim hosts` lists them, `learn_hosts = false` turns learning off. |
 | **Merkle verification** | A `.ferdim-merkle` manifest (content-defined chunks, SHA-256 per chunk, Merkle root) is discovered next to the URL or given with `--merkle`. A corrupt chunk is re-fetched **by range only** (at most twice) before the job completes; `ferdim merkle update` rebuilds a new version of a file from an old local copy and fetches only the changed chunks. |
 | **Coexistence mode** (opt-in) | `ferdim coexist on`: while other traffic on the line exceeds `coexist_threshold` (15 % of observed capacity) the queue halves every job's links, and rebuilds them after 10 quiet seconds. Off by default — maximum power stays the default. |
-| **HTTP/3** (optional) | `--http3 auto` (or the `http3` setting) uses QUIC when the server advertises it in `Alt-Svc` and falls back to TCP on any failure; `force` never falls back. Needs the optional `aioquic` module (`python3-aioquic`, `pip install ferdim[h3]`); without it nothing changes. |
+| **HTTP/3** (optional) | `--http3 auto` (or the `http3` setting) uses QUIC when the server advertises it in `Alt-Svc` and falls back to TCP on any failure; `force` never falls back. One QUIC connection per origin carries every range, sidecar and HLS/DASH segment as separate streams. Needs the optional `aioquic` module (`python3-aioquic`, `pip install ferdim[h3]`); without it nothing changes. |
 | **Archives** | ZIP (nested up to three levels) and tar (`.tar`, `.gz`, `.xz`, `.bz2`) listing, selective extraction and repair of an interrupted extraction (`.ferdim-extract.json` records size + CRC per member; only damaged members are rewritten). Path traversal, escaping links and decompression bombs are rejected. |
 | **Desktop integration** | Desktop notifications for completions, failures and verification results (portal → freedesktop → `notify-send`, bursts coalesced; `notify`, `notify_errors_only`). `ferdim-dbus` exports `org.ferdim.Daemon1` on the session bus (D-Bus activated); a GNOME Shell extension (47–49) shows speed and job controls in the panel. |
+| **Speed plan** | `speed_plan` rules (`mon-fri 09:00–18:00 → 2MB`, crossing midnight allowed, first match wins) set the global limit by time of day; a manual `ferdim limit` overrides the plan until `ferdim limit plan`. `ferdim speedplan`, web settings editor. |
+| **Congestion awareness** | Range workers read the kernel's `TCP_INFO` (RTT, retransmits) per link; when an extra link brings no throughput while retransmits and RTT climb, the governor stops probing upward (`adaptive = congestion`). `tcp_info = false` disables it. |
+| **LAN peer cache** (opt-in) | `peer_cache = true`: machines on the same LAN announce the Merkle roots they hold and serve chunks by SHA-256 only (private source addresses, rate-limited). A job with an explicit Merkle manifest takes matching chunks from peers — each verified before it is written — and fetches only the rest from the origin. |
+| **Metrics** | `GET /metrics` (token header required) in Prometheus text format: bytes, retries and 429/503 throttles per host, jobs per state, active links, aggregate speed, coexistence state. |
+| **Publisher tooling** | `ferdim publish DIR --base-url URL` writes `.ferdim-merkle`, `.sha256` and RFC 5854 `.meta4` files (plus `index.meta4`) next to release artefacts, byte-stable across runs — see [docs/publishing.md](docs/publishing.md). |
 
 Also included: queue with concurrency limits and a night-window scheduler,
 watched folders, global + per-job speed limits, clipboard watching (event-driven on Wayland),
@@ -98,6 +103,9 @@ sudo zypper install ferdim
 ```
 
 (Use `16.0` instead of `openSUSE_Tumbleweed` on Leap 16.0.)
+
+Flatpak: `packaging/flatpak/` (app id `io.github.proxy_turkey.FerDim`); every
+release attaches a `.flatpak` bundle — see [docs/flatpak.md](docs/flatpak.md).
 
 Arch Linux: `packaging/aur/PKGBUILD` builds with `makepkg -si`; the AUR
 package `ferdim` is updated from the same file on every release tag.
@@ -186,6 +194,9 @@ ferdim merkle make big.iso                      # publish big.iso.ferdim-merkle
 ferdim merkle update old.iso https://example.com/new.iso --manifest new.iso.ferdim-merkle
 ferdim coexist on                               # shed links while the line is busy
 ferdim add https://example.com/big.iso --http3 auto    # QUIC when advertised
+ferdim speedplan set '[{"days":"mon-fri","from":"09:00","to":"18:00","limit":"2MB"}]'
+ferdim publish ./release --base-url https://example.org/dl   # .ferdim-merkle + .meta4
+curl -s -H "X-FerDim-Token: $(cat ~/.local/state/ferdim/token)" http://127.0.0.1:8378/metrics
 ```
 
 - **Web UI** — `http://127.0.0.1:8378`: live queue, categories, speed/ETA,
@@ -257,6 +268,7 @@ tests/             unittest suite + local HTTP fixtures
 - [x] FTP/FTPS, SOCKS5, SQLite history, COPR/OBS/AUR (1.5)
 - [x] D-Bus, GNOME Shell, notifications, archives, host profiles (1.6)
 - [x] Coexistence mode, HTTP/3 extra, Merkle verification, Turkish man pages (1.6)
+- [x] MV3 extension, speed plan, metrics, congestion awareness, LAN peer cache, publisher tooling, fuzzing, Flatpak (1.7)
 
 What is left (official Fedora package, new locales, MV3) lives in
 [ROADMAP.md](ROADMAP.md).
