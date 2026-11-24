@@ -1,0 +1,21 @@
+#!/bin/sh
+# FerDim native messaging host for the Flatpak build.
+#
+# Firefox launches native messaging hosts as stdio children. A Flatpak
+# Firefox cannot execute this script from the host, so it reaches it through
+# xdg-native-messaging-proxy (or a host Firefox can invoke it directly).
+# The wrapper keeps the 4-byte-length + JSON frames on stdout untouched and
+# delegates to the sandboxed ferdim-nm, which owns the daemon socket there.
+set -eu
+
+APP_ID=io.github.proxy_turkey.FerDim
+
+if ! flatpak info "$APP_ID" >/dev/null 2>&1; then
+    echo "ferdim-nm-flatpak: $APP_ID is not installed (flatpak install --user ...)" >&2
+    exit 1
+fi
+
+# No --user here: works for a user-level and a system-level installation.
+# flatpak keeps stdin/stdout/stderr attached, which is all the native
+# messaging protocol needs.
+exec flatpak run --command=ferdim-nm "$APP_ID" "$@"
