@@ -40,6 +40,22 @@ def cmd_turbo(a, env):
     return 0
 
 
+def cmd_coexist(a, env):
+    """Birlikte yasam modu: hat mesgulken baglanti birak (varsayilan kapali)."""
+    with _client(env) as c:
+        if a.action == "status":
+            r = c.request("coexist")
+        else:
+            r = c.request("coexist", on=(a.action == "on"))
+    on = bool(r.get("enabled"))
+    print(f"{_('coexist')}: " + _("coexist_on" if on else "coexist_off"))
+    if on:
+        if r.get("active"):
+            print(_("coexist_active"))
+        print(_("coexist_hint"))
+    return 0
+
+
 def _add_file(c, path: str) -> int:
     """Yerel baglanti listesini / metalink belgesini kuyruga ekler;
     eklenen is sayisini dondurur."""
@@ -327,6 +343,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("action", choices=["on", "off", "status"], nargs="?",
                     default="status")
     sp.set_defaults(fn=cmd_turbo)
+
+    sp = sub.add_parser("coexist",
+                        help="birlikte yasam: hat mesgulken baglanti birak "
+                             "(on/off/status)")
+    sp.add_argument("action", choices=["on", "off", "status"], nargs="?",
+                    default="status")
+    sp.set_defaults(fn=cmd_coexist)
 
     sp = sub.add_parser("config", help="yapilandirmayi goster/degistir")
     sp.add_argument("--set", help='JSON, orn \'{"segments":16}\'')

@@ -41,6 +41,11 @@ DEFAULTS = {
     "history_days": 365,           # 0 = gecmisi sonsuza kadar sakla
     # --- ogrenilen ana makine profilleri (1.6) ---
     "learn_hosts": True,           # biten isin baglanti tavani/RTT'sini hatirla
+    # --- birlikte yasam (2.0) ---
+    # Varsayilan KAPALI: azami guc. Acilirsa hat mesgulken (yabanci trafik
+    # gozlenen kapasitenin bu oranini gecerse) baglanti sayisi yarilanir.
+    "coexist": False,
+    "coexist_threshold": 0.15,
 }
 
 

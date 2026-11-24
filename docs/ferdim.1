@@ -91,12 +91,24 @@ limit and the turbo state never disagree.
 .BI turbo " on|off|status"
 Toggle maximum-power defaults (32 links, unlimited speed, 8 concurrent jobs).
 .TP
+.BI coexist " on|off|status"
+Opt-in coexistence mode; off by default, so maximum power stays the default.
+While it is on the line is sampled once a second (\fI/proc/net/dev\fR;
+loopback and virtual interfaces are left out) and FerDim's own throughput is
+subtracted, leaving the foreign traffic. When that exceeds
+\fIcoexist_threshold\fR (default \fB0.15\fR, i.e. 15% of the observed line
+capacity) for a few seconds, every job gives up half of its connections (at
+least one stays) and the governor stops probing upwards; after ten quiet
+seconds the cap is released and links are rebuilt. The footer of the web UI
+shows the state.
+.TP
 .BI config " [\-\-set JSON]"
 Show or change settings: segments, concurrency, scheduler window and
 per-category windows (\fIschedule.categories\fR), language, watched
 folders (\fIwatch_dirs\fR, \fIwatch_done\fR = delete | rename | keep),
 automatic sidecar verification (\fIchecksum_sidecar\fR), retries and
-timeouts (\fItimeout\fR, \fIstall_timeout\fR) and download history
+timeouts (\fItimeout\fR, \fIstall_timeout\fR), coexistence mode
+(\fIcoexist\fR, \fIcoexist_threshold\fR) and download history
 retention (\fIhistory_days\fR, default 365 days, \fB0\fR keeps forever).
 .TP
 .BI history " [QUERY]"

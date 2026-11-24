@@ -92,6 +92,15 @@ def _sanitize_config(cfg: dict, env=None) -> None:
     lh = cfg.get("learn_hosts", True)
     cfg["learn_hosts"] = lh if isinstance(lh, bool) else \
         str(lh).strip().lower() not in ("0", "false", "no", "off")
+    # "coexist": ayni sekilde metin kabul edilir; esik 0.02-0.9 arasinda
+    cv = cfg.get("coexist", False)
+    cfg["coexist"] = cv if isinstance(cv, bool) else \
+        str(cv).strip().lower() not in ("0", "false", "no", "off", "")
+    try:
+        cfg["coexist_threshold"] = max(
+            0.02, min(0.9, float(cfg.get("coexist_threshold", 0.15))))
+    except (TypeError, ValueError):
+        cfg["coexist_threshold"] = 0.15
     dirs = cfg.get("watch_dirs")
     cfg["watch_dirs"] = [d for d in dirs if isinstance(d, str) and d.strip()] \
         if isinstance(dirs, list) else []
@@ -240,6 +249,14 @@ def handle(ctx, cmd: str, params: dict) -> dict:
                     "turbo": bool(cfg.get("turbo_mode"))}
         state = qm.set_turbo(bool(want))
         return {"ok": True, "turbo": state}
+    if cmd == "coexist":
+        want = params.get("on")
+        if want is None:
+            return {"ok": True, **qm.coexist_status()}
+        cfg["coexist"] = bool(want)
+        ctx["set_cfg"](cfg)
+        qm._coexist_tick()      # tavan hemen kurulur/birakilir
+        return {"ok": True, **qm.coexist_status()}
     if cmd == "stats" or cmd == "list" or cmd == "jobs":
         return {"ok": True, **qm.stats()}
     if cmd == "zip-preview":
