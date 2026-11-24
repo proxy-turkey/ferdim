@@ -31,6 +31,9 @@ class HostsWindow(Gtk.Window):
         self.listbox.set_placeholder(Gtk.Label(label=gtr("hosts_empty")))
         _a11y(self.listbox, "LABEL", [gtr("hosts_title")])
         box.append(scrolled(self.listbox))
+        # gorunum durumu: liste bos/gec gelen yanitta da guvenli okunur
+        self.rows: list[Gtk.ListBoxRow] = []
+        self.loaded = False
 
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         actions.set_margin_top(4)
@@ -51,6 +54,7 @@ class HostsWindow(Gtk.Window):
 
     # --------------------------------------------------------------- yukleme
     def load(self, *_a):
+        self.loaded = False
         request_async(self.app, "hosts", self._loaded)
         return False
 
@@ -61,17 +65,22 @@ class HostsWindow(Gtk.Window):
                 nxt = child.get_next_sibling()
                 self.listbox.remove(child)
                 child = nxt
+            self.rows = []
             if not res.get("ok"):
                 self._say(str(res.get("error") or ""))
                 return False
             rows = res.get("hosts") or []
             for h in rows:
-                self.listbox.append(self._row(h))
+                row = self._row(h)
+                self.listbox.append(row)
+                self.rows.append(row)
             if not rows and not self.status.get_text():
                 self._say(gtr("hosts_empty"))   # islem sonucu mesajini ezme
             self.forget_all_btn.set_sensitive(bool(rows))
         except Exception:
             pass
+        finally:
+            self.loaded = True
         return False
 
     def _row(self, h: dict) -> Gtk.ListBoxRow:
@@ -87,6 +96,7 @@ class HostsWindow(Gtk.Window):
         forget.connect("clicked", self._forget, host)
         line.append(text); line.append(forget)
         row.set_child(line)
+        row.host = host          # tuketiciler satir cocugunu kazimasin
         return row
 
     # --------------------------------------------------------------- eylemler

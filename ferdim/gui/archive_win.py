@@ -25,6 +25,10 @@ class ArchiveWindow(Gtk.Window):
         self.app = app
         self.job_id = job.get("id", "")
         self.task = ""
+        # gorev durumu: tuketiciler bir arsiv isleminin gercekten bitmesini
+        # (archive-status terminal) bekleyebilsin; dugme duyarliligi bu
+        # tamamlanma isaretine baglidir
+        self.task_done = False
         self.checks: list[tuple[Gtk.CheckButton, str]] = []
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.set_margin_top(10); box.set_margin_bottom(10)
@@ -126,8 +130,10 @@ class ArchiveWindow(Gtk.Window):
         if self.task:
             return
         members = [key for cb, key in self.checks if cb.get_active()]
+        self.task_done = False
         if not members:
             self._status(gtr("zip_sel_none"))
+            self.task_done = True
             return
         self._busy(True)
         request_async(self.app, "archive-extract", self._started,
@@ -136,6 +142,7 @@ class ArchiveWindow(Gtk.Window):
     def repair(self, _btn=None):
         if self.task:
             return
+        self.task_done = False
         self._busy(True)
         request_async(self.app, "archive-repair", self._started,
                       id=self.job_id)
@@ -144,6 +151,7 @@ class ArchiveWindow(Gtk.Window):
         try:
             if not res.get("ok"):
                 self._busy(False)
+                self.task_done = True
                 self._status(gtr("zip_nomf") if res.get("code") == "no_manifest"
                              else gtr("zip_failed",
                                       e=str(res.get("error") or "")))
@@ -167,6 +175,7 @@ class ArchiveWindow(Gtk.Window):
         try:
             if not st.get("ok"):
                 self.task = ""
+                self.task_done = True
                 self._busy(False)
                 self._status(gtr("zip_failed",
                                  e=str(st.get("error") or "")))
@@ -179,6 +188,7 @@ class ArchiveWindow(Gtk.Window):
             self.task = ""
             self._busy(False)
             self._done(st)
+            self.task_done = True
         except Exception:
             pass
         return False

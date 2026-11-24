@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -35,12 +36,17 @@ for _dom in ("Gtk", "GLib-GObject", "GLib", "Pango", "Gdk"):
     GLib.log_set_handler(_dom, GLib.LogLevelFlags.LEVEL_WARNING, _log, None)
 
 # --------------------------------------------------------------- yerel sunucu
+# Kosuya ozgu adlar: ayni XDG kokunu paylasan web testi (run.sh all) ayni
+# dosya adlarini indirdigi icin sabit adlar hedef dosya/cikarma dizini ve
+# gecmis aramasi uzerinden yarisa girerdi.
 WWW = tempfile.mkdtemp(prefix="ferdim-gtk-www-")
-ZIP_NAME = "arsiv.zip"
+RUN = f"gtk-{os.getpid()}-{int(time.time())}"
+ZIP_NAME = f"{RUN}-arsiv.zip"
+ADD_NAME = f"{RUN}-belge.bin"
 with zipfile.ZipFile(os.path.join(WWW, ZIP_NAME), "w") as _z:
     _z.writestr("a.txt", "a" * 3000)
     _z.writestr("b.txt", "b" * 2000)
-with open(os.path.join(WWW, "belge.bin"), "wb") as _f:
+with open(os.path.join(WWW, ADD_NAME), "wb") as _f:
     _f.write(b"x" * 5000)
 
 
@@ -54,7 +60,7 @@ SRV = http.server.ThreadingHTTPServer(
 threading.Thread(target=SRV.serve_forever, daemon=True).start()
 BASE_URL = f"http://127.0.0.1:{SRV.server_address[1]}"
 ZIP_URL = BASE_URL + "/" + ZIP_NAME
-ADD_URL = BASE_URL + "/belge.bin"
+ADD_URL = BASE_URL + "/" + ADD_NAME
 
 JOB = {"id": "smoke1", "filename": "ornek.zip", "url": "http://h/ornek.zip",
        "state": "downloading", "size": 1000, "done": 420, "speed": 123456,
@@ -78,17 +84,24 @@ class Smoke(A.FerdimApp):
         self.actions.append(("error", msg))
         Gtk.AlertDialog(message=msg).show(parent or self.get_active_window())
 
-    def until(self, name, cond, then, tries=80, detail=None):
-        """Kosul saglanana kadar 150 ms'de bir yoklar; saglanmazsa zaman
-        asimi kaydedip yine de devam eder (duman testi kilitlenmesin)."""
-        left = [tries]
+    POLL_MS = 100                 # yoklama araligi (GLib ana dongusu)
+    DEADLINE_S = 20.0             # kosul basina comert son tarih
+
+    def until(self, name, cond, then, deadline=None, detail=None):
+        """Kosul saglanana kadar GLib ana dongusunde yoklar.
+
+        Sure duvar saatinden olculur (yuk altinda 150 ms'lik sayim
+        gercekten 20 sn surmez); son tarih gecerse zaman asimi kaydedilir
+        ve zincir yine de devam eder ki duman testi kilitlenmesin."""
+        end = time.monotonic() + (self.DEADLINE_S if deadline is None
+                                  else float(deadline))
 
         def tick():
             try:
                 ok = bool(cond())
             except Exception:
                 ok = False
-            if ok or left[0] <= 0:
+            if ok or time.monotonic() >= end:
                 if not ok:
                     self.actions.append(("timeout", name))
                     if detail is not None:
@@ -101,9 +114,8 @@ class Smoke(A.FerdimApp):
                 except Exception as e:
                     self.actions.append(("exception", repr(e)))
                 return False
-            left[0] -= 1
             return True
-        GLib.timeout_add(150, tick)
+        GLib.timeout_add(self.POLL_MS, tick)
 
     def snapshot(self, job_id):
         try:
@@ -117,7 +129,7 @@ class Smoke(A.FerdimApp):
     def do_activate(self):
         super().do_activate()
         GLib.timeout_add(900, self.step)
-        GLib.timeout_add(60000, self._finish_once)
+        GLib.timeout_add(70000, self._finish_once)
 
     @staticmethod
     def windows(cls):
@@ -350,21 +362,6 @@ class Smoke(A.FerdimApp):
                    .get("state") == "done", self.open_archive)
         return False
 
-    def debug_zip(self):
-        snap = self.snapshot(self.zip_job) or {}
-        st = self.client.request("stats")
-        print("   zip-state:", snap.get("state"), snap.get("done"),
-              snap.get("size"), snap.get("error"), snap.get("error_code"),
-              "sched:", st.get("schedule_active"),
-              "cat:", snap.get("category"))
-        print("   jobs:", [(j.get("id")[:4], j.get("state"),
-                            j.get("category")) for j in st.get("jobs") or []])
-        cfg = self.cfg()
-        print("   cfg:", {k: cfg.get(k) for k in
-                          ("max_concurrent", "speed_limit", "turbo_mode",
-                           "schedule", "smart_queue")})
-        return False
-
     def open_archive(self):
         self.action(self.zip_job, "archive")
         wins = self.windows(ArchiveWindow)
@@ -379,13 +376,16 @@ class Smoke(A.FerdimApp):
         self.actions.append(("archive-entries", len(w.checks)))
         for cb, _key in w.checks[1:]:
             cb.set_active(False)          # yalniz ilk uyeyi cikar
-        self.until("archive-extract",
-                   lambda: w.status.get_text() != "" and w.task == "",
+        # pencere archive-status terminal (done/error) gorulunce
+        # task_done isaretler; disk yalniz ondan sonra denetlenir
+        self.until("archive-extract", lambda: w.task_done,
                    lambda: self.archive_extracted(w))
         w.extract()
 
     def archive_extracted(self, w):
-        dest = os.path.join(self.cfg().get("download_dir") or "", "arsiv")
+        # varsayilan cikarma hedefi: arsiv yaninda '<ad>/' (uzanti atilir)
+        dest = os.path.join(self.cfg().get("download_dir") or "",
+                            ZIP_NAME.rsplit(".zip", 1)[0])
         want = A.gtr("zip_extracted", n=1, dest=dest)
         self.actions.append(("archive-extract",
                              w.status.get_text().startswith(want)))
@@ -409,10 +409,12 @@ class Smoke(A.FerdimApp):
 
     def history_search(self, w):
         self.actions.append(("history-rows", len(w.recs) >= 1))
-        w.search.set_text("arsiv")
+        # kosuya ozgu ad: paylasilan daemon'un gecmisinde web testinden
+        # kalan "arsiv.zip" kayitlari da olabilir
+        w.search.set_text(RUN + "-arsiv")
         w.load()
         self.until("history-search",
-                   lambda: len(w.recs) == 1 and "arsiv" in
+                   lambda: len(w.recs) == 1 and (RUN + "-arsiv") in
                    str(w.recs[0][1].get("filename") or ""),
                    lambda: self.history_redownload(w))
 
@@ -445,19 +447,33 @@ class Smoke(A.FerdimApp):
         if not wins:
             return
         w = wins[-1]
-        self.until("hosts-list", lambda: w.listbox.get_first_child()
-                   is not None, lambda: self.hosts_forget(w))
+        # pencere yuklendi mi (bos liste de gecerli bir durumdur: run.sh all
+        # kosusunda web testi daemon'un profil deposunu onceden okumus olur,
+        # tohum o zaman gorunmez)
+        self.until("hosts-list", lambda: w.loaded,
+                   lambda: self.hosts_ready(w),
+                   detail=lambda: (w.loaded, len(w.rows),
+                                   w.status.get_text()))
 
-    def hosts_forget(self, w):
-        row = w.listbox.get_first_child()
-        text = row.get_child().get_first_child().get_text()
-        self._host = text.split()[0] if text else ""
-        self.actions.append(("hosts-row", bool(self._host)))
+    def hosts_ready(self, w):
+        """Profil varsa unut akislarini, yoksa bos durumu denetle."""
+        if not w.rows:
+            self.actions.append(("hosts-state",
+                                 w.status.get_text() == A.gtr("hosts_empty")
+                                 and not w.forget_all_btn.get_sensitive()))
+            w.close()
+            self.phase_coexist()
+            return
+        self.actions.append(("hosts-state", True))
+        self.actions.append(("hosts-row", True))
+        # satir kendi anahtarini tasir: cocuk zinciri kazilmez (liste
+        # yenilenirken cocuk None olabilir)
+        self._host = str(getattr(w.rows[0], "host", ""))
         w._forget(None, self._host)
         marked = []
 
         def forgotten_ok():
-            ok = (w.listbox.get_first_child() is None
+            ok = (not w.rows
                   and w.status.get_text()
                   == A.gtr("hosts_forgotten", host=self._host))
             if ok and not marked:
@@ -486,8 +502,9 @@ class Smoke(A.FerdimApp):
         self.until("hosts-forget-all", cleared_ok,
                    lambda: self.phase_coexist(w))
 
-    def phase_coexist(self, w):
-        w.close()
+    def phase_coexist(self, w=None):
+        if w is not None:
+            w.close()
         self.on_settings(None)
         wins = self.windows(A.SettingsWindow)
         if not wins:
@@ -556,9 +573,7 @@ class Smoke(A.FerdimApp):
                      ("history-rows", True),
                      ("history-redownload", True),
                      ("hosts-window", True),
-                     ("hosts-row", True),
-                     ("hosts-forget", True),
-                     ("hosts-forget-all", True),
+                     ("hosts-state", True),
                      ("coexist-toggle", True),
                      ("coexist-label", True),
                      ("coexist-restore", True),
