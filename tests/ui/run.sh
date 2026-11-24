@@ -40,6 +40,7 @@ RC=0
 if [ "$WHAT" = web ] || [ "$WHAT" = all ]; then
   ( cd "$REPO" && PORT="$DP" SRV="http://127.0.0.1:$SP" \
       SLOW="http://127.0.0.1:$SP/slow" TOKEN_PATH="$T/state/ferdim/token" \
+      SOCK="$T/state/ferdim/ferdim.sock" \
       timeout 240 python3 tests/ui/web_live.py ) || RC=1
 fi
 if [ "$WHAT" = gtk ] || [ "$WHAT" = all ]; then

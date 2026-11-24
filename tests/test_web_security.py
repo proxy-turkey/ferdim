@@ -1,9 +1,12 @@
 """Yerel web sunucusu guvenligi: DNS rebinding (Host) ve Origin kapisi,
-token karsilastirmasinin ASCII disi baslikta cokmemesi.
+token karsilastirmasinin ASCII disi baslikta cokmemesi, sayfaya token
+gomulmemesi.
 
 Rebinding saldirisi: dusman alan adi 127.0.0.1'e cozulur, tarayici ayni
 origin'i korur ve Host basligi saldirganin adidir. Sunucu Host'u gercek
-bagli portla karsilastirdigi icin token'in gomuldugu sayfa verilmez.
+bagli portla karsilastirir. Sayfa artik token tasimaz: tarayici tek
+kullanimlik biletle acilir (bkz. tests/test_web_session.py), sayfayi okuyan
+baska bir yerel kullanici API'ye erisemez.
 """
 from __future__ import annotations
 
@@ -24,7 +27,7 @@ TOKEN = "testtoken"
 
 
 def _request(path="/", method="GET", host=None, token=None, origin=None,
-             body=b"") -> bytes:
+             body=b"", ctype="application/json", length=None) -> bytes:
     lines = [f"{method} {path} HTTP/1.1", "Connection: close"]
     if host is not None:
         lines.append(f"Host: {host}")
@@ -32,14 +35,16 @@ def _request(path="/", method="GET", host=None, token=None, origin=None,
         lines.append(f"X-FerDim-Token: {token}")
     if origin is not None:
         lines.append(f"Origin: {origin}")
-    if body:
-        lines.append(f"Content-Length: {len(body)}")
-        lines.append("Content-Type: application/json")
+    if body or length is not None:
+        lines.append(f"Content-Length: {len(body) if length is None else length}")
+        if ctype is not None:
+            lines.append(f"Content-Type: {ctype}")
     return "\r\n".join(lines).encode("latin-1") + b"\r\n\r\n" + body
 
 
-def _raw(port: int, payload: bytes) -> tuple[int, bytes]:
-    """Ham HTTP istegi: urllib basliklari yeniden yaziyor, Host'u biz kurariz."""
+def _raw_full(port: int, payload: bytes) -> tuple[int, dict, bytes]:
+    """Ham HTTP istegi: urllib basliklari yeniden yaziyor, Host'u biz kurariz.
+    (durum, basliklar, govde) dondurur; baslik adlari kucuk harftir."""
     with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
         s.sendall(payload)
         chunks = []
@@ -50,8 +55,27 @@ def _raw(port: int, payload: bytes) -> tuple[int, bytes]:
             chunks.append(part)
     data = b"".join(chunks)
     head, _, body = data.partition(b"\r\n\r\n")
-    status = int(head.split(b" ")[1])
+    lines = head.split(b"\r\n")
+    status = int(lines[0].split(b" ")[1])
+    headers = {}
+    for ln in lines[1:]:
+        k, _, v = ln.partition(b":")
+        headers[k.strip().lower().decode()] = v.strip().decode()
+    return status, headers, body
+
+
+def _raw(port: int, payload: bytes) -> tuple[int, bytes]:
+    status, _headers, body = _raw_full(port, payload)
     return status, body
+
+
+def json_code(body: bytes) -> str:
+    """Yanit govdesindeki kararli hata kodunu okur (test yardimcisi)."""
+    import json
+    try:
+        return json.loads(body).get("code", "")
+    except Exception:
+        return ""
 
 
 class WebHostGuardTests(unittest.TestCase):
@@ -94,17 +118,33 @@ class WebHostGuardTests(unittest.TestCase):
         self.assertEqual(status, 421)
         self.assertEqual(body, b"")
 
-    def test_02_local_hosts_accepted(self):
+    def test_02_local_hosts_accepted_page_has_no_token(self):
         for host in (self.host, f"localhost:{self.port}",
                      f"[::1]:{self.port}"):
             with self.subTest(host=host):
                 status, body = _raw(self.port, _request("/", host=host))
                 self.assertEqual(status, 200)
-                self.assertIn(TOKEN.encode(), body)
+                # sayfa token GOMMEZ: yerel kullanici sayfayi okusa da
+                # API'yi kullanamaz (bilet yalniz Unix soketinden gelir)
+                self.assertNotIn(TOKEN.encode(), body)
+                self.assertNotIn(b"__TOKEN__", body)
+                self.assertNotIn(b"FERDIM_TOKEN", body)
                 status, body = _raw(self.port, _request(
                     "/api/stats", host=host, token=TOKEN))
                 self.assertEqual(status, 200)
                 self.assertIn(b'"jobs"', body)
+                # token'siz ayni yol 401
+                status, body = _raw(self.port, _request(
+                    "/api/stats", host=host))
+                self.assertEqual(status, 401)
+
+    def test_02b_index_is_served_verbatim(self):
+        # sunucu sayfayi oldugu gibi verir (yer tutucu degistirme yok)
+        raw = (self.env.web_dir / "index.html").read_bytes()
+        status, _headers, body = _raw_full(
+            self.port, _request("/index.html", host=self.host))
+        self.assertEqual(status, 200)
+        self.assertEqual(body, raw)
 
     def test_03_post_origin_guard(self):
         payload = b'{"id": "yok"}'
@@ -143,6 +183,89 @@ class WebHostGuardTests(unittest.TestCase):
             "/api/stats", host=self.host, token=TOKEN))
         self.assertEqual(status, 200)
         self.assertIn(b'"jobs"', body)
+
+    def test_05_post_requires_json_and_closes(self):
+        # icerik turu yanlis: 415, baglanti kapanir (okunmamis govde kalmasin)
+        status, headers, body = _raw_full(self.port, _request(
+            "/api/pause", method="POST", host=self.host, token=TOKEN,
+            body=b'{"id": "x"}', ctype="text/plain"))
+        self.assertEqual(status, 415)
+        self.assertEqual(headers.get("connection"), "close")
+        self.assertEqual(json_code(body), "content_type")
+        # govde var, Content-Type hic yok: ayni ret
+        status, _headers, body = _raw_full(self.port, _request(
+            "/api/pause", method="POST", host=self.host, token=TOKEN,
+            body=b'{"id": "x"}', ctype=None))
+        self.assertEqual(status, 415)
+        # parametreli JSON kabul edilir
+        status, body = _raw(self.port, _request(
+            "/api/pause", method="POST", host=self.host, token=TOKEN,
+            body=b'{"id": "yok"}', ctype="application/json; charset=utf-8"))
+        self.assertEqual(status, 200, body)
+
+    def test_06_body_cap(self):
+        # 1 MiB ustu govde okunmadan reddedilir: 413 + kapanis
+        status, headers, body = _raw_full(self.port, _request(
+            "/api/add", method="POST", host=self.host, token=TOKEN,
+            length=1024 * 1024 + 1, body=b""))
+        self.assertEqual(status, 413)
+        self.assertEqual(headers.get("connection"), "close")
+        self.assertEqual(json_code(body), "too_large")
+        # tam sinir kabul edilir (govde gercekten gonderilir)
+        filler = b" " * (1024 * 1024 - 2)
+        status, _headers, _body = _raw_full(self.port, _request(
+            "/api/clear-finished", method="POST", host=self.host, token=TOKEN,
+            body=b"{}" + filler))
+        self.assertNotEqual(status, 413)
+
+    def test_07_early_rejects_close_connection(self):
+        cases = {
+            # 401: token yok
+            "401": _request("/api/stats", host=self.host),
+            # 404: bilinmeyen API yolu (token'li)
+            "404": _request("/api/yok", host=self.host, token=TOKEN),
+            # 403: capraz origin
+            "403": _request("/api/pause", method="POST", host=self.host,
+                            token=TOKEN, body=b"{}",
+                            origin="https://evil.example"),
+            # 413: govde siniri
+            "413": _request("/api/pause", method="POST", host=self.host,
+                            token=TOKEN, length=2 * 1024 * 1024, body=b""),
+            # 415: icerik turu
+            "415": _request("/api/pause", method="POST", host=self.host,
+                            token=TOKEN, body=b"{}", ctype="text/plain"),
+        }
+        for name, payload in cases.items():
+            with self.subTest(code=name):
+                status, headers, body = _raw_full(self.port, payload)
+                self.assertEqual(status, int(name))
+                self.assertEqual(headers.get("connection"), "close", name)
+                self.assertNotIn(b"jobs", body)
+                # erken rette govde JSON'dur; token asla sizmaz
+                self.assertNotIn(TOKEN.encode(), body)
+
+    def test_08_internal_error_hides_text(self):
+        from ferdim import api
+        real = api.handle
+
+        def boom(_ctx, _cmd, _params):
+            raise RuntimeError("gizli-ayrinti-123")
+
+        api.handle = boom
+        try:
+            status, _headers, body = _raw_full(self.port, _request(
+                "/api/pause", method="POST", host=self.host, token=TOKEN,
+                body=b'{"id": "x"}'))
+        finally:
+            api.handle = real
+        self.assertEqual(status, 500)
+        self.assertEqual(json_code(body), "internal")
+        self.assertNotIn(b"gizli-ayrinti-123", body)
+        self.assertNotIn(b"RuntimeError", body)
+        # sunucu ayakta: sonraki istek normal cevap alir
+        status, body = _raw(self.port, _request(
+            "/api/stats", host=self.host, token=TOKEN))
+        self.assertEqual(status, 200)
 
 
 if __name__ == "__main__":

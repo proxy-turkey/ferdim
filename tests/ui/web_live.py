@@ -1,9 +1,12 @@
 """FerDim web arayuzu canli testi: yaltilmis daemon + gercek Chromium
-(playwright). PORT, SRV, SLOW, TOKEN_PATH cevre degiskenlerini run.sh verir;
-UI_SHOTS verilirse ekran goruntuleri oraya yazilir (yoksa gecici dizin)."""
+(playwright). PORT, SRV, SLOW, TOKEN_PATH, SOCK cevre degiskenlerini run.sh
+verir; UI_SHOTS verilirse ekran goruntuleri oraya yazilir (yoksa gecici
+dizin). Sayfa token tasimaz: tarayici, soketten alinan tek kullanimlik
+biletli adresle (#s=<nonce>) acilir."""
 import datetime as dt
 import json
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -15,8 +18,29 @@ PORT = int(os.environ["PORT"])
 SRV = os.environ["SRV"]
 SLOW = os.environ["SLOW"]
 TOKEN = open(os.environ["TOKEN_PATH"]).read().strip()
+SOCK = os.environ.get("SOCK") or os.path.join(
+    os.path.dirname(os.environ["TOKEN_PATH"]), "ferdim.sock")
 OUT = os.environ.get("UI_SHOTS") or tempfile.mkdtemp(prefix="ferdim-ui-shots-")
 fails, errors = [], []
+
+
+def web_session() -> str:
+    """`ferdim web` ile ayni yol: soketten bilet, tek kullanimlik adres."""
+    req = json.dumps({"cmd": "web-session", "req_id": 1}).encode() + b"\n"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(10)
+        s.connect(SOCK)
+        s.sendall(req)
+        buf = b""
+        while b"\n" not in buf:
+            part = s.recv(65536)
+            if not part:
+                break
+            buf += part
+    r = json.loads(buf.split(b"\n", 1)[0])
+    if not r.get("ok") or not r.get("url"):
+        raise SystemExit(f"web-session basarisiz: {r}")
+    return r["url"]
 
 
 def api(path, body=None):
@@ -99,7 +123,12 @@ with sync_playwright() as p:
 
     page.on("pageerror", lambda e: errors.append("pageerror: " + str(e)))
     page.on("console", on_console)
-    page.goto(f"http://127.0.0.1:{PORT}/")
+    url = web_session()
+    page.goto(url)
+    # bilet adres cubugundan silinmis olmali (#s=... kalici olmamali)
+    check("bilet adres cubugundan silinir",
+          "#s=" not in page.url and page.url.startswith(
+              f"http://127.0.0.1:{PORT}/"), page.url)
     page.wait_for_selector("#jobList .row", timeout=15000)
     page.wait_for_timeout(900)
 
@@ -126,6 +155,21 @@ with sync_playwright() as p:
           page.evaluate("""() => [...document.querySelectorAll('#jobList .act')]
              .filter(b => !b.hidden && !(b.getAttribute('aria-label') || '').trim()).length""") == 0)
     check("atla baglantisi", page.locator("a.skip").get_attribute("href") == "#jobPanel")
+
+    # --------------------------------------- oturumsuz sayfa (token sizmaz)
+    # Sayfayi okuyabilen baska bir yerel kullanici API'yi kullanamaz: token
+    # gomulmez, sayfa yalniz "ferdim web" iletisini gosterir.
+    ctx0 = browser.new_context(viewport={"width": 1000, "height": 700},
+                               locale="tr-TR")
+    p0 = ctx0.new_page()
+    p0.goto(f"http://127.0.0.1:{PORT}/")
+    p0.wait_for_selector("#noSession", state="visible", timeout=10000)
+    check(" bilet yok: yonlendirme iletisi gorunur",
+          "ferdim web" in p0.inner_text("#noSession"), p0.inner_text("#noSession"))
+    check(" bilet yok: is listesi bos",
+          p0.locator("#jobList .row").count() == 0)
+    check(" bilet yok: token sayfada yok", TOKEN not in p0.content())
+    ctx0.close()
 
     # --------------------------------------------------------- icerik
     txt = page.inner_text("#jobList")
@@ -456,7 +500,7 @@ with sync_playwright() as p:
     page2 = ctx2.new_page()
     perr = []
     page2.on("pageerror", lambda e: perr.append(str(e)))
-    page2.goto(f"http://127.0.0.1:{PORT}/")
+    page2.goto(web_session())
     page2.wait_for_selector("#jobList .row")
     check(" prefers-reduced-motion:Transition yok", page2.evaluate(
         "getComputedStyle(document.querySelector('.bar i')).transitionDuration") == "0s")

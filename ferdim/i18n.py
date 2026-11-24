@@ -28,6 +28,11 @@ S = {
     "h_new":         {"en": "New Download", "tr": "Yeni İndirme", "es": "Nueva descarga", "ru": "Новая загрузка"},
     "h_settings":    {"en": "Settings", "tr": "Ayarlar", "es": "Ajustes", "ru": "Настройки"},
     "web_ui":        {"en": "Web UI", "tr": "Web Arayüzü", "es": "Interfaz web", "ru": "Веб-интерфейс"},
+    "web_no_session": {
+        "en": "This page needs a one-time session link. Open the web UI with the \u201cferdim web\u201d command, the FerDim app, or the browser extension.",
+        "tr": "Bu sayfa tek kullanımlık bir oturum bağlantısı ister. Web arayüzünü \u201cferdim web\u201d komutuyla, FerDim uygulamasıyla ya da tarayıcı eklentisiyle açın.",
+        "es": "Esta página necesita un enlace de sesión de un solo uso. Abre la interfaz web con el comando \u201cferdim web\u201d, la aplicación FerDim o la extensión del navegador.",
+        "ru": "Этой странице нужна одноразовая ссылка сеанса. Откройте веб-интерфейс командой \u201cferdim web\u201d, в приложении FerDim или через расширение браузера."},
     # ---------------------------------------------------------------- turbo
     "turbo":         {"en": "Turbo", "tr": "Turbo", "es": "Turbo", "ru": "Турбо"},
     "turbo_on":      {"en": "TURBO ON", "tr": "TURBO AÇIK", "es": "TURBO ACTIVADO", "ru": "ТУРБО ВКЛ"},
