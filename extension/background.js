@@ -1,9 +1,11 @@
 /* FerDim Entegrasyon Modülü - arka plan betigi
  * Davranis modeli:
  *  - tarayici indirmesini yakala -> iptal et -> FerDim'e aktar
- *  - video/ses medyalarini webRequest ile dinle, sayfa basliginda rozet
+ *  - medya/indirme adaylarini webRequest ile dinle (siniflandirma
+ *    sniff.js icinde, saf fonksiyon), sayfa basliginda rozet
  *  - sag tik menusu, "tum baglantilari tara" (grab) kutuphanesi
  */
+/* global FerDimSniff */
 "use strict";
 
 const NATIVE = "ferdim";
@@ -29,7 +31,15 @@ let hostOk = false;
 let hostPort = 8378;
 let hostTurbo = false;
 
-/* mediaByTab: tabId -> Map(url -> {url,size,mime,filename,ext}) */
+/* MV2 (browser_action/page_action) ile MV3 (action) ayni kodu paylassin:
+ * docs/mv3-spike.md. MV3 action'da show/hide yok, rozet zaten gorunur. */
+const toolbar = browser.browserAction || browser.action;
+const pageButton = browser.pageAction || {
+  show: () => Promise.resolve(),
+  hide: () => Promise.resolve(),
+};
+
+/* mediaByTab: tabId -> Map(url -> sniff.js verdict'i) */
 const mediaByTab = new Map();
 const grabsByTab = new Map(); // tabId -> [link]
 
@@ -56,23 +66,19 @@ async function pingHost() {
   } catch (e) {
     hostOk = false;
   }
-  browser.browserAction.setBadgeBackgroundColor(
+  toolbar.setBadgeBackgroundColor(
     { color: hostOk ? "#22c55e" : "#ef4444" });
   return hostOk;
 }
 
 /* ------------------------------------------------------------------ utils */
-function headerValue(headers, name) {
-  const h = (headers || []).find((x) =>
-    (x.name || "").toLowerCase() === name);
-  return h ? h.value : "";
-}
 function nameFromUrl(u) {
   try {
     const p = new URL(u).pathname.split("/").filter(Boolean).pop() || "";
     return decodeURIComponent(p);
   } catch { return ""; }
 }
+/* Tarayici indirmesi devralinirken kullanilir (baslik yok, yalnizca URL+mime). */
 function looksMedia(u, mime) {
   const ul = (u || "").toLowerCase().split("?")[0];
   if (/\.(mp4|mkv|webm|flv|avi|mov|m4v|ts|3gp|ogv|m3u8|mpd)$/.test(ul)) return true;
@@ -81,12 +87,6 @@ function looksMedia(u, mime) {
   if (m.startsWith("video/") || m.includes("mpegurl")) return true;
   if (m.startsWith("audio/")) return "audio";
   return false;
-}
-function humanSize(n) {
-  if (!n || n < 0) return "";
-  const u = ["B", "KB", "MB", "GB"]; let i = 0;
-  while (n >= 1024 && i < 3) { n /= 1024; i++; }
-  return (i ? n.toFixed(1) : n) + " " + u[i];
 }
 
 /* ------------------------------------------------------- indirme yakalama */
@@ -160,45 +160,53 @@ function notify(title, message) {
 }
 
 /* ------------------------------------------------------- medya dinleyicisi */
+/* Siniflandirma sniff.js icinde (saf fonksiyon); burada yalnizca kablolama:
+ * parca isteklerini ele, rozette medya sayisi tut, overlay'e haber ver. */
 function onHeaders(details) {
   if (details.tabId < 0) return;
-  const ct = (headerValue(details.responseHeaders, "content-type") || "").toLowerCase();
-  const cd = headerValue(details.responseHeaders, "content-disposition");
-  const size = parseInt(headerValue(details.responseHeaders, "content-length") || "0", 10);
-  const url = details.url;
-  const kind = looksMedia(url, ct);
-  if (!kind) return;
-  if (kind === "audio" && !opts.includeAudio) return;
-  if (kind === true && size && size < (opts.minMediaMB || 0) * 1048576) return;
-  // sayfa icerigi degil, indirme amacli oge olmali (ana cerceve harici)
-  let filename = nameFromUrl(url);
-  const m = /filename="?([^";]+)"?/i.exec(cd || "");
-  if (m) filename = decodeURIComponent(m[1]);
-  if (!filename) return;
+  const hit = FerDimSniff.classify(
+    { url: details.url, status: details.statusCode,
+      headers: details.responseHeaders },
+    { minBytes: Math.round((opts.minMediaMB || 0) * 1048576) });
+  if (!hit) return;
+  if (hit.kind === "audio" && !opts.includeAudio) return;
+  // HLS/DASH parcasi: indirilecek oge manifesttir, parca degil
+  if (hit.role === "segment") return;
 
   let map = mediaByTab.get(details.tabId);
+  const manifestSeen = map ? hasManifest(map) : false;
+  if (hit.segmentish && manifestSeen) return;
+  if (map && map.has(hit.url)) return;
   if (!map) { map = new Map(); mediaByTab.set(details.tabId, map); }
-  if (!map.has(url)) {
-    map.set(url, { url, size, mime: ct || (kind === "audio" ? "audio/*" : "video/*"),
-                   filename, kind });
-    if (map.size > 60) map.delete(map.keys().next().value);
-    updateBadge(details.tabId);
-    if (opts.overlayButton) {
-      browser.tabs.sendMessage(details.tabId, {
-        ferdimMedia: true, count: map.size,
-      }).catch(() => {});
-    }
+  map.set(hit.url, hit);
+  if (hit.role === "manifest") dropSegments(map);
+  if (map.size > 60) map.delete(map.keys().next().value);
+  updateBadge(details.tabId);
+  if (opts.overlayButton) {
+    browser.tabs.sendMessage(details.tabId, {
+      ferdimMedia: true, count: map.size,
+    }).catch(() => {});
   }
+}
+
+function hasManifest(map) {
+  for (const it of map.values()) if (it.role === "manifest") return true;
+  return false;
+}
+
+/* Manifest bulundu: daha once eklenmis parca kayitlari listeden cikar. */
+function dropSegments(map) {
+  for (const it of map.values()) if (it.segmentish) map.delete(it.url);
 }
 
 function updateBadge(tabId) {
   const map = mediaByTab.get(tabId);
   const n = map ? map.size : 0;
   if (opts.badge) {
-    browser.browserAction.setBadgeText({ tabId, text: n ? String(n) : "" });
+    toolbar.setBadgeText({ tabId, text: n ? String(n) : "" });
   }
-  if (n) browser.pageAction.show(tabId);
-  else browser.pageAction.hide(tabId).catch(() => {});
+  if (n) pageButton.show(tabId);
+  else pageButton.hide(tabId).catch(() => {});
 }
 
 browser.tabs.onRemoved.addListener((tabId) => {
@@ -228,7 +236,7 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
     if (u) await handoff(u, { referer, filename: nameFromUrl(u) });
   } else if (info.menuItemId === "fd-page" || info.menuItemId === "fd-selection") {
     await grabTab(tab.id, info.menuItemId === "fd-selection");
-    browser.pageAction.show(tab.id).catch(() => {});
+    pageButton.show(tab.id).catch(() => {});
   }
 });
 
@@ -300,7 +308,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.getTurbo) return sendResponse({ ok: true, turbo: hostTurbo });
     if (msg.openPanel && sender.tab) {
-      browser.pageAction.show(sender.tab.id).catch(() => {});
+      pageButton.show(sender.tab.id).catch(() => {});
       return sendResponse({ ok: true });
     }
     sendResponse({ ok: false });
@@ -313,7 +321,8 @@ browser.downloads.onCreated.addListener(onDownloadCreated);
 browser.webRequest.onHeadersReceived.addListener(
   onHeaders,
   { urls: ["http://*/*", "https://*/*"],
-    types: ["media", "xmlhttprequest", "other", "sub_frame", "object"] },
+    types: ["main_frame", "sub_frame", "media", "xmlhttprequest", "other",
+            "object"] },
   ["responseHeaders"]);
 
 loadOpts().then(async () => {

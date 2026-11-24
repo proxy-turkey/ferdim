@@ -31,7 +31,7 @@
   "takeoverOff": {"message": "Desactivado (solo menú contextual)"},
   "minTakeover": {"message": "Omitir archivos menores de (MB, 0 = todos)"},
   "secMedia": {"message": "Captura de vídeo / multimedia"},
-  "minMedia": {"message": "Capturar medios mayores de (MB)"},
+  "minMedia": {"message": "Capturar medios o archivos mayores de (MB)"},
   "includeAudio": {"message": "Capturar también archivos de audio"},
   "badge": {"message": "Mostrar contador en la barra de herramientas"},
   "overlayButton": {"message": "Mostrar botón flotante «Descargar con FerDim» en las páginas"},

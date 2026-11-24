@@ -31,7 +31,7 @@
   "takeoverOff": {"message": "Kapalı (sadece sağ tık menü)"},
   "minTakeover": {"message": "Şu boyuttan küçükleri dokunma (MB, 0 = hepsi)"},
   "secMedia": {"message": "Video / medya yakalama"},
-  "minMedia": {"message": "Şu boyuttan büyük medyayı yakala (MB)"},
+  "minMedia": {"message": "Şu boyuttan büyük medya/dosyaları yakala (MB)"},
   "includeAudio": {"message": "Ses dosyalarını da yakala"},
   "badge": {"message": "Araç çubuğunda sayı rozeti göster"},
   "overlayButton": {"message": "Sayfada köşede “FerDim ile indir” düğmesi göster"},
