@@ -5,9 +5,11 @@ import hashlib
 import json
 import os
 import signal
+import socketserver
 import struct
 import subprocess
 import sys
+import threading
 import time
 import unittest
 import urllib.request
@@ -16,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from ferdim import nativehost
 from ferdim.client import FerdimClient
 from tests.helpers import DATA, DATA_SHA, start_server, tmp_root
 
@@ -200,6 +203,124 @@ class RpcNativeTests(unittest.TestCase):
 
         p.stdin.close()
         p.wait(timeout=10)
+
+
+class _Recorder(socketserver.ThreadingUnixStreamServer):
+    """Soket protokolunu taklit eden kayit sunucusu (gercek kuyruk yok)."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, path, seen):
+        self.seen = seen
+        super().__init__(str(path), _RecordHandler)
+
+
+class _RecordHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        for line in self.rfile:
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            self.server.seen.append(msg)
+            self.wfile.write(b'{"ok": true}\n')
+            self.wfile.flush()
+
+
+class NativeHostFilterTests(unittest.TestCase):
+    """Eklenti cerceveleri: toplu indirme alanlari filtrelenir, nesne
+    olmayan JSON cercevesi hata yaniti alir (surec devrilmez)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = tmp_root(cls, "ferdim-nm-")
+        cfgdir = cls.root / "config" / "ferdim"
+        cfgdir.mkdir(parents=True, exist_ok=True)
+        (cfgdir / "config.json").write_text(
+            json.dumps({"download_dir": str(cls.root / "dl")}))
+        cls.sock = cls.root / "state" / "ferdim" / "ferdim.sock"
+        cls.sock.parent.mkdir(parents=True, exist_ok=True)
+        cls.seen = []
+        cls.srv = _Recorder(cls.sock, cls.seen)
+        cls.addClassCleanup(cls.srv.server_close)
+        cls.addClassCleanup(cls.srv.shutdown)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    def _host(self):
+        p = subprocess.Popen(
+            [sys.executable, "-m", "ferdim.nativehost"],
+            env=_env(self.root),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL)
+        # LIFO: once borular kapanir, en son bekle
+        self.addCleanup(p.wait, 10)
+        self.addCleanup(p.stdin.close)
+        self.addCleanup(p.stdout.close)
+        return p
+
+    @staticmethod
+    def _send(p, obj):
+        data = json.dumps(obj).encode()
+        p.stdin.write(struct.pack("<I", len(data)) + data)
+        p.stdin.flush()
+
+    @staticmethod
+    def _recv(p):
+        raw = p.stdout.read(4)
+        if len(raw) != 4:
+            raise AssertionError("native host yanit vermeden kapandi")
+        (n,) = struct.unpack("<I", raw)
+        return json.loads(p.stdout.read(n))
+
+    def test_01_batch_and_download_only_forward_whitelisted_keys(self):
+        p = self._host()
+        start = len(self.seen)
+        self._send(p, {"cmd": "download-batch", "items": [
+            {"url": "http://127.0.0.1:1/a.bin", "filename": "a.bin",
+             "referer": "http://sayfa/", "cookies": "k=v", "ua": "UA",
+             "segments": 4, "merkle": "/etc/passwd",
+             "proxy": "socks5://127.0.0.1:9", "insecure": True,
+             "headers": ["X: y"], "checksum": "sha256:" + "0" * 64},
+            "bozuk-oge",                       # dict degil: atlanir
+            {"url": "http://127.0.0.1:1/b.bin", "filename": "b.bin"},
+        ]})
+        r = self._recv(p)
+        self.assertTrue(r["ok"], r)
+        batch = next(m for m in self.seen[start:]
+                     if m.get("cmd") == "add-batch")
+        items = batch["items"]
+        self.assertEqual([it["filename"] for it in items],
+                         ["a.bin", "b.bin"])
+        allowed = set(nativehost.DOWNLOAD_DEFAULTS)
+        for it in items:
+            self.assertLessEqual(set(it), allowed)
+        for banned in ("merkle", "proxy", "insecure", "headers", "checksum"):
+            self.assertNotIn(banned, items[0])
+
+        # tek 'download' ayni kumeyi kullanir (parite)
+        start = len(self.seen)
+        self._send(p, {"cmd": "download", "url": "http://127.0.0.1:1/c.bin",
+                       "filename": "c.bin", "merkle": "/etc/passwd",
+                       "proxy": "socks5://127.0.0.1:9", "insecure": True})
+        self.assertTrue(self._recv(p)["ok"])
+        add = next(m for m in self.seen[start:] if m.get("cmd") == "add")
+        self.assertLessEqual(set(add) - {"cmd"}, allowed)
+        self.assertNotIn("merkle", add)
+
+    def test_02_non_dict_frames_answer_with_error(self):
+        p = self._host()
+        for frame in ([1, 2], "metin", None):
+            with self.subTest(frame=frame):
+                self._send(p, frame)
+                r = self._recv(p)
+                self.assertFalse(r["ok"], r)
+                self.assertIn("gecersiz", r["error"])
+        # surec ayakta: sonraki komut normal yanitlanir
+        self._send(p, {"cmd": "ping"})
+        r = self._recv(p)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["inReplyTo"], "ping")
 
 
 if __name__ == "__main__":

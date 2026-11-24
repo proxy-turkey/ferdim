@@ -1,8 +1,10 @@
 """127.0.0.1 HTTP API + yerel web arayuzu.
 
-Guvenlik: tum /api cagrilari X-FerDim-Token basligi ister (sabit zaman
-karsilastirmasi). Browser ayni origin oldugu icin token sayfaya gomulur;
-dis origin'ler SOP + preflight'siz engellenir.
+Guvenlik: Host basligi yalnizca gercek yerel ad + bagli portu kabul eder
+(DNS rebinding: dusman alan adi 127.0.0.1'e cozulse bile token'i okuyamaz).
+Tum /api ve /metrics cagrilari X-FerDim-Token ister (bayt bazinda sabit
+zamanli karsilastirma). Yazma amacli POST /api cagrilarinda Origin de
+yerel olmali; curl gibi Origin gondermeyen istemciler token ile gecer.
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ from .. import metrics as _metrics
 
 def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
     token = Path(env.token_path).read_text().strip()
+    token_b = token.encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -27,6 +30,30 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
             pass
 
         # ---------------------------------------------------------- helpers
+        def _local_hosts(self) -> tuple[str, str, str]:
+            """Gercek bagli portla yerel Host degerleri; rebinding'i keser."""
+            port = self.server.server_address[1]
+            return (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}")
+
+        def _host_ok(self) -> bool:
+            hosts = self.headers.get_all("Host") or []
+            # tam olarak bir Host: cift baslik (smuggling) de reddedilir
+            return (len(hosts) == 1
+                    and hosts[0].strip() in self._local_hosts())
+
+        def _origin_ok(self) -> bool:
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return True     # curl/CLI: Origin gondermez, token yeter
+            return origin.strip() in {f"http://{h}" for h in self._local_hosts()}
+
+        def _reject(self, code: int):
+            # govdesiz ret: token ve sayfa icerigi sizmaz
+            self.send_response(code)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
         def _send_json(self, obj, code=200):
             body = (json.dumps(obj, ensure_ascii=False)).encode()
             self.send_response(code)
@@ -62,11 +89,16 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
             self.wfile.write(body)
 
         def _authorized(self) -> bool:
+            # hmac.compare_digest(str, str) ASCII disi baslikta TypeError
+            # atar; bayt karsilastirmasi 401 doner ve sunucu ayakta kalir.
             got = self.headers.get("X-FerDim-Token", "")
-            return hmac.compare_digest(got, token)
+            return hmac.compare_digest(got.encode("utf-8"), token_b)
 
         # ------------------------------------------------------------ routes
         def do_GET(self):
+            if not self._host_ok():
+                self._reject(421)
+                return
             u = urlparse(self.path)
             if u.path == "/" or u.path == "/index.html":
                 self._send_file(env.web_dir / "index.html", "text/html; charset=utf-8",
@@ -107,6 +139,12 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
                 self._send_json({"ok": False, "error": "bulunamadi"}, 404)
 
         def do_POST(self):
+            if not self._host_ok():
+                self._reject(421)
+                return
+            if not self._origin_ok():
+                self._reject(403)
+                return
             u = urlparse(self.path)
             if not u.path.startswith("/api/"):
                 self._send_json({"ok": False, "error": "bulunamadi"}, 404)
