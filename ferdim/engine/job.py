@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import http.client
 import os
@@ -24,7 +25,7 @@ from pathlib import Path
 
 from .. import cdc, tcpinfo, util
 from ..coexist import LatencySignal
-from ..paths import AppEnv
+from ..paths import AppEnv, fsync_dir
 from ..profiles import host_key, open_profiles
 from ..ratelimit import TokenBucket
 from . import dash, ftp, hls, httpcli, segments, socks
@@ -180,6 +181,16 @@ def _verify_pass(path, algos, man=None, halt=None, progress=None):
     if man is None:
         return got, None
     return got, (size_ok, chk.bad if chk is not None else [])
+
+
+def _identity_encoding(value: str) -> bool:
+    """Content-Encoding 'sikistirma yok' mu? Virgullu liste desteklenir.
+
+    Kabul: bos, `identity`, `none` ve her ogesi bunlardan olan listeler
+    (`identity, identity`). Baska her oge (gzip, br, deflate...) reddedilir:
+    aralikli indirmede govde baytlari Range ofsetleriyle eslesmez."""
+    parts = [t.strip().lower() for t in str(value or "").split(",")]
+    return all(t in ("", "identity", "none") for t in parts)
 
 
 def _stat_key(path) -> tuple:
@@ -440,6 +451,10 @@ class DownloadJob:
         self._chunk = 1 << 18 if self._turbo else CHUNK       # 256KB / 64KB
         self._min_split = 1 << 18 if self._turbo else MIN_SPLIT  # 256KB / 1MB
         self._last_checkpoint = 0.0
+        # .part'a yazilan toplam bayt (tek yonlu sayac) ve son fsync'te
+        # guvenceye alinan degeri: nokta yalnizca ARADAKI fark varsa fsync eder
+        self._wrote = 0
+        self._durable_wrote = 0
         self._speed_done_mark = 0
         self._speed_mark_ts = time.monotonic()
         # gecmis icin baglanti sayisi ornekleri (kuyruk tick'i toplar)
@@ -692,9 +707,15 @@ class DownloadJob:
                 pass
 
     def _drop_reservation(self) -> None:
-        """Sahiplenilmis ama doldurulmamis son ad yer tutucusunu siler."""
-        p, self._reserved = self._reserved, None
-        if p is not None:
+        """Sahiplenilmis ama doldurulmamis son ad yer tutucusunu siler.
+
+        Kilit altinda: yayinlama ile ayni kritik bolumde karar verilir.
+        Yayinlandiysa (`_reserved` replace sonrasi temizlenir) hicbir sey
+        silinmez - gercek dosya yer tutucu sanilip kaldirilmaz."""
+        with self._lock:
+            p, self._reserved = self._reserved, None
+            if p is None or self._finalized.is_set():
+                return
             try:
                 p.unlink()
             except OSError:
@@ -721,6 +742,8 @@ class DownloadJob:
         # HLS / DASH manifest mi? (FTP semasi once gelir: ftp://...m3u8
         # bir FTP dosyasidir, manifest degil)
         resume_meta = util.read_json(self.meta_path) or {}
+        # onceki kosu adi sahiplenip yayinlayamadan olduyse bos yer tutucu kalir
+        self._drop_stale_reservation(resume_meta)
         if self.kind == "ftp" or ftp.is_ftp(self.url) or \
            resume_meta.get("kind") == "ftp":
             self.kind = "ftp"
@@ -821,9 +844,22 @@ class DownloadJob:
                 self._allowed = max(1, min(int(resume_meta["allowed"]),
                                            self._ceiling_locked()))
                 self.extra["adaptive"] = self._allowed
+            fresh = False
+        elif self._publish_ready(resume_meta, p):
+            # her sey inmis, yalnizca yayinlanmamis (cokme penceresi):
+            # yeniden indirmek yerine dosya sahiplenilip bitirilir
+            self._pending = []
+            self.done = self.total
+            fresh = False
         else:
             self._fresh_start(p)
+            fresh = True
         self._fd = os.open(self.part_path, os.O_RDWR | os.O_CREAT, 0o644)
+        if fresh:
+            # bastan: eski .part'in kuyrugu KALMAZ. Bilinmeyen boyutta
+            # (total = -1) ftruncate(total) yok; kirpilmazsa eski kuyruk
+            # yeni icerigin ardinda kalir ve is yanlislikla DONE olur.
+            os.ftruncate(self._fd, 0)
         if self.total > 0:
             os.ftruncate(self._fd, self.total)
         self._meta = resume_meta
@@ -860,6 +896,66 @@ class DownloadJob:
                 and not (self.spec.wanted() or self.spec.merkle):
             return False
         return True
+
+    def _publish_ready(self, resume_meta: dict, p: httpcli.ProbeResult) -> bool:
+        """Nokta 'her sey indi, yalnizca yayinlanmadi' mi diyor?
+
+        Indirme bittikten sonra `_finalize_file` calismadan cokme olursa
+        denetim noktasi bos aralik listesi + done == total tasir ve .part
+        tamdir: yeniden indirmek yerine dosya yayinlanir. Dogrulayici
+        kosulu `_resumable` ile aynidir (dogrulayicisiz veri guvenilmez)."""
+        if self.total <= 0 or resume_meta.get("url") != self.url:
+            return False
+        if resume_meta.get("etag") != p.etag \
+                or resume_meta.get("last_modified") != p.last_modified:
+            return False
+        if resume_meta.get("ranges"):
+            return False
+        if int(resume_meta.get("done") or 0) != self.total:
+            return False
+        if not (p.etag or p.last_modified) \
+                and not (self.spec.wanted() or self.spec.merkle):
+            return False
+        try:
+            return self.part_path.stat().st_size == self.total
+        except OSError:
+            return False
+
+    def _record_reservation(self, dest: Path) -> None:
+        """Sahiplenilen son adi noktaya yazar (cokme kurtarmasi icin).
+
+        Yer tutucunun kimligi (dev, ino) de saklanir: bir sonraki hazirlik
+        yalnizca HALA BOS ve AYNI yer tutucu olan dosyayi siler - yayinlanmis
+        (inode'u degismis) dosyaya asla dokunulmaz."""
+        try:
+            st = dest.stat()
+        except OSError:
+            return
+        meta = util.read_json(self.meta_path) or {}
+        meta["reserved"] = [dest.name, st.st_dev, st.st_ino]
+        try:
+            util.atomic_write_json(self.meta_path, meta)
+        except OSError:
+            pass          # kurtarma kaydi yardimci: yayini engellemez
+
+    def _drop_stale_reservation(self, meta: dict) -> None:
+        """Onceki kosunun yayinlanmamis ad yer tutucusunu siler."""
+        rec = (meta or {}).get("reserved")
+        if not (isinstance(rec, list) and len(rec) == 3):
+            return
+        name, dev, ino = rec
+        if not isinstance(name, str) or not name or name != Path(name).name:
+            return
+        p = self.target_dir / name
+        try:
+            st = p.stat()
+        except OSError:
+            return
+        if st.st_size == 0 and st.st_dev == dev and st.st_ino == ino:
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
     def _fresh_start(self, p: httpcli.ProbeResult):
         self._reset_verify_extra()      # bastan: eski uyarilar tasinmaz
@@ -1607,8 +1703,8 @@ class DownloadJob:
         # httpcli.base_headers). Sunucu yine de sikistirdiysa govde Range
         # araliklariyla eslesmez: baytlar 'geldigi gibi' yazilirsa dosya
         # sessizce bozulur. Boyle bir kaynak bu is icin gecersizdir.
-        enc = (resp.headers.get("Content-Encoding") or "").strip().lower()
-        if enc and enc != "identity":
+        enc = resp.headers.get("Content-Encoding") or ""
+        if not _identity_encoding(enc):
             resp.close()
             raise SourceInvalid(
                 f"sikistirilmis yanit (Content-Encoding: {enc})",
@@ -1813,6 +1909,7 @@ class DownloadJob:
                         os.pwrite(self._fd, chunk, cursor)
                         cursor += len(chunk)
                         self.done += len(chunk)
+                        self._wrote += len(chunk)      # nokta fsync'i buna bakar
                         self._inflight[wid] = (cursor, e)
                     nbytes += len(chunk)
                     win_b += len(chunk)
@@ -1990,6 +2087,7 @@ class DownloadJob:
                     os.pwrite(self._fd, data, off)
                 except OSError:
                     return False
+                self._wrote += len(data)    # esbaz baytlari da diske inmeli
             return True
 
         try:
@@ -2217,6 +2315,7 @@ class DownloadJob:
             def prog(n):
                 with self._lock:
                     self.done += n
+                    self._wrote += n        # FTP yazimlari da sayilir
                 if n and not first[0]:
                     first[0] = time.monotonic()
                 moved[0] += n
@@ -2422,6 +2521,8 @@ class DownloadJob:
 
     def _finalize_file(self):
         try:
+            with self._lock:
+                self._finalized.clear()   # bu deneme henuz yayinlanmadi
             if self._fd is not None:
                 try:
                     # os.replace oncesi: dosya diske inmeli (.part -> son ad)
@@ -2433,13 +2534,26 @@ class DownloadJob:
             # adli iki is birbirinin dosyasini ezemez; adi alan is bitirir.
             dest = util.unique_path(self.target_dir,
                                     self.final_filename or "download.bin")
-            self._reserved = dest
+            with self._lock:
+                self._reserved = dest
+            self._record_reservation(dest)   # cokme: bos yer tutucu kurtarilir
             try:
                 os.replace(self.part_path, dest)   # yer tutucunun uzerine
-            except OSError:  # nadiren baska FS: kopyala+sil
+            except OSError as ex:
+                if ex.errno != errno.EXDEV:
+                    raise
+                # baska dosya sistemi: kopyala + fsync + sil (ad zaten bizim)
                 import shutil
                 shutil.move(str(self.part_path), str(dest))
-            self._reserved = None      # ad artik dosyanin kendisi
+                fd = os.open(dest, os.O_RDONLY)
+                try:
+                    os.fsync(fd)               # kopya diske inmeden bitmez
+                finally:
+                    os.close(fd)
+            with self._lock:
+                self._reserved = None          # ad artik dosyanin kendisi
+            # ad degisikligi diske insin; sonra nokta dosyasi kaldirilir
+            fsync_dir(self.target_dir)
             self.final_filename = dest.name
             self.meta_path.unlink(missing_ok=True)
             self.speed = 0
@@ -2749,32 +2863,52 @@ class DownloadJob:
         if self.kind in ("hls", "dash") or self._fd is None:
             return
         with self._lock:
-            fd = self._fd
-            if fd is not None:
-                try:
-                    # 'tamamlanan aralik' kaydi ancak baytlar DISKE indikten
-                    # sonra yazilir: elektrik kesintisi sifir dolu araligi
-                    # tamam saymaz. Blok basina degil, nokta basina bir kez.
-                    os.fsync(fd)
-                except OSError:
-                    # yazilamiyor: eski (daha geri) nokta kalir - guvenli yon
-                    return
-            util.atomic_write_json(self.meta_path, {
-                "url": self.url,
-                "filename": self.final_filename,
-                "total": self.total,
-                "etag": self._etag,
-                "last_modified": self._last_modified,
-                # eldeki araliklar da yazilir: duraklama/cokme aninda bir
-                # iscinin elinde kalan bolum yeniden indirilir, kaybolmaz
-                "ranges": [list(r) for r in self._pending] +
-                          [list(r) for r in self._inflight.values()],
-                "done": self.done,
-                "kind": self.kind,
-                "allowed": self._allowed,
-                "validator_src": self._vsrc,
-                "ftp_mtime": self._ftp_mtime,
-            })
+            fd, run = self._fd, self._run
+            # Sayac ilerlediyse yeni baytlar yazildi: nokta onlari 'bitti'
+            # sayabilir, bu yuzden once fsync gerekir. Ilerleme yoksa (ayni
+            # noktanin tekrari) fsync bosuna surmez.
+            need = self._wrote != self._durable_wrote
+            wrote = self._wrote
+            meta = self._checkpoint_meta_locked()
+        if need:
+            try:
+                # KILIT DISINDA: fsync yavas diskte saniyeler surer; kilit
+                # tutulurken isciler pwrite icin bekler ve pause() 8 sn
+                # butcesi asilirdi.
+                os.fsync(fd)
+            except OSError:
+                # yazilamiyor: eski (daha geri) nokta kalir - guvenli yon
+                return
+            with self._lock:
+                if self._fd is not fd or self._run != run:
+                    return      # kapanmis/yeni kosu: karar yazilmaz
+                # nokta fsync ONCESI goruntuden yazilir: fsync sirasinda
+                # yazilan bayt bir sonraki turda fsync edilir (sayac ilerler)
+                self._durable_wrote = wrote
+        else:
+            with self._lock:
+                if self._fd is not fd or self._run != run:
+                    return      # bu arada kapandi/iptal: nokta yazilmaz
+        util.atomic_write_json(self.meta_path, meta)
+
+    def _checkpoint_meta_locked(self) -> dict:
+        """Denetim noktasinin diske yazilacak goruntusu (kilit altinda)."""
+        return {
+            "url": self.url,
+            "filename": self.final_filename,
+            "total": self.total,
+            "etag": self._etag,
+            "last_modified": self._last_modified,
+            # eldeki araliklar da yazilir: duraklama/cokme aninda bir
+            # iscinin elinde kalan bolum yeniden indirilir, kaybolmaz
+            "ranges": [list(r) for r in self._pending] +
+                      [list(r) for r in self._inflight.values()],
+            "done": self.done,
+            "kind": self.kind,
+            "allowed": self._allowed,
+            "validator_src": self._vsrc,
+            "ftp_mtime": self._ftp_mtime,
+        }
 
     def update_speed(self):
         """QueueManager ticker'i cagirir; hiz ve baglanti ornekleri."""
