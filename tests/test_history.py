@@ -317,7 +317,7 @@ class QueueRecordTests(unittest.TestCase):
         job = self.qm.get(r["id"])
         self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR)), job.state)
         self.assertEqual(job.state, JobState.DONE)
-        row = self.qm.history.get(r["id"])
+        row = self._history_row(r["id"])
         self.assertIsNotNone(row, "biten is gecmise yazilmali")
         self.assertEqual(row["state"], "done")
         self.assertEqual(row["filename"], "tiny.bin")
@@ -328,6 +328,16 @@ class QueueRecordTests(unittest.TestCase):
         self.assertGreater(row["duration"], 0, "aktif sure kaydedilmeli")
         self.assertNotIn("password", json.dumps(row, ensure_ascii=False))
 
+    def _history_row(self, job_id, timeout=10.0):
+        # gecmis kaydi durum degisikligi dinleyicisinde yazilir: is ERROR/DONE
+        # gorundukten hemen sonra; yavas derleyicide satiri bekle
+        end = time.monotonic() + timeout
+        while True:
+            row = self.qm.history.get(job_id)
+            if row is not None or time.monotonic() > end:
+                return row
+            time.sleep(0.02)
+
     def test_14_error_job_is_recorded(self):
         r = api.handle(self.ctx, "add", {"url": self.base + "/yok.bin"})
         self.assertTrue(r["ok"], r)
@@ -335,7 +345,7 @@ class QueueRecordTests(unittest.TestCase):
         self.assertTrue(wait_state(job, (JobState.ERROR, JobState.DONE)), job.state)
         self.assertEqual(job.state, JobState.ERROR)
         self.assertEqual(job.error_code, "not_found")
-        row = self.qm.history.get(r["id"])
+        row = self._history_row(r["id"])
         self.assertIsNotNone(row)
         self.assertEqual(row["state"], "error")
         self.assertEqual(row["error_code"], "not_found")
