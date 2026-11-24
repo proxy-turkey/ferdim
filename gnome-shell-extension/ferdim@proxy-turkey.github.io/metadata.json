@@ -1,0 +1,8 @@
+{
+  "uuid": "ferdim@proxy-turkey.github.io",
+  "name": "FerDim",
+  "description": "Speed, queue actions and the web UI for the FerDim download manager.",
+  "shell-version": ["47", "48", "49"],
+  "url": "https://github.com/proxy-turkey/ferdim",
+  "version": 1
+}

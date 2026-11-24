@@ -388,6 +388,41 @@ S = {
         "en": "mid", "tr": "orta", "es": "media", "ru": "средний"},
     "rtt_high": {
         "en": "high", "tr": "yüksek", "es": "alta", "ru": "высокий"},
+    # ------------------------------------------------------- masaustu bildirimi
+    "notify_done_title": {
+        "en": "Download complete", "tr": "İndirme tamamlandı",
+        "es": "Descarga completada", "ru": "Загрузка завершена"},
+    "notify_error_title": {
+        "en": "Download failed", "tr": "İndirme başarısız",
+        "es": "Descarga fallida", "ru": "Загрузка не удалась"},
+    "notify_verify_title": {
+        "en": "Verification result", "tr": "Doğrulama sonucu",
+        "es": "Resultado de verificación", "ru": "Результат проверки"},
+    "notify_chk_ok": {
+        "en": "checksum verified", "tr": "sağlama doğrulandı",
+        "es": "suma verificada", "ru": "контрольная сумма подтверждена"},
+    "notify_chk_warn": {
+        "en": "sidecar checksum mismatch; file kept",
+        "tr": "yan dosya sağlaması uyuşmadı; dosya korundu",
+        "es": "la suma del archivo auxiliar no coincide; archivo conservado",
+        "ru": "сумма файла-спутника не совпала; файл сохранён"},
+    "notify_chk_mismatch": {
+        "en": "checksum mismatch", "tr": "sağlama uyuşmadı",
+        "es": "la suma no coincide",
+        "ru": "контрольная сумма не совпала"},
+    "notify_summary_title": {
+        "en": "{n} downloads finished", "tr": "{n} indirme tamamlandı",
+        "es": "{n} descargas terminadas", "ru": "{n} загрузок завершено"},
+    "notify_summary_body": {
+        "en": "{done} completed, {failed} failed",
+        "tr": "{done} tamam, {failed} hata",
+        "es": "{done} completadas, {failed} fallidas",
+        "ru": "{done} завершено, {failed} с ошибкой"},
+    "notify_summary_warn": {
+        "en": "{n} with a checksum warning",
+        "tr": "{n} sağlama uyarısı",
+        "es": "{n} con aviso de suma",
+        "ru": "{n} с предупреждением о сумме"},
 }
 
 
