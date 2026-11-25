@@ -521,6 +521,31 @@ def _metalink_root_guard(items: list, keep: dict, cfg: dict,
     return ""
 
 
+def _add_job(ctx, params: dict) -> dict:
+    """'add' govdesi: dogrulama + kuyruga ekleme (tick/yazim cagirana aittir).
+
+    Toplu yolda (add-batch, metalink, URL listesi) tick ve kuyruk yazimi
+    bir kez yapilir; tek eklemede handle() ikisini de hemen calistirir.
+    """
+    cfg = ctx["cfg"]
+    url = params.get("url", "")
+    if not isinstance(url, str) or not url.startswith(
+            ("http://", "https://", "ftp://", "ftps://")):
+        return {"ok": False, "error": "gecersiz URL"}
+    if _bad_checksum(params):
+        return {"ok": False, "error": "gecersiz saglama degeri"}
+    denied = _check_add_dir(ctx, params)
+    if denied:
+        return denied
+    # metalink / .meta4: icindeki dosyalara ac (aynalar + saglamalar)
+    if _ml.looks_like_metalink(url):
+        return _add_remote_metalink(ctx, params)
+    job = ctx["qm"].add(_spec_from(params, cfg),
+                        paused=bool(params.get("paused")))
+    return {"ok": True, "id": job.id,
+            "filename": job.snapshot()["filename"]}
+
+
 def _add_metalink_items(ctx, items: list, base: dict) -> dict:
     """Ayristirilmis metalink dosyalarini kuyruga ekler. 'base' icindeki
     dizin, kimlik, hiz limiti gibi ayarlar her dosyaya tasinir; kimlik
@@ -534,14 +559,15 @@ def _add_metalink_items(ctx, items: list, base: dict) -> dict:
     if err:
         return {"ok": False, "error": f"metalink: {err}"}
     ids, first = [], None
-    for it in items[:MAX_METALINK_FILES]:
-        add = _item_params(keep, doc_url, it)
-        if add is None:
-            continue
-        r = handle(ctx, "add", add)
-        if r.get("ok"):
-            ids.append(r["id"])
-            first = first or r
+    with ctx["qm"].bulk_save():     # 64 dosya = tek kuyruk yazimi
+        for it in items[:MAX_METALINK_FILES]:
+            add = _item_params(keep, doc_url, it)
+            if add is None:
+                continue
+            r = _add_job(ctx, add)
+            if r.get("ok"):
+                ids.append(r["id"])
+                first = first or r
     if not first:
         return {"ok": False, "error": "metalink bos"}
     return {**first, "ids": ids, "metalink": len(items)}
@@ -592,10 +618,11 @@ def _add_local_file(ctx, path) -> dict:
     if not urls:
         return {"ok": False, "error": "gecerli URL yok"}
     ids = []
-    for u in urls:
-        r = handle(ctx, "add", {"url": u})
-        if r.get("ok"):
-            ids.append(r["id"])
+    with ctx["qm"].bulk_save():        # liste: tek kuyruk yazimi
+        for u in urls:
+            r = _add_job(ctx, {"url": u})
+            if r.get("ok"):
+                ids.append(r["id"])
     if not ids:
         return {"ok": False, "error": "eklenemedi"}
     return {"ok": True, "ids": ids, "count": len(ids)}
@@ -654,6 +681,27 @@ def _archive_cmd(ctx, cmd: str, params: dict) -> dict:
             "state": snap["state"]}
 
 
+def _stat_int(value):
+    """stats parametresi: gecerli tamsayi ya da None (gecersiz yok sayilir)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _control_async(ctx) -> bool:
+    """Denetim arka plana mi verilsin?
+
+    HTTP istekleri (tarayici arayuzu) durumu yoklar: yanit hemen doner,
+    yoklama/join/dosya silme kuyruk iscisinde yapilir. Soket istemcisi
+    (CLI, GTK, D-Bus) sonucu bekler: orada komut dondugunde durum okunur
+    (`ferdim pause` -> hemen `ferdim list`), bu yuzden eski davranis kalir.
+    """
+    return ctx.get("transport") == "http"
+
+
 def handle(ctx, cmd: str, params: dict) -> dict:
     """ctx: {qm, env, cfg, set_cfg} sozlugu; yanit sozlugu dondurur."""
     qm, env, cfg = ctx["qm"], ctx["env"], ctx["cfg"]
@@ -709,7 +757,11 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         qm._coexist_tick()      # tavan hemen kurulur/birakilir
         return {"ok": True, **qm.coexist_status()}
     if cmd == "stats" or cmd == "list" or cmd == "jobs":
-        return {"ok": True, **qm.stats()}
+        # since/limit/offset: revizyon deltasi + sayfalama (gecersiz = yok say)
+        return {"ok": True, **qm.stats(
+            since=_stat_int(params.get("since")),
+            limit=_stat_int(params.get("limit")),
+            offset=_stat_int(params.get("offset")) or 0)}
     if cmd in ("archive-list", "archive-extract", "archive-repair",
                "archive-status"):
         return _archive_cmd(ctx, cmd, params)
@@ -723,40 +775,41 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         return {"ok": True, "entries": entries, "note": note,
                 "filename": job.final_filename}
     if cmd == "add":
-        url = params.get("url", "")
-        if not isinstance(url, str) or not url.startswith(
-                ("http://", "https://", "ftp://", "ftps://")):
-            return {"ok": False, "error": "gecersiz URL"}
-        if _bad_checksum(params):
-            return {"ok": False, "error": "gecersiz saglama degeri"}
-        denied = _check_add_dir(ctx, params)
-        if denied:
-            return denied
-        # metalink / .meta4: icindeki dosyalara ac (aynalar + saglamalar)
-        if _ml.looks_like_metalink(url):
-            return _add_remote_metalink(ctx, params)
-        spec = _spec_from(params, cfg)
-        job = qm.add(spec, paused=bool(params.get("paused")))
-        qm._tick()
-        return {"ok": True, "id": job.id, "filename": job.snapshot()["filename"]}
+        r = _add_job(ctx, params)
+        if r.get("ok"):
+            qm._tick()          # eklenen is beklemeden baslasin
+        return r
     if cmd == "add-file":
-        return _add_local_file(ctx, params.get("path", ""))
+        r = _add_local_file(ctx, params.get("path", ""))
+        if r.get("ok"):
+            qm._tick()
+        return r
     if cmd == "add-batch":
         ids = []
-        for item in params.get("items") or []:
-            if not isinstance(item, dict):
-                continue
-            p = dict(params)
-            p.update(item)
-            r = handle(ctx, "add", p)
-            if r.get("ok"):
-                ids.append(r["id"])
+        # toplu ekleme: 500 is tek kuyruk yazimi ve tek tick eder
+        with qm.bulk_save():
+            for item in params.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                p = dict(params)
+                p.update(item)
+                r = _add_job(ctx, p)
+                if r.get("ok"):
+                    ids.append(r["id"])
+        if ids:
+            qm._tick()
         return {"ok": True, "ids": ids}
     if cmd in ("pause", "resume", "cancel", "restart"):
-        ok = qm.control(params.get("id", ""), cmd,
-                        delete_files=bool(params.get("delete_files")))
+        job_id = params.get("id", "")
+        delete = bool(params.get("delete_files"))
+        run = qm.control_async if _control_async(ctx) else qm.control
+        ok = run(job_id, cmd, delete_files=delete)
         return {"ok": ok} if ok else {"ok": False, "error": "is bulunamadi"}
     if cmd == "remove":
+        if _control_async(ctx):
+            return {"ok": qm.remove_async(
+                params.get("id", ""),
+                delete_files=bool(params.get("delete_files")))}
         return {"ok": qm.remove(params.get("id", ""),
                                 delete_files=bool(params.get("delete_files")))}
     if cmd == "clear-finished":
