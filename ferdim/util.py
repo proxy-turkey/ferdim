@@ -1,6 +1,9 @@
 """Dosya adi, kategori ve bicimlendirme yardimcilari."""
 from __future__ import annotations
 
+import email.message
+import email.policy
+import email.utils
 import errno
 import json
 import os
@@ -35,13 +38,46 @@ def category_for(name_or_path: str) -> str:
     return "other"
 
 
+NAME_MAX_BYTES = 255          # tek dosya adi bileseninin bayt siniri
+
+
+def _clip_utf8(text: str, budget: int) -> str:
+    """UTF-8 bayt butcesine kirpar; cok baytli karakteri ASLA bolmez."""
+    raw = text.encode("utf-8")
+    if len(raw) <= budget:
+        return text
+    return raw[:max(0, budget)].decode("utf-8", "ignore")
+
+
+def _truncate_filename(name: str, limit: int = NAME_MAX_BYTES) -> str:
+    """255 BAYT siniri, uzanti korunur (tipik dosya sistemi kurali).
+
+    Uzanti (son noktadan sonrasi) oldugu gibi tutulur; govde kalan bayt
+    butcesine kirpilir. Uzantinin kendisi siniri asarsa uzanti ayrimi
+    yapilmaz, tum ad kirpilir. Kirpma sonunda kalan bosluk/nokta atilir;
+    sonuc bos kalirsa cagiran 'download.bin' kullanir."""
+    if len(name.encode("utf-8")) <= limit:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if not dot or not stem:
+        return _clip_utf8(name, limit).strip(" .")
+    ext_part = "." + ext
+    ext_len = len(ext_part.encode("utf-8"))
+    if ext_len >= limit:
+        return _clip_utf8(name, limit).strip(" .")
+    stem = _clip_utf8(stem, limit - ext_len).strip(" .")
+    return (stem + ext_part) if stem else _clip_utf8(name, limit).strip(" .")
+
+
 def sanitize_filename(name: str) -> str:
     name = unicodedata.normalize("NFKC", name).strip()
     name = name.replace("\x00", "")
     # Bolum ayracilari ve dosya sistemlerine aykiri karakterleri temizle
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
     name = re.sub(r"\s+", " ", name).strip(" .")
-    return name[:200] or "download.bin"
+    # Sinir KARAKTER degil BAYT: Turkce/emoji adlar 255 baytta kalir,
+    # uzanti korunur, cok baytli karakter bolunmez.
+    return _truncate_filename(name) or "download.bin"
 
 
 def filename_from_url(url: str) -> str:
@@ -50,16 +86,55 @@ def filename_from_url(url: str) -> str:
     return sanitize_filename(base) if base else "download.bin"
 
 
-def parse_content_disposition(value: str | None) -> str | None:
-    if not value:
+def _cd_from_email(value: str) -> str | None:
+    """RFC 6266 basligini email.message ile ayristirir (RFC 2231/5987).
+
+    compat32 politikasi parametreleri HAM tutar; boylece `filename*`
+    (genisletilmis, her charset) duz `filename`den AYRI gorulur ve ona
+    tercih edilebilir. Genisletilmis deger collapse_rfc2231_value ile
+    cozulur (bilinmeyen charset'te latin-1'e duser)."""
+    try:
+        msg = email.message.EmailMessage(policy=email.policy.compat32)
+        msg["Content-Disposition"] = value
+        plain = None
+        for name, param in msg.get_params(header="content-disposition") or ():
+            if name != "filename":
+                continue
+            if isinstance(param, tuple):
+                return email.utils.collapse_rfc2231_value(param)
+            if plain is None:
+                plain = param
+        return plain
+    except Exception:
         return None
+
+
+def _cd_from_regex(value: str) -> str | None:
+    """Eski davranis: yalniz UTF-8 filename* ve duz filename."""
     m = re.search(r"filename\*=(?:UTF-8|utf-8)''([^;]+)", value)
     if m:
-        return sanitize_filename(unquote(m.group(1).strip('" ')))
+        return unquote(m.group(1).strip('" '))
     m = re.search(r'filename="?([^";]+)"?', value)
     if m:
-        return sanitize_filename(unquote(m.group(1).strip()))
+        return unquote(m.group(1).strip())
     return None
+
+
+def parse_content_disposition(value: str | None) -> str | None:
+    """Content-Disposition'dan dosya adi (RFC 6266 / RFC 5987).
+
+    Once email.message ile ayristirilir: `filename*` (her charset) duz
+    `filename`ye tercih edilir. Ayristirma sonuc vermezse eski regex
+    yedek olarak denenir."""
+    if not value:
+        return None
+    raw = _cd_from_email(value)
+    if raw is None:
+        raw = _cd_from_regex(value)
+    if raw is None:
+        return None
+    raw = raw.strip().strip('"').strip()
+    return sanitize_filename(raw) if raw else None
 
 
 def unique_path(directory: Path, name: str) -> Path:
@@ -347,13 +422,77 @@ _SIZE_TEXT_RE = re.compile(
     r"^\d+(?:\.\d+)?(?:kib|mib|gib|kb|mb|gb|k|m|g|b)?$", re.IGNORECASE)
 
 
-def window_open(start, stop, now=None, days=None) -> bool:
+def _resolve_wall(day, minutes: int, zone):
+    """Duvarsaati -> bilincli (aware) an; DST POLITIKASI burada uygulanir.
+
+    - Ileri sicrama (olmayan saat): pencerenin o siniri, bosluktan SONRAKI
+      ilk gecerli ana kayar (Berlin'de 02:30 -> 03:00 CEST).
+    - Geri alma (belirsiz saat): ILK olusum (fold=0) kullanilir; ikinci
+      tekrar pencereyi yeniden ACMAZ.
+    """
+    import datetime as _dt
+    naive = _dt.datetime.combine(
+        day, _dt.time(minutes // 60, minutes % 60))
+    cand = naive.replace(tzinfo=zone)
+    if cand.astimezone(_dt.timezone.utc).astimezone(zone).replace(
+            tzinfo=None) == naive:
+        return cand                      # var; belirsizse fold=0
+    for step in range(1, 241):           # bosluk en fazla birkac saat
+        probe = naive + _dt.timedelta(minutes=step)
+        c = probe.replace(tzinfo=zone)
+        if c.astimezone(_dt.timezone.utc).astimezone(zone).replace(
+                tzinfo=None) == probe:
+            return c                     # bosluktan sonraki ilk gecerli an
+    return cand
+
+
+def _window_open_tz(start_min: int, stop_min: int, now, days, zone) -> bool:
+    """Bilincli saat diliminde an karsilastirmali pencere testi.
+
+    Karsilastirma UTC'ye cevrilerek yapilir: ayni tzinfo'lu iki aware
+    datetime karsilastirmasinda Python `fold`u YOK SAYAR; geri alma
+    saatinde bu pencereyi yanlislikla yeniden acardi."""
+    import datetime as _dt
+    utc = _dt.timezone.utc
+    local = (now.astimezone(zone) if now.tzinfo
+             else now.replace(tzinfo=zone)).astimezone(utc)
+    today = local.astimezone(zone).date()
+    one = _dt.timedelta(days=1)
+
+    def at(day, minutes):
+        return _resolve_wall(day, minutes, zone).astimezone(utc)
+
+    if start_min <= stop_min:
+        if days is not None and local.astimezone(zone).weekday() not in days:
+            return False
+        return at(today, start_min) <= local < at(today, stop_min)
+    # Gece yarisini asan pencere: bugun baslayan ve dun baslayan adaylar.
+    wd = local.astimezone(zone).weekday()
+    if days is None or wd in days:
+        if at(today, start_min) <= local < at(today + one, stop_min):
+            return True
+    if days is None or (wd - 1) % 7 in days:
+        if at(today - one, start_min) <= local < at(today, stop_min):
+            return True
+    return False
+
+
+def window_open(start, stop, now=None, days=None, tz=None) -> bool:
     """'02:00'-'08:00' penceresi su an acik mi? Gece yarisini asan pencere
     desteklenir; bozuk giris pencere yok sayilir (her zaman acik).
 
     days verilirse (0 = pazartesi) pencere yalniz o gunlerde aciktir. Gece
     yarisini asan pencerede gun, pencerenin BASLADIGI gundur: 'cuma
-    22:00-02:00' cumartesi 01:00'de de aciktir."""
+    22:00-02:00' cumartesi 01:00'de de aciktir.
+
+    DST POLITIKASI (bilincli `now` ya da `tz` verildiginde; naive `now`
+    eski duvarsaati davranisini korur):
+    - ileri sicrama: o gun VAR OLMAYAN bir pencere siniri, bosluktan
+      sonraki ilk gecerli ana kayar (02:30 -> 03:00). Iki sinir da
+      bosluktaysa pencere o gun bostur.
+    - geri alma: belirsiz duvarsaati ILK olusumuyla (fold=0) cozulur ve
+      pencere ikinci tekrarda yeniden ACILMAZ.
+    """
     import datetime as _dt
     now = now or _dt.datetime.now()
     if days is not None:
@@ -364,6 +503,10 @@ def window_open(start, stop, now=None, days=None) -> bool:
         s, e = _hm(start), _hm(stop)
     except Exception:
         return days is None or now.weekday() in days
+    zone = tz or (now.tzinfo if getattr(now, "tzinfo", None) is not None
+                  else None)
+    if zone is not None:
+        return _window_open_tz(s, e, now, days, zone)
     cur = now.hour * 60 + now.minute
     if s <= e:
         return (days is None or now.weekday() in days) and s <= cur < e

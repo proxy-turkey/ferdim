@@ -610,6 +610,32 @@ S = {
         "tr": "sunucu dosya yerine bir HTML sayfası gönderdi (yumuşak 404); dosya korundu",
         "es": "el servidor envió una página HTML en lugar del archivo (404 suave); el archivo se conservó",
         "ru": "сервер отправил HTML-страницу вместо файла (мягкая 404); файл сохранён"},
+    # ---- 1.12 pano onayi (eylemli bildirim + geri al)
+    "clipboard_confirm_title": {
+        "en": "Queued from clipboard",
+        "tr": "Panodan kuyruğa alındı",
+        "es": "En cola desde el portapapeles",
+        "ru": "Добавлено из буфера обмена"},
+    "clipboard_confirm_body": {
+        "en": "{name} will start in {secs} s.",
+        "tr": "{name} {secs} sn içinde başlayacak.",
+        "es": "{name} comenzará en {secs} s.",
+        "ru": "{name} начнётся через {secs} с."},
+    "clipboard_undo": {
+        "en": "Undo",
+        "tr": "Geri al",
+        "es": "Deshacer",
+        "ru": "Отменить"},
+    "clipboard_queued_title": {
+        "en": "Queued from clipboard",
+        "tr": "Panodan kuyruğa alındı",
+        "es": "En cola desde el portapapeles",
+        "ru": "Добавлено из буфера обмена"},
+    "clipboard_queued_body": {
+        "en": "{name} queued from the clipboard.",
+        "tr": "{name} panodan kuyruğa alındı.",
+        "es": "{name} en cola desde el portapapeles.",
+        "ru": "{name} добавлено из буфера обмена."},
 }
 
 
