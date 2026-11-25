@@ -47,3 +47,34 @@ class TokenBucket:
                     return True
                 wait = (n - self._tokens) / self._rate
             time.sleep(min(wait, step))
+
+
+class CombinedBucket:
+    """Birden cok kovayi BIRLIKTE uygular (kuyruk geneli + is basina).
+
+    `take(n)` her kovadan yer ister: en yavas kova akisi belirler. Is
+    basina `--limit` kuyruk geneli limitle celismez, iki sinir da gecerlidir.
+    `rate` bilesenlerin en buyugudur (0 = hicbir sinir yok); durdurma
+    semantigi (`take(n, stop)` bayt harcamadan False) korunur.
+    """
+
+    def __init__(self, *buckets):
+        self._buckets = [b for b in buckets if b is not None]
+
+    @property
+    def rate(self) -> float:
+        return max((b.rate for b in self._buckets), default=0.0)
+
+    def set_rate(self, rate: float) -> None:
+        # Tek kova gibi davran: mevcut cagiranlar (testler/araclar) tum
+        # bilesenleri ayarlayabilsin.
+        for b in self._buckets:
+            b.set_rate(rate)
+
+    def take(self, n: int, stop: "threading.Event | None" = None) -> bool:
+        if n <= 0:
+            return True
+        for b in self._buckets:
+            if b.rate > 0 and not b.take(n, stop):
+                return False
+        return True

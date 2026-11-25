@@ -610,6 +610,12 @@ S = {
         "tr": "sunucu dosya yerine bir HTML sayfası gönderdi (yumuşak 404); dosya korundu",
         "es": "el servidor envió una página HTML en lugar del archivo (404 suave); el archivo se conservó",
         "ru": "сервер отправил HTML-страницу вместо файла (мягкая 404); файл сохранён"},
+    # ---- 1.12 engine
+    "err_fd_exhausted": {
+        "en": "the system ran out of file handles; the download was paused and can be resumed",
+        "tr": "sistemde dosya tanıtıcısı kalmadı; indirme duraklatıldı, kaldığı yerden sürdürülebilir",
+        "es": "el sistema se quedó sin descriptores de archivo; la descarga se pausó y se puede reanudar",
+        "ru": "в системе закончились файловые дескрипторы; загрузка приостановлена, её можно продолжить"},
 }
 
 

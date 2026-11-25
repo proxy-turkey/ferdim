@@ -23,11 +23,16 @@ import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+try:                       # POSIX: baglanti tavani RLIMIT_NOFILE'dan
+    import resource
+except ImportError:        # pragma: no cover - POSIX disi platform
+    resource = None
+
 from .. import cdc, tcpinfo, util
 from ..coexist import LatencySignal
 from ..paths import AppEnv, fsync_dir
 from ..profiles import host_key, open_profiles
-from ..ratelimit import TokenBucket
+from ..ratelimit import CombinedBucket, TokenBucket
 from . import dash, ftp, hls, httpcli, segments, socks
 
 CHUNK = 1 << 16            # 64 KB okuma blogu
@@ -47,6 +52,47 @@ PEER_PREFILL_BUDGET = 3.5  # sn: esbaz taramasi (pause 8 sn bekler)
 _HTML_EXT = frozenset({".html", ".htm", ".xhtml", ".shtml", ".php",
                        ".asp", ".aspx", ".jsp", ".cgi"})
 _HTML_HEAD = (b"<!doctype html", b"<html", b"<head", b"<body")
+# dosya taniticisi tukendi: yeniden denemek ise yaramaz, is duraklatilir
+_FD_ERRNOS = frozenset({errno.EMFILE, errno.ENFILE})
+# posix_fallocate desteklenmiyorsa seyrek dosyaya (ftruncate) dusulur
+_ALLOC_UNSUPPORTED = frozenset({errno.EOPNOTSUPP, errno.EINVAL, errno.ENOSYS})
+
+
+def _fd_budget(cfg: dict) -> int:
+    """Is basina baglanti tavani: yumusak RLIMIT_NOFILE'dan turetilir.
+
+    Her aralik baglantisi ~1 fd tutar; dosya taniticisi ve gecici kollar
+    icin 64 fd pay birakilir. Eszamanli is sayisina bolunur ki kuyruk
+    geneli toplam tavan asilmasin. Kucuk sinirlarda en az 1 link kalir;
+    sinir okunamazsa 32 (davranis degismez)."""
+    if resource is None:      # pragma: no cover - POSIX disi
+        return 32
+    try:
+        soft = int(resource.getrlimit(resource.RLIMIT_NOFILE)[0])
+    except Exception:
+        return 32
+    if soft <= 0:
+        return 32
+    try:
+        slots = max(1, int(cfg.get("max_concurrent", 3) or 1))
+    except (TypeError, ValueError):
+        slots = 1
+    return max(1, (soft - 64) // slots)
+
+
+def _is_fd_error(e: BaseException) -> bool:
+    """Hata fd tukenmesi mi (EMFILE/ENFILE)? URLError sarmalini acar."""
+    seen = set()
+    cur: object = e
+    while isinstance(cur, BaseException) and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, OSError) and cur.errno in _FD_ERRNOS:
+            return True
+        if isinstance(cur, urllib.error.URLError):
+            cur = cur.reason          # genelde altindaki OSError
+            continue
+        break
+    return False
 
 
 def backoff_delay(attempt: int, cap: float = 15.0,
@@ -100,9 +146,14 @@ def _describe_error(e: BaseException) -> str:
 
 
 def _retry_after(err) -> float:
-    """Retry-After basligindan beklenecek saniye (sayi ya da HTTP-tarih)."""
+    """Retry-After basligindan beklenecek saniye (sayi ya da HTTP-tarih).
+
+    HTTP-tarih, yanitin `Date` basligina GORE hesaplanir (varsa): sunucu
+    saati istemciden kaymis olsa da bekleme dogru cikar. Sonuc 1..3600 sn
+    araligina sikistirilir (bozuk/gecmis tarih isi kilitlemesin)."""
     try:
-        ra = (err.headers.get("Retry-After", "") or "").strip()
+        hdrs = err.headers
+        ra = (hdrs.get("Retry-After", "") or "").strip()
     except Exception:
         return 3.0
     if not ra:
@@ -111,8 +162,18 @@ def _retry_after(err) -> float:
         return max(1.0, min(float(ra), 3600.0))
     try:
         import email.utils
-        when = email.utils.parsedate_to_datetime(ra).timestamp()
-        return max(1.0, min(when - time.time(), 3600.0))
+        when = email.utils.parsedate_to_datetime(ra)
+        if when is None:
+            return 3.0
+        base = time.time()
+        try:
+            date = (hdrs.get("Date", "") or "").strip()
+            ref = email.utils.parsedate_to_datetime(date) if date else None
+            if ref is not None:
+                base = ref.timestamp()      # sunucu saati: istemci kaymasi yok
+        except Exception:
+            pass
+        return max(1.0, min(when.timestamp() - base, 3600.0))
     except Exception:
         return 3.0
 
@@ -123,6 +184,11 @@ class SourceInvalid(Exception):
     def __init__(self, msg: str, code: str = "size_mismatch"):
         super().__init__(msg)
         self.code = code
+
+
+class _RangeIgnored(Exception):
+    """Sunucu Range'i yok saydi (aralik istegine 200 tam govde): tek akisa
+    dusulur. Isin kendisi HATA degildir; monitor `_degrade_ranges` uygular."""
 
 
 class _ChunkCheck:
@@ -376,7 +442,7 @@ class JobSpec:
 
 class DownloadJob:
     def __init__(self, env: AppEnv, cfg: dict, spec: JobSpec,
-                 job_id: str | None = None, on_change=None):
+                 job_id: str | None = None, on_change=None, bucket=None):
         self.env = env
         self.cfg = cfg
         self.spec = spec
@@ -412,7 +478,9 @@ class DownloadJob:
         self._run = 0
         # isci havuzu sunucunun izin verdigi kadarina adaptive
         # kuculur; limit asimlari isi HATA ile bitirmez.
-        self._allowed = max(1, min(int(spec.segments or 8), 32))
+        # fd butcesi: RLIMIT_NOFILE yumusak siniri (bkz. _fd_budget)
+        self._fd_cap = _fd_budget(cfg)
+        self._allowed = max(1, min(int(spec.segments or 8), 32, self._fd_cap))
         self._active = 0          # su an aralik isleyen isci sayisi
         self._alive: set[int] = set()
         # eldeki (iscilerin isledigi) araliklar: denetim noktasi bunlari da
@@ -444,7 +512,17 @@ class DownloadJob:
         self._last_modified = ""
         self._ftp_mtime = ""      # FTP MDTM: resume dogrulamasi
         self._restart_needed = False
-        self._bucket = TokenBucket(spec.limit or cfg.get("speed_limit", 0))
+        # hiz sinirlari: kuyruk geneli (paylasilan) + is basina (--limit).
+        # IKISI de saglanmali; tek kova olsaydi 8 is x limit = 8x limit olurdu.
+        gbucket = bucket if bucket is not None else TokenBucket(
+            cfg.get("speed_limit", 0))
+        self._gbucket = gbucket
+        self._job_bucket = TokenBucket(spec.limit or 0)
+        self._bucket = CombinedBucket(gbucket, self._job_bucket)
+        # is geneli Retry-After kapisi: tum isciler ayni ana kadar yeni
+        # baglanti acmaz (monotonic; uyku degil kapi)
+        self._not_before = 0.0
+        self._ranges_ignored = False   # sunucu Range'i yok saydi -> tek akis
         # Turbo: daha derin okuma blogu + daha kucuk bolme esigi = daha
         # agresif paralellik; hat doana kadar calisir.
         self._turbo = bool(cfg.get("turbo_mode"))
@@ -660,6 +738,10 @@ class DownloadJob:
                 # (ve hata, onceki iyi denetim noktasini ezmesin: fd yoksa
                 # _checkpoint yazmaz)
                 self._close_fd()
+                if _is_fd_error(e):
+                    # fd tukendi: yeniden denemek ise yaramaz, is duraklatilir
+                    self._pause_error(_describe_error(e), "fd_exhausted")
+                    return
                 self._fail(_describe_error(e), _code_for(e))
                 return
             # _prepare() bu arada pause()/cancel() gormus olabilir. Karari
@@ -705,6 +787,27 @@ class DownloadJob:
                 os.close(fd)
             except OSError:
                 pass
+
+    def _open_part(self, flags: int) -> int:
+        """`.part` taniticisini acar (tek nokta: testler fd tukenmesini
+        burada taklit eder)."""
+        return os.open(self.part_path, flags, 0o644)
+
+    def _allocate(self, fd: int, total: int) -> None:
+        """Yer onayi: mumkunse bloklari simdiden ayir (posix_fallocate).
+
+        Desteklenmeyen dosya sistemlerinde (EOPNOTSUPP/EINVAL/ENOSYS)
+        sessizce seyrek dosyaya (ftruncate) dusulur. ENOSPC gibi gercek
+        hatalar yukari gider: is mevcut disk dolu koduyla biter."""
+        falloc = getattr(os, "posix_fallocate", None)
+        if falloc is not None:
+            try:
+                falloc(fd, 0, total)
+                return
+            except OSError as ex:
+                if ex.errno not in _ALLOC_UNSUPPORTED:
+                    raise
+        os.ftruncate(fd, total)
 
     def _drop_reservation(self) -> None:
         """Sahiplenilmis ama doldurulmamis son ad yer tutucusunu siler.
@@ -762,7 +865,7 @@ class DownloadJob:
             if not self.final_filename:
                 self.final_filename = util.filename_from_url(self.url) + ".ts"
             name = self.final_filename = _ensure_ext(self.final_filename)
-            self._fd = os.open(self.part_path, os.O_RDWR | os.O_CREAT, 0o644)
+            self._fd = self._open_part(os.O_RDWR | os.O_CREAT)
             self._meta = resume_meta
             return
         if self.kind == "dash" or dash.is_dash(self.url, "") or \
@@ -774,7 +877,7 @@ class DownloadJob:
                 base = util.filename_from_url(self.url)
                 self.final_filename = re.sub(r"\.mpd$", "", base,
                                              flags=re.I) + ".mp4"
-            self._fd = os.open(self.part_path, os.O_RDWR | os.O_CREAT, 0o644)
+            self._fd = self._open_part(os.O_RDWR | os.O_CREAT)
             self._meta = resume_meta
             return
 
@@ -816,6 +919,8 @@ class DownloadJob:
                     self._src_fail(src, "gone" if e.code in (404, 410)
                                    else "http", code=_code_for(e))
             except Exception as e:
+                if _is_fd_error(e):
+                    raise       # fd tukendi: isi duraklat (_pause_error)
                 last_err = e
                 if _socks_auth_error(e):
                     self._src_kill(src, "conn", _code_for(e))
@@ -854,14 +959,20 @@ class DownloadJob:
         else:
             self._fresh_start(p)
             fresh = True
-        self._fd = os.open(self.part_path, os.O_RDWR | os.O_CREAT, 0o644)
+        self._fd = self._open_part(os.O_RDWR | os.O_CREAT)
         if fresh:
             # bastan: eski .part'in kuyrugu KALMAZ. Bilinmeyen boyutta
             # (total = -1) ftruncate(total) yok; kirpilmazsa eski kuyruk
             # yeni icerigin ardinda kalir ve is yanlislikla DONE olur.
             os.ftruncate(self._fd, 0)
         if self.total > 0:
-            os.ftruncate(self._fd, self.total)
+            if fresh:
+                # boyut bilinen temiz baslangic: mumkunse bloklari simdiden
+                # ayir (yer oldugundan emin ol); desteklenmezse seyrek dosya
+                self._allocate(self._fd, self.total)
+            else:
+                # devam: mevcut veri korunur, yalnizca boyut tamamlanir
+                os.ftruncate(self._fd, self.total)
         self._meta = resume_meta
         # kaynak kapasiteleri: her kaynak isin izin verdigi kadar baglanti
         # alabilir; limit sinyali gelince kaynak bazinda daralir
@@ -989,7 +1100,7 @@ class DownloadJob:
             insecure=opt.insecure, stall=self._stall,
             user=self.spec.user, password=self.spec.password,
             proxy=opt.proxy)
-        self._fd = os.open(self.part_path, os.O_RDWR | os.O_CREAT, 0o644)
+        self._fd = self._open_part(os.O_RDWR | os.O_CREAT)
         part = self.part_path.stat().st_size if self.part_path.exists() else 0
         if size >= 0 and part > size:
             # yerel dosya sunucudakinden buyuk: ayna/eski kalinti, bastan
@@ -1005,6 +1116,9 @@ class DownloadJob:
         self._ftp_mtime = mtime
         self.total = size
         self.done = part if size < 0 else min(part, size)
+        # NOT: FTP devami dosya BOYUTUNDAN hesaplanir (REST offset); bu
+        # yuzden onceden yer ayirma (ftruncate/fallocate) YAPILMAZ - boyut
+        # gercek ilerlemeyi yansitmali.
 
     # ---------------------------------------------------------------- workers
     def _start_workers(self):
@@ -1065,11 +1179,13 @@ class DownloadJob:
         return sum(e - s + 1 for s, e in self._pending)
 
     def _ceiling_locked(self) -> int:
-        """Baglanti tavani: sunucu tavani ile dis (birlikte yasam)
-        tavaninin kucugu. Dis tavan yoksa yalniz sunucu tavani."""
-        if self._ext_cap is None:
-            return self._seg_max
-        return max(1, min(self._seg_max, self._ext_cap))
+        """Baglanti tavani: sunucu tavani, dis (birlikte yasam) tavani ve
+        fd butcesinin en kucugu. Dis tavan yoksa sunucu tavani gecerlidir;
+        fd butcesi her durumda asilamaz (EMFILE'ye dusmemek icin)."""
+        cap = self._seg_max
+        if self._ext_cap is not None:
+            cap = max(1, min(cap, self._ext_cap))
+        return max(1, min(cap, self._fd_cap))
 
     def set_external_cap(self, cap: int | None) -> None:
         """Kuyrugun kurdugu dis tavan (birlikte yasam modu).
@@ -1243,6 +1359,30 @@ class DownloadJob:
                 if s.cap < self._allowed:
                     s.cap = min(self._allowed, s.cap * 2)
             self._last_limit_ts = 0.0
+
+    def _retry_gate(self, wait: float) -> None:
+        """Is geneli 'once su ana kadar bekle' kapisi (Retry-After).
+
+        Tek iscinin uyumasi yerine TUM isciler kapida bekler: sunucu 429/503
+        ile uzun bir sure istediyse 32 isci sirayla tekrar tekrar denemez.
+        Kapi monotonic'tir; uyku degil, durdurma sinyaliyle uyanir."""
+        until = time.monotonic() + max(0.0, float(wait))
+        with self._lock:
+            if until > self._not_before:
+                self._not_before = until
+        with self._cond:
+            self._cond.notify_all()
+
+    def _wait_not_before(self) -> bool:
+        """Kapi acilana kadar bekle (durdurma sinyaline saygili).
+        Donus: True devam, False durduruldu."""
+        while True:
+            with self._lock:
+                left = self._not_before - time.monotonic()
+            if left <= 0:
+                return True
+            if self._stop.wait(min(left, 1.0)):
+                return False
 
     def _pick_locked(self, now: float) -> tuple[_Src | None, bool]:
         """Sonraki baglanti icin kaynak secer (kilit altinda).
@@ -1498,12 +1638,18 @@ class DownloadJob:
                                   "size_mismatch")
 
     # ------------------------------------------------- adaptif isci havuzu
-    def _acquire(self, wid: int) -> tuple[int, int] | None:
+    def _acquire(self, wid: int,
+                 gen: int | None = None) -> tuple[int, int] | None:
         """Slot alir. Fazla iscalar OLMEZ, park edilir: governor buyudugunde
-        aninda devreye girerler (baglanti sayisi aktif slotlarla sinirli)."""
+        aninda devreye girerler (baglanti sayisi aktif slotlarla sinirli).
+
+        `gen` verilirse eski kusak isci aralik ALMAZ: kuyruk yeniden
+        kuruldugunda (restart/tek akisa dusme) eski isci yeni araligi
+        kapip isleyemez (aralik kaybolmaz)."""
         with self._cond:
             while True:
-                if self._stop.is_set():
+                if self._stop.is_set() \
+                        or (gen is not None and gen != self._gen):
                     return None
                 if not self._pending:
                     if self._active == 0:
@@ -1662,7 +1808,7 @@ class DownloadJob:
         # kusak degismisse (durdurma -> devam arasinda okumada kalan eski
         # isci) isci cekilir: araligi denetim noktasinda yazili, iade edilmez
         while not self._stop.is_set() and gen == self._gen:
-            rng = self._acquire(wid)
+            rng = self._acquire(wid, gen)
             if rng is None:
                 return
             cooldown = 0.0
@@ -1679,13 +1825,37 @@ class DownloadJob:
             finally:
                 self._release()
             if cooldown:
-                time.sleep(min(cooldown, 30.0))
+                # kisa bekleme de durdurma sinyaliyle uyanir (pause hizli)
+                if self._stop.wait(min(cooldown, 30.0)):
+                    return
             if exit_worker:
                 return
 
+    def _unchanged(self, src: _Src, opt) -> bool:
+        """Range'i yoksayan kaynak AYNI dosyayi mi veriyor (200 teshisi)?
+
+        Yeni bir 0-0 yoklamasi yapar: boyut/ETag bu isin bildigiyle
+        uyusmuyorsa dosya degismistir (bastan indirme dogru yol). Yoklama
+        yapilamazsa temkinli davranip "degismedi" sayilir: en azindan
+        sonsuz 200/206 dongusune girilmez."""
+        try:
+            p = httpcli.probe(src.url, opt)
+        except Exception:
+            return True
+        if self.total > 0 and p.total > 0 and p.total != self.total:
+            return False
+        if self._etag and p.etag and p.etag != self._etag:
+            return False
+        return True
+
     def _open(self, src: _Src, opt, cursor: int, e: int):
         """Kaynak icin Range baglantisi acar ve yaniti dogrular.
-        Hatalar: RangeInvalid (birincil kaynak degismis -> bastan indir),
+
+        Donus: (resp, served_end). `served_end <= e`: sunucu istedigimizden
+        KISA bir 206 dondurebilir (ornegin parca boyutunu kendi sinirlar);
+        kalan aralik yeniden kuyruga girer, bu bir hata degildir.
+        Hatalar: _RangeIgnored (birincil 200: Range yok sayildi -> tek akis),
+        RangeInvalid (birincil kaynak degismis -> bastan indir),
         SourceInvalid (ayna baska dosya veriyor / Range desteklemiyor ->
         ayna elenir), HTTPError ve baglanti hatalari."""
         same = src.url == self._vsrc      # dogrulayici (If-Range) sadece bu kaynaga
@@ -1695,8 +1865,14 @@ class DownloadJob:
                 self._etag if same else "",
                 self._last_modified if same else "",
                 timeout=self._stall)
-        except httpcli.RangeInvalid:
+        except httpcli.RangeInvalid as ex:
             if src.primary:
+                if "(200)" in str(ex):
+                    # sunucu Range'i yok saydi (tam govde dondu). Dosya
+                    # DEGISMEDIYSE tek akisa dus; degistiyse (ETag/boyut
+                    # farkli) eski davranis: bastan indir.
+                    if self._unchanged(src, opt):
+                        raise _RangeIgnored() from None
                 raise
             raise SourceInvalid("Range desteklenmiyor", "incompatible") from None
         # SIKISTIRMA: istekler Accept-Encoding: identity ile gider (bkz.
@@ -1709,11 +1885,12 @@ class DownloadJob:
             raise SourceInvalid(
                 f"sikistirilmis yanit (Content-Encoding: {enc})",
                 "content_encoding")
-        m = re.match(r"bytes\s+(\d+)-\d+(?:/(\d+|\*))?",
+        served = e
+        m = re.match(r"bytes\s+(\d+)-(\d+)(?:/(\d+|\*))?",
                      resp.headers.get("Content-Range") or "")
         if m:
-            total = m.group(2)
-            bad = int(m.group(1)) != cursor or (
+            start, end, total = int(m.group(1)), int(m.group(2)), m.group(3)
+            bad = start != cursor or (
                 bool(total) and total.isdigit() and self.total > 0
                 and int(total) != self.total)
             if bad:
@@ -1721,7 +1898,8 @@ class DownloadJob:
                 if src.primary:
                     raise httpcli.RangeInvalid("Content-Range uyusmuyor")
                 raise SourceInvalid("farkli dosya (boyut/aralik)", "size_mismatch")
-        return resp
+            served = min(e, end)
+        return resp, served
 
     def _sample_tcp(self, resp, wid: int) -> None:
         """Range yanitinin soketinden TCP_INFO ornegi alir (ucuz, hata yutmaz).
@@ -1774,6 +1952,8 @@ class DownloadJob:
             time.sleep(backoff_delay(attempt, rng=self._rand))
 
         while cursor <= e and not self._stop.is_set() and gen == self._gen:
+            if not self._wait_not_before():
+                return (0.0, False)     # durdurma: nokta eldeki araligi yazar
             src = self._next_source()
             if src is None:
                 if not self._stop.is_set() and gen == self._gen:
@@ -1782,7 +1962,15 @@ class DownloadJob:
                 return (0.0, True)
             try:
                 t_open = time.monotonic()
-                resp = self._open(src, opt, cursor, e)
+                resp, served = self._open(src, opt, cursor, e)
+                if served < e:
+                    # sunucu istedigimizden KISA bir 206 dondurdu (kendi
+                    # parca siniri): gelen baytlar yazilir, KALAN aralik
+                    # yeniden kuyruga girer. Hata degildir.
+                    with self._lock:
+                        self._pending.append((served + 1, e))
+                        self._inflight[wid] = (cursor, served)
+                    e = served
                 # TTFB: baglanti + basliklara kadar gecen sure. Ek istek
                 # acilmaz; taban/EMA karsilastirmasi birlikte yasam
                 # modunun gecikme sinyalini besler (eski kusak yazmaz).
@@ -1790,6 +1978,12 @@ class DownloadJob:
                     self._lat.add(host_key(src.url),
                                   time.monotonic() - t_open)
                     self._sample_tcp(resp, wid)
+            except _RangeIgnored:
+                # sunucu Range'i yok saydi (200 tam govde): tek akisa dus
+                requeue()
+                with self._lock:
+                    self._ranges_ignored = True
+                return (0.0, True)
             except SourceInvalid as ex:
                 # ayna baska dosya veriyor / Range desteklemiyor / sikistirilmis
                 # yanit: isi bastan baslatmak YANLIS olur (sonsuz restart
@@ -1823,8 +2017,10 @@ class DownloadJob:
                                    f"(HTTP {err.code})", "rate_limited")
                         return (0.0, True)
                     self._shrink(f"HTTP {err.code}", src)
+                    # is geneli kapi: tum isciler ayni ana kadar beklemez
+                    self._retry_gate(wait)
                     requeue()
-                    return (min(wait, 30.0), False)
+                    return (0.0, False)
                 fatal = err.code in (401, 403, 404, 410)
                 kind = "gone" if err.code in (404, 410) or (
                     not src.primary and err.code in (401, 403)) else "http"
@@ -1859,6 +2055,12 @@ class DownloadJob:
                 backoff()
                 continue
             except Exception as ex:
+                if _is_fd_error(ex):
+                    # fd tukendi: tekrar denemek isi HATA'ya dusururdu;
+                    # is duraklatilir, neden error_code ile gorunur kalir
+                    requeue()
+                    self._pause_error(_describe_error(ex), "fd_exhausted")
+                    return (0.0, True)
                 if self._others_alive(src):
                     self._src_fail(src, "conn", code=_code_for(ex))
                     continue
@@ -1977,6 +2179,10 @@ class DownloadJob:
                 backoff()
                 continue
             except Exception as ex:
+                if _is_fd_error(ex):
+                    requeue()
+                    self._pause_error(_describe_error(ex), "fd_exhausted")
+                    return (0.0, True)
                 if self._others_alive(src):
                     self._src_fail(src, "read", code=_code_for(ex))
                     continue
@@ -2229,6 +2435,10 @@ class DownloadJob:
                 alive = any(t.is_alive() for t in self._threads)
                 empty = not self._pending
                 restart = self._restart_needed
+                ignored = self._ranges_ignored
+            if ignored:
+                self._degrade_ranges()
+                return
             if restart:
                 self._do_restart()
                 return
@@ -2260,7 +2470,10 @@ class DownloadJob:
                 self.total = self.done = int(meta.get("tail", 0))
                 util.atomic_write_json(self.meta_path, meta)
         except Exception as ex:
-            self._fail(str(ex), _code_for(ex))
+            if _is_fd_error(ex):
+                self._pause_error(_describe_error(ex), "fd_exhausted")
+            else:
+                self._fail(str(ex), _code_for(ex))
 
     def _seg_cap(self) -> int:
         """Segment havuzu tavani: sabit 8 ile isin baglanti tavani
@@ -2293,7 +2506,10 @@ class DownloadJob:
                 self.total = self.done = int(meta.get("tail", 0))
                 util.atomic_write_json(self.meta_path, meta)
         except Exception as ex:
-            self._fail(str(ex), _code_for(ex))
+            if _is_fd_error(ex):
+                self._pause_error(_describe_error(ex), "fd_exhausted")
+            else:
+                self._fail(str(ex), _code_for(ex))
 
     def _run_ftp(self):
         """Tek akis indirme, geri cekilmeli yeniden deneme ile. Durdurma
@@ -2439,6 +2655,45 @@ class DownloadJob:
             # sonsuz bastan-indirme dongusune girmeyelim
             self._fail("kaynak surekli degisiyor (tutarsiz sunucu)",
                        "source_changed")
+            return
+        self.state = JobState.DOWNLOADING
+        self._changed()
+        self._spawn()
+
+    def _degrade_ranges(self) -> None:
+        """Sunucu Range'i yok saydi (200): tek akisa dus.
+
+        `_min_split = inf` + `segments = 1` + tek aralik: ayni anda tek
+        baglanti acilir ve tam govde 0'dan iner. Boylece aralik isteyip
+        200 alan is surekli bastan baslatilmaz ("kaynak surekli degisiyor"
+        hatasina da dusmez). Yerel yarim veri guvenilmez (200 govdesi
+        sifirdan gelir): bastan indirilir."""
+        with self._cond:
+            self._gen += 1           # eski kusak isciler cekilsin
+            self._cond.notify_all()
+        self._fold_threads()
+        with self._lock:
+            self._ranges_ignored = False
+            self._threads = []
+            self.spec.segments = 1
+            self._allowed = 1
+            self._seg_max = 1
+            self._min_split = float("inf")
+            self.extra["no_ranges"] = True
+            self._gov["probe"] = False
+            if self.total > 0:
+                self._pending = [(0, self.total - 1)]
+                self.done = 0
+                if self._fd is not None:
+                    os.ftruncate(self._fd, self.total)
+            else:
+                self._pending = [(0, 1 << 62)]
+                self.done = 0
+            self._gov["done"] = self.done
+            self._speed_done_mark = self.done
+        self._reset_verify_extra()
+        self._checkpoint(force=True)   # yeni tek-aralik noktasi diske insin
+        if self._stop.is_set():
             return
         self.state = JobState.DOWNLOADING
         self._changed()
@@ -2759,6 +3014,29 @@ class DownloadJob:
         with self._cond:
             self._cond.notify_all()
         self._checkpoint(force=True)
+        self._changed()
+
+    def _pause_error(self, msg: str, code: str) -> None:
+        """Kalici olmayan altyapi hatasi (or. fd tukenmesi): isi HATA'ya
+        dusurmek yerine DURAKLATIR. Neden `error`/`error_code` ile gorunur
+        kalir; kuyruk yeniden baslatmada bunu 'paused' olarak geri yukler
+        (kalici hata dongusu yok). Kullanici `resume` ile yeniden dener."""
+        with self._lock:
+            if self.state == JobState.CANCELED:
+                return
+            self.error = msg
+            self.error_code = code
+            self.speed = 0
+            self._stop.set()          # tum isciler kalan araliklari birakir
+        with self._cond:
+            self._cond.notify_all()
+        try:
+            self._checkpoint(force=True)
+        except OSError:
+            pass                      # fd yoksa/disk hatasi: neden yine gorunur
+        with self._lock:
+            if self.state != JobState.CANCELED:
+                self.state = JobState.PAUSED
         self._changed()
 
     # -------------------------------------------------------------- control
