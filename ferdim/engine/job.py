@@ -3510,15 +3510,28 @@ class DownloadJob:
 
     # ------------------------------------------------------------- checkpoint
     def _maybe_checkpoint(self):
-        now = time.monotonic()
-        if now - self._last_checkpoint >= CHECKPOINT_INTERVAL:
-            self._checkpoint(force=True)
+        """Aralikli denetim noktasi: esigi GECEN ILK isci yazar.
+
+        Hizli yol kilitsiz bakistir (sicak dongude isci basina yalnizca bir
+        karsilastirma); kilit ancak esik gecmis GORUNUYORSA alinir.
+        `force` KULLANILMAZ: force aralik kontrolunu atlar, bu yuzden ayni
+        pencerede esigi gecen her isci kendi dup+fsync(.part)+meta yazimini
+        yapabiliyordu. Talebi `_checkpoint` kilidin ALTINDA atomik
+        sahiplenir; digerleri tazelenmis `_last_checkpoint`i gorup doner."""
+        if time.monotonic() - self._last_checkpoint < CHECKPOINT_INTERVAL:
+            return
+        self._checkpoint()
 
     def _checkpoint(self, force=False):
-        now = time.monotonic()
-        if not force and now - self._last_checkpoint < CHECKPOINT_INTERVAL:
-            return
-        self._last_checkpoint = now
+        with self._lock:
+            now = time.monotonic()
+            if not force and now - self._last_checkpoint < CHECKPOINT_INTERVAL:
+                return
+            # TALEBI BURADA SAHIPLEN (kilitli): araligi ayni anda gecen
+            # isciler sirayla girer, yalniz ilki yazar; boylece pencerede
+            # en cok BIR nokta uretilir. force=True (EOF, bilinmeyen boyut,
+            # duraklatma) bu kilidi yine de gecer.
+            self._last_checkpoint = now
         # hls/dash meta dosyasi segment ilerlemesini tasir (segments.py
         # yazar); aralik bicimli bir nokta onu ezerdi
         if self.kind in ("hls", "dash") or self._fd is None:
