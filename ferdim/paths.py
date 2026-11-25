@@ -80,6 +80,8 @@ DEFAULTS = {
     "tls_client_cert": "",         # mTLS istemci sertifikasi
     "tls_client_key": "",          # "" -> anahtar sertifika dosyasinda
     "tls_min_version": "",         # "" varsayilan | "1.2" | "1.3"
+    "clipboard_confirm": True,     # panodan gelen URL once durur; "Geri al" bildirimi
+    "coexist_interfaces": [],      # bos = varsayilan rotanin arayuzu (VPN dahil)
 }
 
 

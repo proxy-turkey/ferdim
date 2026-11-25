@@ -8,7 +8,8 @@ import threading
 import time
 
 from .. import util
-from ..coexist import DEFAULT_LATENCY, DEFAULT_THRESHOLD, LineMonitor
+from ..coexist import (DEFAULT_LATENCY, DEFAULT_THRESHOLD, LineMonitor,
+                       resolve_interfaces)
 from ..history import STATES as HISTORY_STATES, open_history, redact_credentials
 from ..paths import AppEnv
 from .job import DownloadJob, JobSpec, JobState
@@ -138,7 +139,9 @@ class QueueManager:
         self._starting: set[str] = set()
         # birlikte yasam (varsayilan kapali): hat izleyici yalniz acikken
         # ornekler; 'coexist_on' gecisi tavani birakmak icin tutulur
-        self.coexist = LineMonitor()
+        # cfg['coexist_interfaces'] canli okunur; bos ise varsayilan rota
+        self.coexist = LineMonitor(
+            interfaces=lambda: resolve_interfaces(self.cfg))
         self._coexist_on = False
         self._prober = threading.Thread(target=self._prober_loop, daemon=True)
         self._prober.start()
@@ -902,7 +905,8 @@ class QueueManager:
                         size = _ftp.probe_size(
                             url, timeout=min(max(1, int(opt.timeout)), 5),
                             insecure=opt.insecure, user=cand.spec.user,
-                            password=cand.spec.password, proxy=opt.proxy)
+                            password=cand.spec.password, proxy=opt.proxy,
+                            tls=opt)
                         if size > 0:
                             with cand._lock:
                                 if cand.state == JobState.QUEUED:

@@ -194,6 +194,20 @@ def _sanitize_config(cfg: dict, env=None) -> str:
         if isinstance(_v, str):
             _v = _v.strip().lower() not in ("", "0", "false", "no", "off")
         cfg[_k] = bool(_v)
+    cc = cfg.get("clipboard_confirm", True)
+    if isinstance(cc, str):
+        cc = cc.strip().lower() not in ("", "0", "false", "no", "off")
+    cfg["clipboard_confirm"] = bool(cc)
+    ci = cfg.get("coexist_interfaces", [])
+    if isinstance(ci, str):
+        ci = ci.replace(",", " ").split()
+    elif isinstance(ci, (list, tuple)):
+        ci = [str(x).strip() for x in ci if str(x).strip()]
+    else:
+        ci = []
+    # arayuz adi: /proc/net/dev bicimi disinda karakter kabul edilmez
+    cfg["coexist_interfaces"] = [x for x in ci
+                                 if re.fullmatch(r"[\w.@:-]{1,15}", x)][:16]
     # "coexist": ayni sekilde metin kabul edilir; esik 0.02-0.9 arasinda
     cv = cfg.get("coexist", False)
     cfg["coexist"] = cv if isinstance(cv, bool) else \

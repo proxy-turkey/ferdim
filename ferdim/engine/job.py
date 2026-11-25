@@ -311,6 +311,8 @@ _SRC_CODES = {           # kaynak basarisizlik nedeni -> kararli hata kodu
 
 def _code_for(e: BaseException) -> str:
     """Arayuzlerin cevirebilmesi icin kararli hata kodu (mesaj Turkce kalir)."""
+    if isinstance(e, httpcli.TlsConfigError):
+        return e.code
     if isinstance(e, urllib.error.HTTPError):
         if e.code in (404, 410):
             return "not_found"
@@ -437,6 +439,7 @@ class JobSpec:
             # ayna ya da yonlendirme hedefi parolayi/cerezi almaz (ayni
             # kokenli ayna kimligi korur). Bak: httpcli.headers_for
             origin=httpcli.origin_of(self.url),
+            tls=httpcli.TlsConfig.from_cfg(cfg, self.insecure),
         )
 
 
@@ -1099,7 +1102,7 @@ class DownloadJob:
             self.url, timeout=max(1, int(opt.timeout)),
             insecure=opt.insecure, stall=self._stall,
             user=self.spec.user, password=self.spec.password,
-            proxy=opt.proxy)
+            proxy=opt.proxy, tls=opt)
         self._fd = self._open_part(os.O_RDWR | os.O_CREAT)
         part = self.part_path.stat().st_size if self.part_path.exists() else 0
         if size >= 0 and part > size:
@@ -2590,7 +2593,7 @@ class DownloadJob:
                 insecure=opt.insecure, timeout=max(1, int(opt.timeout)),
                 halted=lambda: gen != self._gen,
                 user=self.spec.user, password=self.spec.password,
-                proxy=opt.proxy)
+                proxy=opt.proxy, tls=opt)
 
         try:
             while True:
