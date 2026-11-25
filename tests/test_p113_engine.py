@@ -12,12 +12,15 @@ Kapsam:
   `set_rate` ile erken uyanir,
 - yerel HTTP indirmesi segmentli olarak bayt bayt aynidir; ortada
   duraklat/devam veri kaybetmez,
+- aralikli denetim noktasi pencerede TEK yazimdir (force her isciye
+  yazdirmaz) ve duraklama noktasi kalan tum baytlari kapsar,
 - yayinlama penceresinde ad yer tutucusu birakilmaz (baska is ayni adi
   kapamaz) ve hata yolu yer tutucuyu sizdirmaz.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sys
 import threading
@@ -312,6 +315,13 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(job.state, JobState.PAUSED, job.error)
         self.assertEqual(job._inflight, {}, "duraklatmada ucustaki aralik kaldi")
         self.assertTrue(job.meta_path.exists(), "denetim noktasi yazilmadi")
+        # cokme guvenligi: nokta kalan TUM baytlari kapsar (eldeki araliklar
+        # dahil) - devam 'done'u bundan turetir, eksik aralik olamaz
+        meta = json.loads(job.meta_path.read_text())
+        covered = int(meta.get("done") or 0) + sum(
+            e - s + 1 for s, e in meta.get("ranges") or [])
+        self.assertEqual(covered, int(meta["total"]),
+                         "duraklama noktasi kalan baytlari kapsamiyor")
         done_at_pause = job.done
         self.assertGreater(done_at_pause, 0)
         job.resume()
@@ -319,6 +329,145 @@ class EndToEndTests(unittest.TestCase):
                         f"{job.state} {job.error}")
         self.assertEqual(job.state, JobState.DONE, job.error)
         self.assertEqual(job.done, job.total)
+        self.assertEqual(hashlib.sha256(job.final_path.read_bytes()).hexdigest(),
+                         hashlib.sha256(DATA).hexdigest())
+
+
+class CheckpointRateTests(unittest.TestCase):
+    """Aralikli denetim noktasi: pencerede tek yazim, crash-safe kapsam.
+
+    Bulgu: `_maybe_checkpoint()` `force=True` ile cagiriyordu; force aralik
+    kontrolunu atladigi icin ayni pencerede esigi gecen her isci kendi
+    dup+fsync(.part)+meta yazimini yapabiliyordu (16 isci -> 16 kat fsync).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), _PacedHandler)
+        cls.srv.daemon_threads = True
+        _PacedHandler.payload = DATA
+        cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.t.start()
+        cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def _job(self, segments=8):
+        env = AppEnv(root=tmp_root(self, "ferdim-p113-ckpt-"))
+        cfg = env.load_config()
+        cfg["checksum_sidecar"] = False
+        cfg["learn_hosts"] = False
+        job = DownloadJob(env, cfg, JobSpec(url=f"{self.base}/f.bin",
+                                            segments=segments))
+        self.addCleanup(job.cancel)
+        return job
+
+    def test_01_maybe_checkpoint_never_forces(self):
+        """`_maybe_checkpoint` force KULLANMAZ: force aralik kontrolunu
+        atlayip her cagirani yazima sokar (asil hata)."""
+        job = self._job()
+        seen = []
+        job._checkpoint = lambda force=False: seen.append(force)
+        job._last_checkpoint = -1e9
+        job._maybe_checkpoint()
+        self.assertEqual(seen, [False],
+                         "aralikli nokta force ile aralik kontrolunu atliyor")
+
+    def test_02_interval_claimed_once_under_contention(self):
+        """Ayni pencerede esigi gecen 8 isci TEK dup+fsync+meta yazar:
+        talep kilidin altinda atomik sahiplenilir."""
+        job = self._job()
+        job.kind = "http"
+        job.total = 1 << 20
+        job.done = 0
+        job._pending = [(0, (1 << 20) - 1)]
+        job.target_dir.mkdir(parents=True, exist_ok=True)
+        job._fd = os.open(job.part_path, os.O_RDWR | os.O_CREAT, 0o644)
+        job._wrote, job._durable_wrote = 1, 0      # fsync yolu da sayilsin
+        writes, dups = [], []
+        real_write = job_mod.util.atomic_write_json
+        real_dup = os.dup
+
+        def counting_write(path, data, *a, **kw):
+            if Path(path) == job.meta_path:
+                writes.append(path)
+            return real_write(path, data, *a, **kw)
+
+        def counting_dup(fd, *a, **kw):
+            if fd == job._fd:
+                dups.append(fd)
+            return real_dup(fd, *a, **kw)
+
+        job._last_checkpoint = -1e9
+        barrier = threading.Barrier(8)
+
+        def call():
+            barrier.wait(5)
+            job._maybe_checkpoint()
+
+        threads = [threading.Thread(target=call, daemon=True)
+                   for _ in range(8)]
+        with mock.patch.object(job_mod, "CHECKPOINT_INTERVAL", 60.0), \
+             mock.patch.object(job_mod.util, "atomic_write_json",
+                               side_effect=counting_write), \
+             mock.patch.object(job_mod.os, "dup", side_effect=counting_dup):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        self.assertFalse([t for t in threads if t.is_alive()])
+        self.assertEqual(len(writes), 1,
+                         f"pencerede {len(writes)} meta yazimi (1 olmali)")
+        self.assertEqual(len(dups), 1, f"pencerede {len(dups)} fsync (1 olmali)")
+
+    def test_03_eight_links_one_checkpoint_per_interval(self):
+        """>2 aralik suren 8 linkli indirme: periyodik nokta kabaca aralik
+        basina 1 (isci sayisiyla carpilmaz) ve dosya bayt bayt aynidir."""
+        job = self._job(segments=8)
+        interval = 0.05
+        periodic, forced = [], []
+        tick = threading.local()
+        orig_maybe = DownloadJob._maybe_checkpoint
+
+        def tagged_maybe(self):
+            tick.on = True
+            try:
+                return orig_maybe(self)
+            finally:
+                tick.on = False
+
+        real_write = job_mod.util.atomic_write_json
+
+        def counting_write(path, data, *a, **kw):
+            # periyodik ve bilincli (EOF/duraklat) yazimlari ayir
+            if Path(path) == job.meta_path and isinstance(data, dict) \
+                    and "ranges" in data:
+                target = periodic if getattr(tick, "on", False) else forced
+                target.append(time.monotonic())
+            return real_write(path, data, *a, **kw)
+
+        with mock.patch.object(job_mod, "CHECKPOINT_INTERVAL", interval), \
+             mock.patch.object(DownloadJob, "_maybe_checkpoint", tagged_maybe), \
+             mock.patch.object(job_mod.util, "atomic_write_json",
+                               side_effect=counting_write):
+            t0 = time.monotonic()
+            job.start()
+            self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR), 120),
+                            f"{job.state} {job.error}")
+            elapsed = time.monotonic() - t0
+        self.assertEqual(job.state, JobState.DONE, job.error)
+        windows = elapsed / interval
+        self.assertGreater(windows, 2.0, f"indirme cok kisa: {elapsed:.2f} s")
+        self.assertGreaterEqual(len(periodic), 2,
+                                "periyodik nokta hic yazilmadi")
+        # pencere basina ~1: isci sayisi (8) carpani YOK
+        self.assertLessEqual(
+            len(periodic), windows + 2,
+            f"aralik basina fazla nokta: {len(periodic)} periyodik yazim / "
+            f"{windows:.0f} pencere ({len(forced)} bilincli yazim)")
         self.assertEqual(hashlib.sha256(job.final_path.read_bytes()).hexdigest(),
                          hashlib.sha256(DATA).hexdigest())
 
