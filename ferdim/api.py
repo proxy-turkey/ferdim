@@ -124,10 +124,48 @@ def _peer_dir_list(value) -> list[str]:
     return _dir_list(value, strip=True)
 
 
-def _sanitize_config(cfg: dict, env=None) -> None:
+def _tls_path(value) -> str:
+    """Mutlak, okunabilir dosya yolu; gecersizse bos dize."""
+    if not isinstance(value, str):
+        return ""
+    p = os.path.expanduser(value.strip())
+    if not p or "\x00" in p or not os.path.isabs(p):
+        return ""
+    try:
+        with open(p, "rb"):
+            pass
+    except OSError:
+        return ""
+    return p
+
+
+def _sanitize_tls(cfg: dict) -> str:
+    """TLS anahtarlarini dogrular; bozuk deger dusurulur ('tls_config')."""
+    bad = False
+    for key in ("tls_ca_file", "tls_client_cert", "tls_client_key"):
+        raw = cfg.get(key, "")
+        if raw in ("", None):
+            cfg[key] = ""
+            continue
+        path = _tls_path(raw)
+        if not path:
+            bad = True            # yok/okunamiyor/goreli: sessizce kullanma
+        cfg[key] = path
+    # anahtar tek basina anlamsiz: sertifika dosyasi yoksa dusur
+    if cfg.get("tls_client_key") and not cfg.get("tls_client_cert"):
+        cfg["tls_client_key"] = ""
+        bad = True
+    if cfg.get("tls_min_version", "") not in ("", "1.2", "1.3"):
+        cfg["tls_min_version"] = ""
+        bad = True
+    return "tls_config" if bad else ""
+
+
+def _sanitize_config(cfg: dict, env=None) -> str:
     """Yapilandirmayi guvenli araliga ceker: bozuk bir deger (el ile
     duzenlenmis config.json, bozuk API cagrisi) daemon'u devirmemeli.
-    env verilirse indirme dizini de denenir; acilamiyorsa varsayilan."""
+    env verilirse indirme dizini de denenir; acilamiyorsa varsayilan.
+    Bozuk TLS ayari dusurulur ve 'tls_config' uyari kodu doner."""
     for key, (lo, hi, default) in _MAX_INT.items():
         try:
             cfg[key] = max(lo, min(hi, int(cfg.get(key, default))))
@@ -200,8 +238,10 @@ def _sanitize_config(cfg: dict, env=None) -> None:
             del sch["categories"][name]     # bozuk pencere = kisit yok
     d = cfg.get("download_dir")
     cfg["download_dir"] = d if isinstance(d, str) and d.strip() else None
+    warning = _sanitize_tls(cfg)
     if env is not None:
         _recheck_download_dir({"env": env, "cfg": cfg})
+    return warning
 
 
 def _recheck_download_dir(ctx) -> str:
@@ -365,17 +405,12 @@ def _bad_checksum(params: dict) -> bool:
 
 
 def _url_origin(url) -> tuple:
-    """(sema, ana makine, port); cozulemeyen URL icin bos sema doner."""
-    try:
-        p = urlsplit(str(url or ""))
-        scheme = (p.scheme or "").lower()
-        host = (p.hostname or "").lower()
-        port = p.port
-    except ValueError:
-        return ("", "", 0)
-    if port is None:
-        port = {"http": 80, "https": 443}.get(scheme, 0)
-    return (scheme, host, port)
+    """(sema, ana makine, port); cozulemeyen URL icin bos sema doner.
+
+    IDNA normalizasyonu httpcli'deki tek kaynaktan gelir: unicode ve
+    punycode yazimlar ayni koken sayilir."""
+    from .engine.httpcli import origin_of
+    return origin_of(url)
 
 
 def _item_params(keep: dict, doc_url: str, it: dict) -> dict | None:
@@ -808,7 +843,7 @@ def handle(ctx, cmd: str, params: dict) -> dict:
         for k, v in new.items():
             if k in cfg:
                 cfg[k] = v
-        _sanitize_config(cfg)
+        warning = _sanitize_config(cfg)
         # turbo acikken girilen limit / eszamanlilik, turbo kapaninca da
         # (turbo_prev geri yuklemesiyle) kaybolmasin
         prev = cfg.get("turbo_prev")
@@ -816,7 +851,8 @@ def handle(ctx, cmd: str, params: dict) -> dict:
             for k in ("speed_limit", "max_concurrent"):
                 if k in new:
                     prev[k] = cfg[k]
-        warning = _recheck_download_dir(ctx) if "download_dir" in new else ""
+        if "download_dir" in new and not warning:
+            warning = _recheck_download_dir(ctx)
         ctx["set_cfg"](cfg)
         if "speed_limit" in new:
             qm.set_speed_limit(int(cfg.get("speed_limit") or 0))

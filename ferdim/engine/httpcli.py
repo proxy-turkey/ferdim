@@ -23,14 +23,17 @@ ProxyHandler'i onu proxy URL'inden yeniden ekler.
 from __future__ import annotations
 
 import base64
+import functools
 import http.client
+import os
 import socket
 import ssl
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from urllib.parse import urlsplit
 
+from ..profiles import normalise_host
 from . import h3, socks
 
 RCVBUF = 1 << 21  # 2 MB (cekirdek rmem_max ile kisitlanir, sorun degil)
@@ -46,6 +49,122 @@ def _tune(sock: socket.socket) -> None:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF)
     except OSError:
         pass
+
+
+# ------------------------------------------------------------------ TLS
+# HTTP, h3 ve FTPS ayni TLS ayarlarini paylasir: ozel CA paketi, istemci
+# sertifikasi (mTLS) ve asgari TLS surumu. Tek kaynak burasidir; her
+# tuketici `ssl_context`/`TlsConfig` uzerinden ayni degeri gorur.
+class TlsConfigError(Exception):
+    """TLS ayari kullanilamaz (dosya yok/okunamiyor). code='tls_config'."""
+
+    code = "tls_config"
+
+
+def _readable_file(path: str) -> bool:
+    if not path or "\x00" in path or not os.path.isabs(path):
+        return False
+    try:
+        with open(path, "rb"):
+            pass
+    except OSError:
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class TlsConfig:
+    """TLS ayarlari (config anahtarlarinin tasiyicisi)."""
+
+    insecure: bool = False
+    ca_file: str = ""         # ek CA paketi (sistem koklerine EKLENIR)
+    client_cert: str = ""     # mTLS istemci sertifikasi
+    client_key: str = ""      # bos ise anahtar sertifika dosyasindadir
+    min_version: str = ""     # "" varsayilan | "1.2" | "1.3"
+
+    @classmethod
+    def from_cfg(cls, cfg: dict, insecure: bool = False) -> "TlsConfig":
+        """config sozlugunden TLS ayarlari (verify_tls dahil)."""
+        get = cfg.get if isinstance(cfg, dict) else (lambda _k, _d=None: _d)
+        return cls(
+            insecure=bool(insecure or not get("verify_tls", True)),
+            ca_file=str(get("tls_ca_file") or ""),
+            client_cert=str(get("tls_client_cert") or ""),
+            client_key=str(get("tls_client_key") or ""),
+            min_version=str(get("tls_min_version") or ""),
+        )
+
+    @classmethod
+    def from_opt(cls, opt) -> "TlsConfig":
+        """DlOptions/benzeri nesneden; `insecure` her zaman dikkate alinir."""
+        t = getattr(opt, "tls", None)
+        if not isinstance(t, cls):
+            t = cls()
+        if getattr(opt, "insecure", False) and not t.insecure:
+            t = replace(t, insecure=True)
+        return t
+
+    def validate(self) -> None:
+        """Dosyalar mutlak/okunabilir mi; anahtar sertifikasiz olmaz."""
+        for path in (self.ca_file, self.client_cert, self.client_key):
+            if path and not _readable_file(path):
+                raise TlsConfigError(f"TLS dosyasi okunamadi: {path}")
+        if self.client_key and not self.client_cert:
+            raise TlsConfigError(
+                "TLS istemci anahtari sertifika olmadan kullanilamaz")
+
+    def apply_quic(self, conf) -> None:
+        """aioquic QuicConfiguration'a CA + istemci sertifikasi uygular.
+
+        QUIC yalniz TLS 1.3 kullanir: `min_version` icin ayar gerekmez.
+        aioquic'te `load_verify_locations` varsayilan (certifi) depoyu
+        DEGISTIRIR; HTTP yolunda ise CA paketi sistem koklerine eklenir.
+        """
+        self.validate()
+        if self.ca_file:
+            conf.load_verify_locations(cafile=self.ca_file)
+        if self.client_cert:
+            conf.load_cert_chain(self.client_cert, self.client_key or None)
+
+
+@functools.lru_cache(maxsize=8)
+def _context_for(settings: TlsConfig) -> ssl.SSLContext:
+    """Ayarlardan SSL baglami uretir (ayar basina onbelleklenir)."""
+    settings.validate()
+    ctx = ssl.create_default_context()
+    if settings.ca_file:
+        try:
+            # ek CA: create_default_context'in yukledigi sistem kokleri kalir
+            ctx.load_verify_locations(cafile=settings.ca_file)
+        except (ssl.SSLError, OSError) as ex:
+            raise TlsConfigError(
+                f"TLS CA paketi yuklenemedi: {settings.ca_file}") from ex
+    if settings.client_cert:
+        try:
+            ctx.load_cert_chain(settings.client_cert,
+                                settings.client_key or None)
+        except (ssl.SSLError, OSError) as ex:
+            raise TlsConfigError(
+                "TLS istemci sertifikasi yuklenemedi: "
+                f"{settings.client_cert}") from ex
+    if settings.insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    ver = {"1.2": ssl.TLSVersion.TLSv1_2,
+           "1.3": ssl.TLSVersion.TLSv1_3}.get(settings.min_version)
+    if ver is not None:
+        ctx.minimum_version = ver
+    return ctx
+
+
+def tls_settings(opt) -> TlsConfig:
+    """DlOptions (veya benzeri) -> TlsConfig; TlsConfig aynen doner."""
+    return opt if isinstance(opt, TlsConfig) else TlsConfig.from_opt(opt)
+
+
+def ssl_context(opt) -> ssl.SSLContext:
+    """Paylasilan TLS baglami: HTTP/FTPS ayni ayardan ayni nesneyi alir."""
+    return _context_for(tls_settings(opt))
 
 
 # ------------------------------------------------------- kimlik kapsami
@@ -76,7 +195,7 @@ def origin_of(url: str) -> tuple:
     try:
         p = urlsplit(str(url or ""))
         scheme = (p.scheme or "").lower()
-        host = (p.hostname or "").lower()
+        host = normalise_host(p.hostname or "")
         port = p.port
     except ValueError:
         return ("", "", 0)
@@ -166,11 +285,18 @@ class SocksHTTPHandler(urllib.request.HTTPHandler):
 
 
 class SocksHTTPSHandler(urllib.request.HTTPSHandler):
-    def __init__(self, proxy: str, context=None):
-        super().__init__(context=context)
+    def __init__(self, proxy: str, opt: "DlOptions"):
+        super().__init__()
         self._proxy = proxy
+        self._opt = opt
+        self._ctx_ready = False
 
     def https_open(self, req):
+        # baglam yalniz HTTPS isteginde kurulur: TLS ayari bozuksa duz
+        # http isi etkilenmez
+        if not self._ctx_ready:
+            self._context = ssl_context(self._opt)
+            self._ctx_ready = True
         return self.do_open(_socks_https_conn(self._proxy), req,
                             context=self._context)
 
@@ -181,8 +307,16 @@ class FastHTTPHandler(urllib.request.HTTPHandler):
 
 
 class FastHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, opt: "DlOptions"):
+        super().__init__()
+        self._opt = opt
+        self._ctx_ready = False
+
     def https_open(self, req):
         # baglam verilmezse --insecure/verify_tls=false sessizce yok sayilir
+        if not self._ctx_ready:
+            self._context = ssl_context(self._opt)
+            self._ctx_ready = True
         return self.do_open(FastHTTPSConnection, req,
                             context=self._context)
 
@@ -263,6 +397,9 @@ class DlOptions:
     # toplayamaz. Bos ise istek URL'inin kendi kokeni gecerlidir (tek
     # kaynak; ad-hoc kullanim) - yonlendirme kurali yine uygulanir.
     origin: tuple = ()
+    # TLS ayarlari: HTTP, h3 ve FTPS ayni nesneyi paylasir. `tls_settings`
+    # `insecure` alanini da birlestirir (eski cagri bicimi korunur).
+    tls: TlsConfig = field(default_factory=TlsConfig)
 
     def base_headers(self) -> dict:
         h = {
@@ -308,25 +445,17 @@ class ProbeResult:
     content_disposition: str = ""
 
 
-def _tls_context(insecure: bool) -> ssl.SSLContext:
-    ctx = ssl.create_default_context()
-    if insecure:
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-
 def _make_opener(opt: DlOptions, direct: bool = False):
     """Opener kurar; h3 seciliyse `open` istekleri h3'e devreder.
 
     direct=True: h3 yonlendirmesi kapali (h3'un TCP'ye dusus yolu, sonsuz
-    donguye girmesin) ve dogrudan urllib opener'i doner."""
+    donguye girmesin) ve dogrudan urllib opener'i doner. TLS baglami
+    HTTPS istegi acilinca kurulur (bozuk TLS ayari duz http isini etkilemez)."""
     handlers: list[urllib.request.BaseHandler] = []
     if opt.proxy and socks.is_socks(opt.proxy):
         # SOCKS5: gecit HTTP degil, tunel acar; ProxyHandler kullanilmaz.
         handlers.append(SocksHTTPHandler(opt.proxy))
-        handlers.append(SocksHTTPSHandler(
-            opt.proxy, _tls_context(opt.insecure)))
+        handlers.append(SocksHTTPSHandler(opt.proxy, opt))
     else:
         if opt.proxy:
             handlers.append(urllib.request.ProxyHandler(
@@ -334,9 +463,7 @@ def _make_opener(opt: DlOptions, direct: bool = False):
         else:
             # cevre degiskenlerindeki proxy'yi koru (urllib varsayilani)
             handlers.append(urllib.request.ProxyHandler())
-        # baglam her zaman acik verilir: 3.11'de context=None varsayilan
-        # baglam uretmez (3.13+ uretir), iki yol ayni davranmali
-        handlers.append(FastHTTPSHandler(context=_tls_context(opt.insecure)))
+        handlers.append(FastHTTPSHandler(opt))
         handlers.append(FastHTTPHandler())
     # yonlendirme kimlik kapsami: SOCKS/duz yol ayrimi yok, her opener'da
     # stdlib HTTPRedirectHandler'in yerine gecer (build_opener alt sinifi
@@ -421,12 +548,38 @@ def _probe_from(res) -> ProbeResult:
     return res_probe
 
 
+# Range yoklamasini reddeden durumlar: sunucu bytes=0-0 istegine ozgu
+# hata donduruyor olabilir. Tek duz GET ile yeniden denenir; basariliysa
+# kaynak Range'siz tek akis sayilir. 404/401 gibi gercek hatalar burada
+# yok: onlar yoklamanin kendisi kadar dosyanin da sorunu.
+_PROBE_RANGE_REJECT = frozenset({400, 403, 405, 416, 501})
+
+
 def probe(url: str, opt: DlOptions) -> ProbeResult:
-    """Range: bytes=0-0 ile kaynak ozelliklerini kesfeder."""
+    """Range: bytes=0-0 ile kaynak ozelliklerini kesfeder.
+
+    Range yoklamasi reddedilirse (400/403/405/416/501) bir kez duz GET
+    denenir: yalniz basliklar okunur, govde kapatilir. Bu durumda kaynak
+    Range desteklemiyormus gibi tek akis kabul edilir (Accept-Ranges
+    basligi olsa bile: sunucu fiilen bytes=0-0 istegini geri cevirdi)."""
     headers = {**opt.headers_for(url), "Range": "bytes=0-0"}
-    res = _open_any(url, opt, headers, opt.timeout)
+    fallback = False
+    try:
+        res = _open_any(url, opt, headers, opt.timeout)
+    except urllib.error.HTTPError as e:
+        try:
+            e.close()
+        except Exception:
+            pass
+        if e.code not in _PROBE_RANGE_REJECT:
+            raise
+        # duz GET: Range basligi yok, yalniz basliklar ilgilendirir
+        res = _open_any(url, opt, opt.headers_for(url), opt.timeout)
+        fallback = True
     try:
         out = _probe_from(res)
+        if fallback:
+            out.accept_ranges = False
         # Alt-Svc ogrenimi: yalniz yanitin SON adresi icin (yonlendirme
         # hedefi baska bir kaynagin h3 ayarini belirleyemez) ve isin
         # guvenilirlik sinifiyla ayni anahtara yazilir.

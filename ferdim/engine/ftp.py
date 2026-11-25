@@ -12,11 +12,11 @@ import re
 import socket
 import ssl
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib.parse import unquote, urlsplit
 
 from .. import util
-from . import socks
+from . import httpcli, socks
 
 BLOCK = 1 << 16          # 64 KB veri blogu
 POLL = 2.0               # veri okuma yoklamasi: durdurma en gec bu kadar bekler
@@ -132,6 +132,8 @@ def _perm_error(ex: ftplib.error_perm) -> FtpError:
 def _wrap(ex: BaseException, connecting: bool = False) -> FtpError:
     if isinstance(ex, FtpError):
         return ex
+    if isinstance(ex, httpcli.TlsConfigError):
+        return FtpError(str(ex), "tls_config")
     if isinstance(ex, socks.SocksError):
         return FtpError(str(ex), ex.code, transient=ex.code == "network")
     if isinstance(ex, socket.gaierror):
@@ -256,15 +258,21 @@ class _SocksFTPTLS(_SocksFTP, ftplib.FTP_TLS):
         self._socks_proxy = proxy
 
 
+def _ssl_context(tls, insecure: bool) -> ssl.SSLContext:
+    """TLS baglami: HTTP/h3 ile ayni kaynaktan (httpcli) gelir."""
+    settings = httpcli.tls_settings(tls) if tls is not None \
+        else httpcli.TlsConfig()
+    if insecure and not settings.insecure:
+        settings = replace(settings, insecure=True)
+    return httpcli.ssl_context(settings)
+
+
 def _connect(t: _Target, *, timeout: float, insecure: bool,
-             stall: float, proxy: str = "") -> ftplib.FTP:
+             stall: float, proxy: str = "", tls=None) -> ftplib.FTP:
     # FTP yalniz SOCKS5 tunelini kullanir; HTTP gecidi FTP'ye uygulanmaz.
     use_socks = bool(proxy) and socks.is_socks(proxy)
     if t.secure:
-        ctx = ssl.create_default_context()
-        if insecure:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+        ctx = _ssl_context(tls, insecure)
         if use_socks:
             ftp: ftplib.FTP = _SocksFTPTLS(proxy, context=ctx, timeout=timeout)
         else:
@@ -305,14 +313,14 @@ def _close(ftp: ftplib.FTP, graceful: bool) -> None:
 
 def probe_meta(url: str, *, timeout: int = 30, insecure: bool = False,
                stall: float | None = None, user: str = "", password: str = "",
-               proxy: str = "") -> tuple[int, str]:
+               proxy: str = "", tls=None) -> tuple[int, str]:
     """(boyut, MDTM) dondurur. SIZE yoksa boyut -1, MDTM yoksa zaman bos.
     Yol yoksa FtpError."""
     t = parse_url(url, user, password)
     stall = float(stall or max(int(timeout), 5))
     try:
         ftp = _connect(t, timeout=timeout, insecure=insecure, stall=stall,
-                       proxy=proxy)
+                       proxy=proxy, tls=tls)
     except BaseException as ex:
         raise _wrap(ex) from None
     try:
@@ -339,16 +347,16 @@ def probe_meta(url: str, *, timeout: int = 30, insecure: bool = False,
 
 def probe_size(url: str, *, timeout: int = 30, insecure: bool = False,
                stall: float | None = None, user: str = "", password: str = "",
-               proxy: str = "") -> int:
+               proxy: str = "", tls=None) -> int:
     """Dosya boyutu; sunucu SIZE desteklemiyorsa -1. Yol yoksa FtpError."""
     return probe_meta(url, timeout=timeout, insecure=insecure, stall=stall,
-                      user=user, password=password, proxy=proxy)[0]
+                      user=user, password=password, proxy=proxy, tls=tls)[0]
 
 
 def download(url: str, fd: int, offset: int, *, stop, bucket, progress,
              stalled, insecure: bool = False, timeout: int = 30,
              halted=None, user: str = "", password: str = "",
-             proxy: str = "") -> int:
+             proxy: str = "", tls=None) -> int:
     """offset'ten EOF'a indirir, yazilan bayt sayisini dondurur.
 
     stop   : threading.Event; bekleme ve okuma aralarinda gorulur.
@@ -367,7 +375,7 @@ def download(url: str, fd: int, offset: int, *, stop, bucket, progress,
         return 0
     try:
         ftp = _connect(t, timeout=timeout, insecure=insecure, stall=stall,
-                       proxy=proxy)
+                       proxy=proxy, tls=tls)
     except BaseException as ex:
         raise _wrap(ex) from None
     written = 0
