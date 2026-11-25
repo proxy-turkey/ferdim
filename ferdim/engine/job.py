@@ -521,7 +521,13 @@ class DownloadJob:
             cfg.get("speed_limit", 0))
         self._gbucket = gbucket
         self._job_bucket = TokenBucket(spec.limit or 0)
-        self._bucket = CombinedBucket(gbucket, self._job_bucket)
+        # Kuyruk disi (dogrudan kurulan) iste kuyruk siniri yoksa yalniz is
+        # basina kova gercek bir sinirdir; bos global kovayi bilesige
+        # koymayiz (set_rate o zaman tek gercek siniri yonetir).
+        parts = [gbucket, self._job_bucket]
+        if bucket is None and gbucket.rate <= 0 and self._job_bucket.rate > 0:
+            parts = [self._job_bucket]
+        self._bucket = CombinedBucket(*parts)
         # is geneli Retry-After kapisi: tum isciler ayni ana kadar yeni
         # baglanti acmaz (monotonic; uyku degil kapi)
         self._not_before = 0.0
@@ -619,6 +625,16 @@ class DownloadJob:
         return self.target_dir / f".ferdim-{self.id}.part"
 
     @property
+    def audio_part_path(self) -> Path:
+        """DASH ses temsilinin gecici dosyasi (video `.part`inden ayri)."""
+        return self.target_dir / f".ferdim-{self.id}.audio.part"
+
+    @property
+    def audio_meta_path(self) -> Path:
+        """DASH ses segment noktasi (segment klasoru: `<ad>.segs`)."""
+        return self.meta_path.with_name(self.meta_path.name + ".audio")
+
+    @property
     def target_dir(self) -> Path:
         """Hedef klasor. Acikca verilmisse o; degilse isin ilk
         kullanimindaki varsayilan indirme klasoru SABITLENIR: varsayilan
@@ -658,6 +674,11 @@ class DownloadJob:
     def snapshot(self) -> dict:
         with self._lock:
             window = self._window_wait()
+            retry_until = float(self.extra.get("retry_after_until") or 0)
+            if retry_until and retry_until <= time.time():
+                # kapi gecti: bayat rozet kalmasin (ui neden bekledigini sorsun)
+                self.extra.pop("retry_after_until", None)
+                retry_until = 0.0
             warnings = []
             if self.extra.get("sources_dead"):
                 warnings.append("mirror_dead")
@@ -700,6 +721,8 @@ class DownloadJob:
                 "sources_dead": sum(1 for s in self._srcs if s.dead),
                 "window": window,
                 "sched_wait": bool(window),
+                # Retry-After kapisi acikken duvar saati (epoch); 0 = yok
+                "retry_after_until": retry_until,
                 "verifying": bool(self.extra.get("verifying")),   # dogrulaniyor
                 "verify_done": int(self.extra.get("verify_done") or 0),
                 "verify_total": int(self.extra.get("verify_total") or 0),
@@ -828,16 +851,23 @@ class DownloadJob:
                 pass
 
     def _cleanup_temp(self) -> None:
-        """Isin gecici dosyalari: yarim `.part` ve HLS/DASH `.segs/` klasoru.
+        """Isin gecici dosyalari: yarim `.part`, DASH ses dosyasi/noktasi ve
+        HLS/DASH `.segs/` klasorleri.
 
         Iptal/kaldirmada kosulsuz silinir (is artik devam etmez). HATA
         durumunda cagrilmaz: ERROR isi `resume`/`restart` ile yarim dosyadan
         surdurulebilir (bkz. `_prepare` devam yolu, FTP REST noktasi)."""
+        for p in (self.part_path, self.audio_part_path):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        segments.cleanup(self.meta_path)
+        segments.cleanup(self.audio_meta_path)
         try:
-            self.part_path.unlink(missing_ok=True)
+            self.audio_meta_path.unlink(missing_ok=True)
         except OSError:
             pass
-        segments.cleanup(self.meta_path)
 
     def _prepare(self):
         opt = self.spec.options(self.cfg)
@@ -1368,11 +1398,18 @@ class DownloadJob:
 
         Tek iscinin uyumasi yerine TUM isciler kapida bekler: sunucu 429/503
         ile uzun bir sure istediyse 32 isci sirayla tekrar tekrar denemez.
-        Kapi monotonic'tir; uyku degil, durdurma sinyaliyle uyanir."""
-        until = time.monotonic() + max(0.0, float(wait))
+        Kapi monotonic'tir; uyku degil, durdurma sinyaliyle uyanir.
+
+        `extra["retry_after_until"]` (duvar saati epoch) kapi acikken
+        gorunur: elle devam ettirilen is neden bekledigini arayuze
+        soyleyebilsin."""
+        wait = max(0.0, float(wait))
+        until = time.monotonic() + wait
         with self._lock:
             if until > self._not_before:
                 self._not_before = until
+                if wait > 0:
+                    self.extra["retry_after_until"] = time.time() + wait
         with self._cond:
             self._cond.notify_all()
 
@@ -1382,6 +1419,10 @@ class DownloadJob:
         while True:
             with self._lock:
                 left = self._not_before - time.monotonic()
+                if left > 0:
+                    self.extra["retry_after_until"] = time.time() + left
+                else:
+                    self.extra.pop("retry_after_until", None)
             if left <= 0:
                 return True
             if self._stop.wait(min(left, 1.0)):
@@ -1901,6 +1942,15 @@ class DownloadJob:
                 if src.primary:
                     raise httpcli.RangeInvalid("Content-Range uyusmuyor")
                 raise SourceInvalid("farkli dosya (boyut/aralik)", "size_mismatch")
+            if end < start or end < cursor:
+                # Bozuk aralik (bitis baslangictan once): kisa 206 sanilip
+                # ayni aralik sonsuza dek yeniden kuyruga girmemeli.
+                resp.close()
+                if src.primary:
+                    raise httpcli.RangeInvalid(
+                        "Content-Range gecersiz (end < start)")
+                raise SourceInvalid("gecersiz aralik (Content-Range)",
+                                    "incompatible")
             served = min(e, end)
         return resp, served
 
@@ -2498,8 +2548,8 @@ class DownloadJob:
             hata durumunda gecici ses dosyasi ve `.segs` klasoru silinir,
             devam eden kosu sesi bastan indirir. Yarim ses dosyasi
             yayinlanmaz; isin iptal temizligi video akisina dokunmaz."""
-            meta_path = self.meta_path.with_name(self.meta_path.name + ".audio")
-            part = self.target_dir / f".ferdim-{self.id}.audio.part"
+            meta_path = self.audio_meta_path
+            part = self.audio_part_path
             try:
                 segments.cleanup(meta_path)
                 meta_path.unlink(missing_ok=True)
@@ -2739,6 +2789,10 @@ class DownloadJob:
             else:
                 self._pending = [(0, 1 << 62)]
                 self.done = 0
+                if self._fd is not None:
+                    # boyut bilinmiyor: eski kuyruk yeni icerigin ardinda
+                    # kalmasin (temiz baslangic gibi)
+                    os.ftruncate(self._fd, 0)
             self._gov["done"] = self.done
             self._speed_done_mark = self.done
         self._reset_verify_extra()
