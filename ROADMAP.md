@@ -338,26 +338,26 @@ silently lose the queue.
 Target: 10 000 queued jobs, 8–16 running, 1 Gbit/s, with the web UI
 responsive and the daemon under 5 % of a core when idle.
 
-- [ ] Persist the queue incrementally (dirty flag + debounce or SQLite
+- [x] Persist the queue incrementally (dirty flag + debounce or SQLite
       like history), never rewriting all jobs under the queue lock per
       add or state change (a 500-file import is O(n²) today).
-- [ ] Control verbs return immediately: resume, cancel and "all" run in
+- [x] Control verbs return immediately: resume, cancel and "all" run in
       the background instead of blocking a request thread on probes and
       joins.
-- [ ] `stats()` without the queue lock held over every snapshot; deltas
+- [x] `stats()` without the queue lock held over every snapshot; deltas
       by revision (`since`) and paging (`limit` / `offset`) in the API.
-- [ ] Push updates to the web UI over Server-Sent Events from the
+- [x] Push updates to the web UI over Server-Sent Events from the
       existing watcher channel; stop polling when the tab is hidden;
       incremental / virtualised job list; paged history with "load more".
-- [ ] Non-blocking socket watchers with bounded per-client queues, so a
+- [x] Non-blocking socket watchers with bounded per-client queues, so a
       slow client can't stall job threads (`sock.py:93`).
-- [ ] Engine hot paths: `pwrite` outside the job lock, a heap for
+- [x] Engine hot paths: `pwrite` outside the job lock, a heap for
       pending ranges with a running byte total, notify-driven worker
       wakeups and token bucket (no 0.3 s / 0.2 s polling).
-- [ ] Keep-alive connection reuse per source (TLS session resumption),
+- [x] Keep-alive connection reuse per source (TLS session resumption),
       so short ranges stop paying a full handshake each.
-- [ ] Bounded size prober (2–3 in parallel) that forgets removed jobs.
-- [ ] Benchmarks in CI with stored baselines: engine throughput against
+- [x] Bounded size prober (2–3 in parallel) that forgets removed jobs.
+- [x] Benchmarks in CI with stored baselines: engine throughput against
       a local server, chunker MB/s, queue load / save with 10 000 jobs,
       `stats()` latency, idle CPU and RSS; a regression of more than 20 %
       fails the build.

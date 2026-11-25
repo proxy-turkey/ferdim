@@ -8,7 +8,7 @@ degrades with a clear error code without it — `aioquic` for HTTP/3,
 `cryptography` for encrypted HLS). The web UI is
 dependency-free vanilla JS. The extension is Manifest V3.
 
-State at authorship: **1.9.1 released**; test suite green (1046 tests),
+State at authorship: **1.10.0 released**; test suite green (1210 tests), `python3 -m benchmarks` within baseline and floors,
 `web-ext lint` 0 errors / 0 warnings, UI smoke checks green
 (`bash tests/ui/run.sh all`), `rpmlint` 0/0, `fedora-review` no failed
 checks, mock builds cleanly on Fedora 43.
@@ -207,6 +207,18 @@ Read `job.py` before touching the engine. The invariants that matter:
   explicit Merkle manifest, verifies every chunk, honours `_stop`, drops
   its result when the run token changed, and stays within 3.5 s so pause
   stays synchronous.
+- **Queue persistence is debounced** (`QUEUE_SAVE_DEBOUNCE`): mutations
+  set a dirty flag for one saver thread; `flush()` is synchronous and
+  `shutdown()` flushes after the control worker. `api` "add" flushes
+  before replying (browser handoff); bulk paths use `qm.bulk_save()`.
+- **Stats are revisioned**: `stats(since, limit, offset)` returns `rev`,
+  `full`, `removed`, `total_jobs`; job views are cached by value key.
+  Anything that changes a visible field must `_notify()` — the push hub
+  (`server/hub.py`) computes stats only on notify or while jobs run.
+- `_pending` is a `PendingRanges` heap (largest first, running total);
+  `pwrite` runs under `_write_lock` outside `_lock`, accounting after.
+- Pooled HTTP connections (`httpcli._ConnPool`) are reused only after a
+  fully read body; redirects are limited to `http`/`https`.
 - Archive extraction writes `member.part` then `os.replace` and records the
   member in `.ferdim-extract.json`; link and device members are never
   created; files FerDim did not write are not overwritten without `force`.

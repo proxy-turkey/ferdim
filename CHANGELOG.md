@@ -4,6 +4,51 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [1.10.0] — 2026-11-26
+
+Performance and scale: 10 000 queued jobs, a responsive UI and a quiet
+daemon.
+
+### Changed
+- The queue is saved in batches instead of being rewritten on every
+  change; importing 500 links writes the file once. A job added from the
+  browser, CLI or web UI is still on disk before FerDim answers.
+- Pause, resume, cancel and remove from the web UI answer at once and
+  finish in the background, in order.
+- The web UI gets live updates pushed from the daemon (Server-Sent
+  Events) carrying only what changed, stops updating while the tab is
+  hidden, draws only the visible rows of a long list and loads history
+  page by page ("Load more").
+- The GTK app, the D-Bus bridge and the GNOME Shell extension ask only
+  for what changed and show at most 500 (GTK) or 50 (panel) jobs.
+- Connections to the same server are kept alive and reused, with TLS
+  session resumption, so many short ranges no longer pay a handshake
+  each.
+- The size prober checks up to three jobs at a time and skips jobs that
+  cannot start yet (closed category window).
+
+### Fixed
+- An idle daemon with 10 000 jobs used most of a CPU core; it now uses
+  under 1 %.
+- Workers and the speed limiter wake up on events instead of checking
+  several times a second; each job writes one resume checkpoint per
+  interval instead of one per connection.
+- A redirect can only lead to another `http`/`https` address; a server
+  could previously redirect a download to a local file.
+- The web UI shows why a job is paused after a restart, and when a job
+  waiting out a server's `Retry-After` continues.
+- Running out of file handles during an FTP download pauses the job
+  (`fd_exhausted`) instead of retrying.
+- Credentials in mirror URLs of private-window downloads are no longer
+  saved to disk.
+
+### Added
+- `python3 -m benchmarks`: engine throughput, chunker speed, queue load
+  and save, stats latency, idle CPU and memory with 10 000 jobs; CI fails
+  on a regression of more than 20 % or when a product floor is missed.
+- `GET /api/stats` accepts `since`, `limit` and `offset`; `GET
+  /api/events` streams changes.
+
 ## [1.9.1] — 2026-11-25
 
 ### Fixed
