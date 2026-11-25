@@ -25,6 +25,8 @@ QUEUE_ITEM_VERSION = 1             # kayit sema surumu (dosya duz liste kalir)
 QUEUE_SAVE_DEBOUNCE = 0.5
 QUEUE_TOMB_MAX = 1024              # stats: hatirlanan son silme sayisi
 PROBE_WORKERS = 3                  # es zamanli boyut yoklamasi (sinirli)
+# smart_queue: boyutu bilinmeyen yeni isi en fazla bu kadar bekle (s)
+SMART_GRACE = 3.0
 STATS_LIMIT_MAX = 10000            # sayfalama ust siniri
 TICK_BUSY = 0.5                    # tick araligi: is var (calisan/kuyrukta)
 TICK_IDLE = 2.0                    # tick araligi: is yok (olay hemen uyandirir)
@@ -578,6 +580,15 @@ class QueueManager:
                 # kucuk dosya once: boyutu bilinmeyenleri yoklayici
                 # isaretleyene kadar beklet, sonra kucukten buyuge basla
                 ready = [j for j in queued if j.id in self._size_probed]
+                # yoklamalar paralel: once biten (buyuk) is, kisa sure once
+                # eklenmis ve boyutu henuz bilinmeyen kucuk isin onune
+                # gecmesin. Bekleme SMART_GRACE ile sinirli (yavas yoklama
+                # kuyrugu kilitlemez).
+                now = time.time()
+                if ready and any(j.id not in self._size_probed
+                                 and now - j.created < SMART_GRACE
+                                 for j in queued):
+                    ready = []
                 if ready:
                     ready.sort(key=lambda j: (j.total if j.total > 0
                                               else float("inf"), j.created))
