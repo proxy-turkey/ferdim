@@ -1,0 +1,18 @@
+{
+  "calibration": 33.66549393023338,
+  "generated": "2026-11-25T16:48:45Z",
+  "metrics": {
+    "cdc_mib_s": 78.59695987295451,
+    "engine_mib_s": 99.12288294337243,
+    "idle_cpu_pct": 0.0,
+    "idle_loaded_cpu_pct": 60.69808321523531,
+    "idle_loaded_rss_mib": 255.6328125,
+    "idle_rss_mib": 37.453125,
+    "queue_load_jobs_s": 9025.332641923298,
+    "queue_save_jobs_s": 64856.537661682814,
+    "stats_calls_s": 2.296727326871361
+  },
+  "platform": "linux",
+  "python": "3.14.10",
+  "version": 1
+}
