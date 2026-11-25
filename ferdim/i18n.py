@@ -610,6 +610,32 @@ S = {
         "tr": "sunucu dosya yerine bir HTML sayfası gönderdi (yumuşak 404); dosya korundu",
         "es": "el servidor envió una página HTML en lugar del archivo (404 suave); el archivo se conservó",
         "ru": "сервер отправил HTML-страницу вместо файла (мягкая 404); файл сохранён"},
+    # ---- 1.12 streams
+    "err_manifest_too_large": {
+        "en": "the playlist/manifest is larger than the allowed limit",
+        "tr": "oynatma listesi/manifest izin verilen boyuttan büyük",
+        "es": "la lista de reproducción/manifiesto supera el límite permitido",
+        "ru": "плейлист/манифест превышает допустимый размер"},
+    "err_hls_crypto_missing": {
+        "en": "encrypted HLS needs the optional cryptography package",
+        "tr": "şifreli HLS için isteğe bağlı cryptography paketi gerekli",
+        "es": "el HLS cifrado necesita el paquete opcional cryptography",
+        "ru": "для зашифрованного HLS нужен дополнительный пакет cryptography"},
+    "err_hls_drm": {
+        "en": "DRM-protected streams are not supported",
+        "tr": "DRM korumalı akışlar desteklenmiyor",
+        "es": "las transmisiones con DRM no son compatibles",
+        "ru": "потоки с DRM не поддерживаются"},
+    "err_hls_key_invalid": {
+        "en": "the HLS encryption key or IV is invalid",
+        "tr": "HLS şifreleme anahtarı ya da IV geçersiz",
+        "es": "la clave o el IV de cifrado HLS no son válidos",
+        "ru": "ключ или IV шифрования HLS недействителен"},
+    "err_hls_decrypt": {
+        "en": "an encrypted HLS segment could not be decrypted",
+        "tr": "şifreli bir HLS segmenti çözülemedi",
+        "es": "no se pudo descifrar un segmento HLS cifrado",
+        "ru": "не удалось расшифровать зашифрованный сегмент HLS"},
 }
 
 

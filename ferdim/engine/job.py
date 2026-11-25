@@ -2260,7 +2260,7 @@ class DownloadJob:
                 self.total = self.done = int(meta.get("tail", 0))
                 util.atomic_write_json(self.meta_path, meta)
         except Exception as ex:
-            self._fail(str(ex), _code_for(ex))
+            self._fail(str(ex), getattr(ex, "code", "") or _code_for(ex))
 
     def _seg_cap(self) -> int:
         """Segment havuzu tavani: sabit 8 ile isin baglanti tavani
@@ -2274,6 +2274,49 @@ class DownloadJob:
         meta = util.read_json(self.meta_path) or {}
         meta.setdefault("url", self.url)
         meta["kind"] = "dash"
+
+        def run_audio(audio):
+            """Ses temsilini KARDES dosyaya indirir (mux yok, ffmpeg yok).
+
+            Ses kosusu video resume'undan bagimsizdir: duraklat/iptal ya da
+            hata durumunda gecici ses dosyasi ve `.segs` klasoru silinir,
+            devam eden kosu sesi bastan indirir. Yarim ses dosyasi
+            yayinlanmaz; isin iptal temizligi video akisina dokunmaz."""
+            meta_path = self.meta_path.with_name(self.meta_path.name + ".audio")
+            part = self.target_dir / f".ferdim-{self.id}.audio.part"
+            try:
+                segments.cleanup(meta_path)
+                meta_path.unlink(missing_ok=True)
+                part.unlink(missing_ok=True)
+                fd = os.open(part, os.O_RDWR | os.O_CREAT, 0o644)
+                try:
+                    hls.segments.assemble(
+                        opt, fd, {}, self._stop, self._bucket, None,
+                        meta_path, audio["init_url"], audio["segments"],
+                        store=None, cap=self._seg_cap(), rtt=0.0)
+                finally:
+                    os.close(fd)
+                if self._stop.is_set():
+                    return
+                stem = Path(self.final_filename or "download").stem
+                dest = util.unique_path(
+                    self.target_dir,
+                    f"{stem}.audio{audio.get('ext') or '.m4a'}")
+                os.replace(part, dest)
+                fsync_dir(self.target_dir)
+                self.extra["audio"] = str(dest)
+            except Exception:
+                segments.cleanup(meta_path)
+                part.unlink(missing_ok=True)
+                raise
+            finally:
+                meta_path.unlink(missing_ok=True)
+                if self._stop.is_set():
+                    # duraklat/iptal: yarim ses yayinlanmaz, sonraki kosu
+                    # sesi bastan indirir
+                    segments.cleanup(meta_path)
+                    part.unlink(missing_ok=True)
+
         try:
             def prog(n):
                 with self._lock:
@@ -2282,18 +2325,22 @@ class DownloadJob:
             t0 = time.monotonic()
             text = dash.fetch_mpd(self.url, opt)
             rtt = time.monotonic() - t0    # MPD yanit suresi (RTT bandi)
-            init_url, seg_urls = dash.build_segment_list(text, self.url)
-            self.extra["segments_listed"] = len(seg_urls)
+            plan = dash.build_plan(text, self.url)
+            video = plan["video"]
+            self.extra["segments_listed"] = len(video["segments"])
             hls.segments.assemble(opt, self._fd, meta, self._stop,
                                   self._bucket, prog, self.meta_path,
-                                  init_url, seg_urls,
+                                  video["init_url"], video["segments"],
                                   store=self._profile_store(),
                                   cap=self._seg_cap(), rtt=rtt)
+            audio = plan.get("audio")
+            if audio and audio["segments"] and not self._stop.is_set():
+                run_audio(audio)
             if not self._stop.is_set():
                 self.total = self.done = int(meta.get("tail", 0))
                 util.atomic_write_json(self.meta_path, meta)
         except Exception as ex:
-            self._fail(str(ex), _code_for(ex))
+            self._fail(str(ex), getattr(ex, "code", "") or _code_for(ex))
 
     def _run_ftp(self):
         """Tek akis indirme, geri cekilmeli yeniden deneme ile. Durdurma

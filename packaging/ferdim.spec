@@ -30,6 +30,8 @@ Requires:       mozilla-filesystem
 Requires:       dbus-common
 %endif
 Recommends:     python3-gobject
+# optional: encrypted HLS (AES-128); imported lazily, see ferdim/engine/segments.py
+Recommends:     python3-cryptography
 # optional: HTTP/3 (QUIC) transport, see ferdim/engine/h3.py
 Suggests:       python3-aioquic
 Recommends:     firefox
