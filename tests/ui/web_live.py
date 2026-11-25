@@ -132,6 +132,8 @@ with sync_playwright() as p:
 
     page.on("pageerror", lambda e: errors.append("pageerror: " + str(e)))
     page.on("console", on_console)
+    reqs = []
+    page.on("request", lambda r: reqs.append(r.url))
     url = web_session()
     page.goto(url)
     # bilet adres cubugundan silinmis olmali (#s=... kalici olmamali)
@@ -196,7 +198,44 @@ with sync_playwright() as p:
         "#jobList .row:has-text('yok-iso.iso')"))
     page.screenshot(path=f"{OUT}/01-liste.png")
 
+    # ------------------------------------------- akis (SSE) tek canli yol
+    check("akis /api/events acildi",
+          any("/api/events" in u for u in reqs), reqs[:5])
+    before = sum(1 for u in reqs if "/api/stats" in u)
+    page.wait_for_timeout(2200)          # akis acikken yoklama olmamali
+    after = sum(1 for u in reqs if "/api/stats" in u)
+    check(" akis acikken /api/stats yoklamasi yok", before == after,
+          (before, after))
+    # yeni is yoklamasiz gorunur, silinen satir akisla duser
+    r = api("/api/add", {"url": f"{SRV}/rapor.pdf", "filename": "akis.pdf",
+                         "paused": True})
+    jid = r.get("id", "")
+    page.wait_for_selector("#jobList .row:has-text('akis.pdf')", timeout=8000)
+    check(" SSE: yeni is akisla geldi", True)
+    api("/api/remove", {"id": jid, "delete_files": True})
+    page.wait_for_selector("#jobList .row:has-text('akis.pdf')",
+                           state="detached", timeout=8000)
+    check(" SSE: silinen is listeden dustu", True)
+    check("gecmis: sayfa dolmadikca 'daha fazla' gizli",
+          not page.is_visible("#histMore"))
+
     # ---------------------------------------------------- XSS (textContent)
+    # Veri artik SSE akisindan gelir: hem akis hem yoklama yedegi
+    # zehirlenir, boylece hangi yol calisirsa calissin ayni kural sinanir.
+    poison_job = {
+        "id": "xss-1", "filename": '<img src=x onerror="window.__xss=1">',
+        "url": "javascript:window.__xss=3", "state": "error",
+        "error": '<svg onload="window.__xss=2"></svg>', "error_code": "",
+        "category": "other", "size": 10, "done": 5, "speed": 0, "eta": -1,
+        "segments": 0, "segments_cfg": 1, "segments_effective": 1,
+        "checksum": "", "merkle": "", "verified": [], "sources_dead": 0,
+        "sched_wait": False, "window": "", "verifying": False,
+        "verify_done": 0, "verify_total": 0, "warning": "",
+        "best_speed": 0, "dir": "", "fullpath": "", "created": 0,
+        "kind": "http", "mirrors": 0, "mirror_health": [],
+        "adaptive": None, "retry_after_until": 0,
+    }
+
     def poison(route):
         resp = route.fetch()
         data = resp.json()
@@ -209,15 +248,93 @@ with sync_playwright() as p:
             route.fulfill(response=resp, body=json.dumps(data))
         except Exception:   # unroute ile yarisan istek: zaten islendi
             pass
+
+    def poison_events(route):
+        frame = {"ok": True, "jobs": [poison_job], "total_speed": 0,
+                 "active": 0, "rev": 1, "full": True, "removed": [],
+                 "total_jobs": 1, "turbo": False, "download_dir": ""}
+        try:
+            route.fulfill(status=200,
+                          headers={"Content-Type": "text/event-stream",
+                                   "Cache-Control": "no-store"},
+                          body="event: stats\ndata: "
+                               + json.dumps(frame) + "\n\n")
+        except Exception:   # unroute ile yarisan istek: zaten islendi
+            pass
+
+    page.route("**/api/events", poison_events)
     page.route("**/api/stats", poison)
+    page.reload()                       # akis yeniden kurulsun (route etkili)
+    page.wait_for_selector("#jobList .row", timeout=15000)
     page.wait_for_timeout(1300)
     check(" XSS: script calismadi", page.evaluate("window.__xss") is None)
     check(" XSS: eleman uretilmedi", q("#jobList img, #jobList svg") == 0)
     check(" XSS: metin literal gorunur",
           '<img src=x onerror="window.__xss=1">' in page.inner_text("#jobList"))
+    page.unroute("**/api/events", poison_events)
     page.unroute("**/api/stats", poison)
-    page.wait_for_timeout(900)
+    page.reload()                       # gercek akis geri gelir
+    page.wait_for_selector("#jobList .row:has-text('arsiv.zip')", timeout=15000)
     check(" XHR: istatistik duzeldi", "arsiv.zip" in page.inner_text("#jobList"))
+
+    # ------------------------------- 10 000 is: yalniz gorunen pencere cizilir
+    many = []
+    for i in range(10000):
+        many.append({
+            "id": f"j{i}", "filename": f"dosya-{i}.bin",
+            "url": f"http://example.invalid/{i}", "state": "queued",
+            "category": "other", "size": 1000, "done": 0, "speed": 0,
+            "eta": -1, "segments": 0, "segments_cfg": 1,
+            "segments_effective": 1, "checksum": "", "merkle": "",
+            "verified": [], "sources_dead": 0, "sched_wait": False,
+            "window": "", "verifying": False, "verify_done": 0,
+            "verify_total": 0, "warning": "", "best_speed": 0, "dir": "",
+            "fullpath": "", "created": 0, "kind": "http", "mirrors": 0,
+            "mirror_health": [], "adaptive": None, "retry_after_until": 0,
+            "error": "", "error_code": ""})
+
+    def many_events(route):
+        frame = {"ok": True, "jobs": many, "total_speed": 0, "active": 0,
+                 "rev": 7, "full": True, "removed": [],
+                 "total_jobs": len(many), "turbo": False, "download_dir": ""}
+        try:
+            route.fulfill(status=200,
+                          headers={"Content-Type": "text/event-stream",
+                                   "Cache-Control": "no-store"},
+                          body="event: stats\ndata: "
+                               + json.dumps(frame) + "\n\n")
+        except Exception:
+            pass
+
+    def many_stats(route):
+        # akis koptugunda yoklama devreye girer: o da ayni listeyi versin
+        frame = {"ok": True, "jobs": many, "total_speed": 0, "active": 0,
+                 "rev": 7, "full": True, "removed": [],
+                 "total_jobs": len(many), "turbo": False, "download_dir": ""}
+        try:
+            route.fulfill(body=json.dumps(frame),
+                          headers={"Content-Type": "application/json"})
+        except Exception:
+            pass
+
+    page.route("**/api/events", many_events)
+    page.route("**/api/stats", many_stats)
+    page.reload()
+    page.wait_for_selector("#jobList .row", timeout=30000)
+    page.wait_for_timeout(900)
+    check("10k is: DOM satiri sinirli (pencere)", q("#jobList [role=row]") < 200,
+          q("#jobList [role=row]"))
+    page.evaluate("() => { document.querySelector('main').scrollTop = 1e9; }")
+    page.wait_for_timeout(900)
+    check("10k is: kaydirinca son satirlar cizilir",
+          q("#jobList .row") > 0
+          and "dosya-9999.bin" in page.inner_text("#jobList"))
+    check("10k is: dolgu kaydirma boyunu korur", page.evaluate(
+        "() => document.querySelector('#rowPadTop').offsetHeight > 0"))
+    page.unroute("**/api/events", many_events)
+    page.unroute("**/api/stats", many_stats)
+    page.reload()
+    page.wait_for_selector("#jobList .row:has-text('arsiv.zip')", timeout=15000)
 
     # ----------------------------------------------------- odak korunur
     btn = page.locator("#jobList .row", has_text="arsiv.zip").locator('[data-act="restart"]')
@@ -505,6 +622,74 @@ with sync_playwright() as p:
           and "Eşleşen kayıt yok" in page.inner_text("#histEmpty"))
     page.fill("#histSearch", "")
     page.wait_for_timeout(700)
+
+    # ------------------------------- fark kareleri (lane A sozlesmesi)
+    # Sunucu rev/full/removed dondurdugunde arayuz yalniz degisenleri uygular:
+    # silinen satir duser, degisen satir YERINDE guncellenir, digeri kalir.
+    def fake_job(jid, name):
+        return {
+            "id": jid, "filename": name, "url": f"http://example.invalid/{jid}",
+            "state": "queued", "category": "other", "size": 100, "done": 0,
+            "speed": 0, "eta": -1, "segments": 0, "segments_cfg": 1,
+            "segments_effective": 1, "checksum": "", "merkle": "",
+            "verified": [], "sources_dead": 0, "sched_wait": False,
+            "window": "", "verifying": False, "verify_done": 0,
+            "verify_total": 0, "warning": "", "best_speed": 0, "dir": "",
+            "fullpath": "", "created": 0, "kind": "http", "mirrors": 0,
+            "mirror_health": [], "adaptive": None, "retry_after_until": 0,
+            "error": "", "error_code": "",
+        }
+
+    three = [fake_job("d1", "delta-eski.bin"), fake_job("d2", "delta-silinir.bin"),
+             fake_job("d3", "delta-kalir.bin")]
+    # d2 guncellenir (ad degisir), d1 silinir, d3 dokunulmaz
+    two = [fake_job("d2", "delta-yeni.bin"), three[2]]
+    stats_calls = {"n": 0}
+
+    def delta_stats(route):
+        stats_calls["n"] += 1
+        is_full = stats_calls["n"] <= 1
+        body = {"ok": True, "jobs": three if is_full else two,
+                "rev": 10 if is_full else 11, "full": is_full,
+                "removed": [], "total_jobs": len(three if is_full else two),
+                "turbo": False, "download_dir": ""}
+        try:
+            route.fulfill(body=json.dumps(body),
+                          headers={"Content-Type": "application/json"})
+        except Exception:
+            pass
+
+    def delta_events(route):
+        full = {"ok": True, "jobs": three, "rev": 10, "full": True,
+                "removed": [], "total_jobs": 3, "turbo": False,
+                "download_dir": ""}
+        delta = {"ok": True, "jobs": [two[0]], "rev": 11, "full": False,
+                 "removed": ["d1"], "total_jobs": 2, "turbo": False,
+                 "download_dir": ""}
+        try:
+            route.fulfill(status=200,
+                          headers={"Content-Type": "text/event-stream",
+                                   "Cache-Control": "no-store"},
+                          body="".join("event: stats\ndata: " + json.dumps(f)
+                                       + "\n\n" for f in (full, delta)))
+        except Exception:
+            pass
+
+    page.route("**/api/events", delta_events)
+    page.route("**/api/stats", delta_stats)
+    page.reload()
+    page.wait_for_selector("#jobList .row", timeout=15000)
+    page.wait_for_timeout(900)
+    dtext = page.inner_text("#jobList")
+    check("fark karesi: silinen satir duser", "delta-eski.bin" not in dtext, dtext)
+    check("fark karesi: degisen satir guncellenir", "delta-yeni.bin" in dtext, dtext)
+    check("fark karesi: degismeyen satir kalir", "delta-kalir.bin" in dtext, dtext)
+    check("fark karesi: satir sayisi", q("#jobList .row") == 2,
+          q("#jobList .row"))
+    page.unroute("**/api/events", delta_events)
+    page.unroute("**/api/stats", delta_stats)
+    page.reload()
+    page.wait_for_selector("#jobList .row:has-text('arsiv.zip')", timeout=15000)
 
     # -------------------------------------------------- azaltılmış hareket
     ctx2 = browser.new_context(viewport={"width": 1280, "height": 800},
