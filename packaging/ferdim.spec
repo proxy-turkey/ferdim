@@ -1,7 +1,7 @@
 %global srcname ferdim
 
 Name:           %{srcname}
-Version:        1.10.0
+Version:        1.10.1
 Release:        1%{?dist}
 Summary:        Dynamic self-tuning download manager with Firefox integration
 
@@ -157,6 +157,8 @@ python3 -m unittest discover -s tests -v
 # end of user-unit preun scriptlet
 
 %changelog
+* Thu Nov 26 2026 Enes Aksu <eaksu@pm.me> - 1.10.1-1
+- web UI: first update no longer lost on a busy daemon
 * Thu Nov 26 2026 Enes Aksu <eaksu@pm.me> - 1.10.0-1
 - scale to 10 000 jobs: batched queue saves, SSE web UI, keep-alive pool
 - idle daemon under 1 % of a core; benchmarks in CI

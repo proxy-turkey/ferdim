@@ -4,6 +4,17 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [1.10.1] — 2026-11-26
+
+### Fixed
+- A newly opened web UI tab could wait up to 15 seconds for its first
+  update on an idle queue when the daemon was busy at that instant (a
+  lost wake-up in the update pusher). This also failed a test on the
+  openSUSE, Fedora 43 and Arch build machines, so 1.10.0 was not
+  published there.
+- The CI benchmark job compares against a baseline from the same kind of
+  machine; until one exists it enforces the absolute floors only.
+
 ## [1.10.0] — 2026-11-26
 
 Performance and scale: 10 000 queued jobs, a responsive UI and a quiet

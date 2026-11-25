@@ -46,6 +46,11 @@
   </screenshots>
 
   <releases>
+    <release version="1.10.1" date="2026-11-26">
+      <description>
+        <p>Fixes a delayed first update in a newly opened web UI tab.</p>
+      </description>
+    </release>
     <release version="1.10.0" date="2026-11-26">
       <description>
         <p>Performance and scale: handles 10 000 queued jobs with live web UI updates, reused connections and an idle daemon under 1 % of a CPU core.</p>
