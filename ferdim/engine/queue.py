@@ -316,8 +316,10 @@ class QueueManager:
             paused: bool = False) -> DownloadJob:
         """paused=True: is kuyruga 'durdurulmus' girer, tick baslatmaz.
 
-        Tek is hemen kalici olur (flush). bulk_save() icinde cagrilirsa
-        yazim birlesir: 500 islik ice aktarma tek dosya yazimi eder.
+        Kayit birlestirilmis yaziciya birakilir (QUEUE_SAVE_DEBOUNCE);
+        yalniz queue.json henuz yoksa hemen yazilir. Kullanici/eklenti
+        eklemesi (api 'add') yanittan once flush() eder. bulk_save()
+        icinde 500 islik ice aktarma tek dosya yazimi eder.
         """
         job = DownloadJob(self.env, self.cfg, spec, job_id=job_id,
                           on_change=self._job_changed, bucket=self.bucket)
@@ -891,6 +893,9 @@ class QueueManager:
         # TEK kuyruk kovasi: tum islerin iscileri bunu paylasir. Is basina
         # `--limit` ayri kovada kalir (CombinedBucket ikisini birlikte uygular).
         self.bucket.set_rate(int(bytes_per_sec))
+        # bos kuyrukta yayin merkezi yalniz bildirimle hesap yapar: limit
+        # degisimi arayuze hemen gitsin
+        self._notify()
 
     # -------------------------------------------------- saat plani (1.8)
     def plan_status(self) -> dict:

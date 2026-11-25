@@ -777,6 +777,9 @@ def handle(ctx, cmd: str, params: dict) -> dict:
     if cmd == "add":
         r = _add_job(ctx, params)
         if r.get("ok"):
+            # tarayici devri 'kabul' yanitindan sonra kendi kopyasini iptal
+            # eder: is yanittan ONCE diskte olmali (cokme kaybi yok)
+            qm.flush()
             qm._tick()          # eklenen is beklemeden baslasin
         return r
     if cmd == "add-file":

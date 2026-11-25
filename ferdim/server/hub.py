@@ -383,6 +383,7 @@ class Hub:
         full_tag = mark(full) if full is not None else None
         full_sock = None
         full_sse = None
+        delta_sse = {}         # ayni fark karesi istemci basina kodlanmaz
 
         for client in clients:
             try:
@@ -418,7 +419,10 @@ class Hub:
                 if same:
                     continue
                 client.mark = tag
-                client.offer(sse_frame(delta), delta["rev"])
+                key = id(delta)
+                if key not in delta_sse:
+                    delta_sse[key] = sse_frame(delta)
+                client.offer(delta_sse[key], delta["rev"])
             except Exception:
                 continue      # tek istemcinin hatasi digerlerini durdurmaz
         # Calisan is VARSA hiz/ilerleme 1 Hz kalp atisiyla tazelenir; yoksa

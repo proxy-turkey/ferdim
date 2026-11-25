@@ -254,6 +254,9 @@ if Gio is not None:
                         text = line.decode("utf-8", "replace").strip()
                         if not text:
                             continue
+                        if text.startswith('{"ok": false') or \
+                                text.startswith('{"ok":false'):
+                            break      # izleyici siniri vb.: bekle, yeniden dene
                         compact = compact_frame(text)
                         if compact:
                             GLib.idle_add(self._emit, compact)

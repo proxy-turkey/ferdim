@@ -171,7 +171,7 @@ class StatsWindow:
             # pencere tasti ya da sayim tutmuyor (kacan kare): kendini duzelt
             self.rev = 0
             self.full_pending = True
-        elif removed and self.total > len(self.jobs):
+        elif st.get("removed") and self.total > len(self.jobs):
             # pencerede yer bosaldi: siradaki is ancak TAM karede gelir
             # (delta yalniz degisenleri tasir), bir sonraki kare tam olsun
             self.rev = 0
