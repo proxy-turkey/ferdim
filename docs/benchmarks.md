@@ -7,6 +7,13 @@ compares the result with a stored baseline and with absolute product
 floors. A metric that regresses by **more than 20 %** or violates a floor
 makes the run exit non-zero, which is what the CI `bench` job enforces.
 
+There are two stored baselines: `baseline.json` from the development
+machine (local runs) and `baseline-ci.json` from a real GitHub runner
+(the CI job). A baseline whose environment (platform, Python minor
+version, CPU count) differs from the current host only loses the drift
+check for machine-bound metrics; the floors still gate the run. If the CI
+baseline does not exist yet, the CI job enforces floors only.
+
 Everything is Python stdlib only; the only network traffic is loopback
 against a server the benchmark starts itself.
 
@@ -18,7 +25,13 @@ python3 -m benchmarks --quick             # small workloads, no comparison
 python3 -m benchmarks --only queue        # one suite (engine, chunker, queue, idle)
 python3 -m benchmarks --json bench.json   # results + verdicts + sample spread
 python3 -m benchmarks --update-baseline   # rewrite benchmarks/baseline.json
+python3 -m benchmarks --baseline benchmarks/baseline-ci.json
+                                          # compare against the CI baseline
 ```
+
+The header prints the environment the run is judged in
+(`python 3.13.7 linux cpus=2`); the same `cpu_count` is stored in the
+baseline.
 
 A full run takes roughly 85 s on a laptop-class machine (four daemon
 startups and 512 MiB of engine payload dominate); `--quick` takes about
@@ -26,8 +39,10 @@ startups and 512 MiB of engine payload dominate); `--quick` takes about
 gate must be decided with the full run.
 
 `--json` records every metric, the raw samples per metric and a spread
-summary (`min` / `median` / `max` / `rel`), together with the per-metric
-verdicts, so a failing build page shows both the number and its noise.
+summary (`min` / `median` / `max` / `rel`), the environment (`python`,
+`platform`, `cpu_count`), whether the run was floors-only, and the
+per-metric verdicts, so a failing build page shows both the number and its
+noise.
 
 Temporary roots (`/tmp/ferdim-bench-*`), the local HTTP server, the SSE
 client and the benchmark daemon are removed/terminated in `finally`
@@ -100,7 +115,8 @@ Latency is the mirror image: `stats_frame_ms` is compared as
 
 ## Thresholds
 
-Two independent gates are applied to every metric:
+Two gates exist; the environment gate below can disable drift for
+machine-bound metrics, never the floor:
 
 1. **Drift** ±20 % against the machine-normalised baseline (rates: fail
    below 80 % of the target; latencies and absolute metrics: fail above
@@ -121,32 +137,74 @@ separate CPU floor: its steady-state cost is the deliberate per-second
 stats recomputation, already bounded by the `stats_frame_ms` floor, so it
 is drift-gated only.
 
-RSS and CPU are sensitive to the interpreter and OS build, so they are
-compared (drift **and** floors) only when the baseline and the current run
-share the same platform and Python minor version; otherwise they are
-reported as `skip`. Rate, latency and their floors are always checked.
+### Environment gate
+
+Some metrics are bound to the machine rather than to this code's CPU work:
+the loopback engine (a 2-vCPU runner cannot reach a 12-core host's
+aggregate throughput) and every absolute metric (RSS and idle CPU depend
+on the interpreter and OS build). When the baseline's environment fields
+— `platform`, Python minor version and `cpu_count` — differ from the
+current run, drift is reported as `skip` for exactly those metrics
+(`engine_mib_s` and all `absolute` metrics). Their floors are still
+checked, because a product floor is not a comparison against a baseline.
+
+CPU/I/O-calibrated metrics (`cdc_mib_s`, `queue_load_jobs_s`,
+`stats_calls_s`, `queue_bulk_add_jobs_s`, `stats_frame_ms`) keep their
+drift check across environments: the calibration scores already model the
+host. A baseline from an older revision without `cpu_count` compares only
+the fields it has; the field is written by every new baseline.
+
 Metrics missing from the baseline are reported as `new` and are still
 subject to their floors — a stale baseline cannot hide a floor violation.
 
-## Regenerating the baseline
+## CI runner baseline
 
-After merging a change that legitimately moves performance (and after
-merging the other 1.13 performance lanes), regenerate the stored baseline
-on the machine that should define it and commit the file:
+The CI `bench` job must not compare a 2-vCPU Ubuntu runner with the
+development machine's `baseline.json`. It therefore reads
+`benchmarks/baseline-ci.json`, and compares with floors only while that
+file does not exist (the run prints `drift atlandi; yalnizca mutlak urun
+tabanlari (floor) uygulanir`).
+
+`baseline-ci.json` comes from a real runner.
+`.github/workflows/bench-baseline.yml` is a manual (`workflow_dispatch`)
+workflow that runs
 
 ```bash
-python3 -m benchmarks --update-baseline   # full run only
+python3 -m benchmarks --update-baseline --baseline benchmarks/baseline-ci.json --json bench.json
+```
+
+on `ubuntu-latest` / Python 3.13 and uploads `benchmarks/baseline-ci.json`
+(plus `bench.json`) as the `bench-baseline-ci` artifact. To enable drift
+in CI, run that workflow on a quiet runner, download the artifact and
+commit the file:
+
+```bash
+git add benchmarks/baseline-ci.json && git commit -m "bench: runner baseline"
+```
+
+Do not hand-write or copy `baseline-ci.json` from a development machine:
+the whole point of the file is that it records the runner's own numbers
+and environment (`cpu_count` included).
+
+## Regenerating the baseline
+
+After merging a change that legitimately moves performance, regenerate
+the baseline on the machine that should define it and commit the file:
+
+```bash
+python3 -m benchmarks --update-baseline   # full run only - dev baseline
 git add benchmarks/baseline.json && git commit -m "bench: refresh baseline"
 ```
 
-Never regenerate the baseline to silence a regression — investigate the
+Never regenerate a baseline to silence a regression — investigate the
 metric first. Keep the run on an otherwise idle machine; a busy host
 lowers the best-of samples even when the code is unchanged.
 
 CI (`.github/workflows/ci.yml`, job `bench`) runs
-`python3 -m benchmarks --json bench.json` on Ubuntu and uploads
-`bench.json` as an artifact, including when the gate fails, so the
-verdict, each metric and its sample spread are visible on the build page.
+`python3 -m benchmarks --baseline benchmarks/baseline-ci.json --json
+bench.json` on Ubuntu and uploads `bench.json` as an artifact, including
+when the gate fails, so the verdict, each metric and its sample spread are
+visible on the build page.
 
 ## Adding a metric
 

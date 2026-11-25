@@ -34,10 +34,13 @@ jobs:
       - name: Parser fuzz campaign (60 s, seed 1)
         run: python3 -m tests.fuzz --seconds 60 --seed 1 --timeout 2
 
-  # ROADMAP 1.13: performans kapisi. Hiz metrikleri sabit kalibrasyon
-  # isine gore normalize edilir; RSS/bosta CPU mutlak esiklerle
-  # karsilastirilir. Baseline'dan %20'den fazla sapan metrik yapiyi
-  # kirmizi yapar (tek baseline dosyasi: tek Python surumu).
+  # ROADMAP 1.13: performans kapisi. Iki katman:
+  # - drift: bu runner'da uretilmis benchmarks/baseline-ci.json'a gore %20
+  #   (dosya commit edilene kadar drift atlanir; yalniz floor uygulanir),
+  # - floor: urun tabanlari (motor >= 150 MiB/s, bosta CPU <= %5,
+  #   yuklu RSS <= 300 MiB ...), her kosuda uygulanir.
+  # Gelistirme makinesinin baseline.json'u burada KULLANILMAZ: 2 vCPU'lu
+  # kosucu ile 12 cekirdekli makine motor hizinda karsilastirilamaz.
   bench:
     runs-on: ubuntu-latest
     steps:
@@ -45,8 +48,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Benchmarks (stored baseline)
-        run: python3 -m benchmarks --json bench.json
+      - name: Benchmarks (runner baseline or floors)
+        run: python3 -m benchmarks --baseline benchmarks/baseline-ci.json --json bench.json
       - name: Upload benchmark results
         if: always()
         uses: actions/upload-artifact@v4
