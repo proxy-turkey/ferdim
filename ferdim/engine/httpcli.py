@@ -19,6 +19,16 @@ kimlik korunur. Kimlik OLMAYAN basliklar her atlama da kalir: Referer
 dosyayi sunan kaynak oldugu icin devam dogrulamasi orada gerekir).
 Proxy-Authorization kimlik sayilir ve tasinmaz: gecitli atlamada urllib'in
 ProxyHandler'i onu proxy URL'inden yeniden ekler.
+
+Keep-alive havuzu (ROADMAP 1.13): dogrudan (gecitsiz, socks'suz) http/https
+istekleri surec genelinde bir bosta baglanti havuzundan gecer. Govdesi TAM
+okunmus ve sunucu kapatmayi istememis HTTP/1.1 baglantisi anahtari basina
+saklanir; yarim okunmus bir soket asla geri konmaz. Boylece kisa Range
+istekleri baglanti/TLS el sikismasi maliyetini tekrar odemez. TLS
+oturumlari anahtar basina saklanip yeni baglantida `wrap_socket(session=)`
+ile sunulur (yeniden kullanim = daha kisa el sikismasi). Proxy'li, SOCKS'lu
+ve h3 istekleri eski yolda kalir: orada baglanti kurulumu gecide/tunele
+baglidir.
 """
 from __future__ import annotations
 
@@ -29,10 +39,12 @@ import os
 import socket
 import ssl
 import stat
+import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field, replace
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from ..profiles import normalise_host
 from . import h3, socks
@@ -411,13 +423,587 @@ class ScopedRedirectHandler(urllib.request.HTTPRedirectHandler):
         return new
 
 
+# --------------------------------------------------------- baglanti havuzu
+# Range istekleri kisa: istek basina yeni TCP + TLS el sikismasi, indirilen
+# birkac yuz kilobayttan pahali. Havuz govdesi TAM okunmus ve sunucu
+# kapatmayi istememis HTTP/1.1 baglantilarini anahtar basina tutar; yarim
+# okunmus bir soket geri konmaz (akis karisirdi).
+#
+# Kapsam: yalnizca DOGRUDAN (proxy'siz, socks'suz) http/https istekleri.
+# Proxy/SOCKS/h3 yollari eski urllib/h3 yolunda kalir (bkz. `_poolable`).
+POOL_TTL = 30.0          # bosta en fazla bu kadar saniye
+POOL_PER_KEY = 32        # anahtar basina bosta baglanti
+POOL_MAX = 256           # toplam bosta baglanti
+
+
+def _pool_max() -> int:
+    """Toplam bosta baglanti tavani: fd butcesinin sekizde biri (en cok 256).
+
+    Havuzdaki her baglanti bir fd tutar; indirme isleri ayni butceyi
+    kullandigi icin tavan RLIMIT_NOFILE'dan turetilir."""
+    try:
+        import resource
+        soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except Exception:
+        return POOL_MAX
+    if not soft or soft <= 0 or soft == getattr(resource, "RLIM_INFINITY", -1):
+        return POOL_MAX
+    return max(16, min(POOL_MAX, int(soft) // 8))
+
+
+class _Idle:
+    """Havuzda bekleyen baglanti ve birakilma ani."""
+
+    __slots__ = ("conn", "ts")
+
+    def __init__(self, conn, ts: float):
+        self.conn = conn
+        self.ts = ts
+
+    def close(self) -> None:
+        if _conn_open(self.conn):
+            self.conn.close()
+
+
+def _conn_open(conn) -> bool:
+    """Baglanti hala bir soket tutuyor mu (http.client kapattiysa hayir)."""
+    return conn is not None and getattr(conn, "sock", None) is not None
+
+
+class _ConnPool:
+    """Anahtar basina bosta baglanti havuzu (is parcacigi guvenli).
+
+    `take` bostaki EN YENI baglantiyi verir (sicak soket once gelir),
+    `put` geri koyar. TTL'i gecen baglantilar hem tembel (take/put) hem de
+    havuz bos degilken calisan tek bir hafif toplayici ile kapatilir:
+    sunucu tarafinda yarim kalan baglanti ve fd birikmez."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._idle: dict = {}
+        self._count = 0
+        self._sessions: dict = {}
+        self._wake = threading.Event()
+        self._reaper: threading.Thread | None = None
+        self.ttl = POOL_TTL
+        self.per_key = POOL_PER_KEY
+        self.max = _pool_max()
+
+    # -- baglanti ----------------------------------------------------
+    def take(self, key):
+        """Bostaki en yeni saglam baglanti; yoksa None."""
+        now = time.monotonic()
+        with self._lock:
+            items = self._idle.get(key)
+            if not items:
+                return None
+            item = items.pop()
+            self._count -= 1
+            if not items:
+                self._idle.pop(key, None)
+        if now - item.ts > self.ttl or not _conn_open(item.conn):
+            item.close()
+            return None
+        return item.conn
+
+    def put(self, key, conn) -> None:
+        """Tam okunmus baglantiyi havuza birakir (tavanlari uygular)."""
+        if not _conn_open(conn):
+            return
+        drop = []
+        with self._lock:
+            items = self._idle.setdefault(key, [])
+            items.append(_Idle(conn, time.monotonic()))
+            self._count += 1
+            while len(items) > self.per_key:
+                self._count -= 1
+                drop.append(items.pop(0))
+            if self._count > self.max:
+                self._count -= 1
+                drop.append(items.pop())
+            if not items:
+                self._idle.pop(key, None)
+            self._ensure_reaper()
+        for item in drop:
+            item.close()
+
+    # -- TLS oturumu -------------------------------------------------
+    def session(self, key):
+        """Anahtarin son TLS oturumu (yoksa None)."""
+        with self._lock:
+            return self._sessions.get(key)
+
+    def store_session(self, key, session) -> None:
+        """Son oturumu anahtara yazar (en fazla 64 anahtar tutulur)."""
+        if session is None:
+            return
+        with self._lock:
+            if key not in self._sessions and len(self._sessions) >= 64:
+                self._sessions.pop(next(iter(self._sessions)))
+            self._sessions[key] = session
+
+    # -- temizlik ----------------------------------------------------
+    def clear(self, keep_sessions: bool = False) -> None:
+        """Bosta baglantilari kapatir; oturumlar korunabilir."""
+        with self._lock:
+            items = [item for group in self._idle.values() for item in group]
+            self._idle.clear()
+            self._count = 0
+            if not keep_sessions:
+                self._sessions.clear()
+        self._wake.set()
+        for item in items:
+            item.close()
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"idle": self._count, "keys": len(self._idle),
+                    "sessions": len(self._sessions)}
+
+    # -- toplayici ---------------------------------------------------
+    def _ensure_reaper(self) -> None:
+        """Bosta baglanti varsa tek temizleyici is parcacigi (kilitli)."""
+        if self._reaper is not None and self._reaper.is_alive():
+            return
+        self._reaper = threading.Thread(target=self._reap,
+                                        name="ferdim-conn-pool", daemon=True)
+        self._reaper.start()
+
+    def _reap(self) -> None:
+        while True:
+            dead = []
+            now = time.monotonic()
+            with self._lock:
+                for key in list(self._idle):
+                    items = self._idle[key]
+                    while items and now - items[0].ts > self.ttl:
+                        dead.append(items.pop(0))
+                        self._count -= 1
+                    if not items:
+                        self._idle.pop(key, None)
+                stop = not self._count
+                if stop:
+                    self._reaper = None
+            for item in dead:
+                item.close()
+            if stop:
+                return
+            self._wake.wait(max(1.0, self.ttl / 3.0))
+            self._wake.clear()
+
+
+_POOL = _ConnPool()
+
+
+def _pool() -> _ConnPool:
+    return _POOL
+
+
+def close_pool(keep_sessions: bool = False) -> None:
+    """Bosta baglantilari kapatir (testler ve kapanis); oturum korunabilir."""
+    _POOL.clear(keep_sessions)
+
+
+def pool_stats() -> dict:
+    """Havuz sayaclari (gozlem/test): idle, keys, sessions."""
+    return _POOL.stats()
+
+
+class PoolTLSConnection(http.client.HTTPSConnection):
+    """HTTPS baglantisi: son TLS oturumu ile el sikismasini kisaltir.
+
+    Verilen oturum sunucuda gecerli degilse (ya da surum uyusmuyorsa) tam
+    el sikismasi yapilir: resumption bir hizlandirma, kosul degildir.
+    TLS 1.3 bileti el sikismasindan sonra geldigi icin `tls_session` ilk
+    yanit okunduktan sonra dolar."""
+
+    def __init__(self, host, port=None, *, context, session=None,
+                 timeout=None):
+        super().__init__(host, port, timeout=timeout, context=context)
+        self._session = session
+        self.tls_session = None
+        self.session_reused = False
+
+    def connect(self):
+        if self._session is not None:
+            try:
+                self._handshake(self._session)
+                return
+            except (ssl.SSLError, ValueError, TypeError):
+                pass                  # oturum kabul edilmedi: tam el sikismasi
+        self._handshake(None)
+
+    def _handshake(self, session) -> None:
+        raw = socket.create_connection((self.host, self.port), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(
+                raw, server_hostname=self.host, session=session)
+        except BaseException:
+            raw.close()
+            raise
+        self.session_reused = bool(getattr(self.sock, "session_reused", False))
+        try:
+            self.tls_session = self.sock.session
+        except (ssl.SSLError, ValueError):
+            self.tls_session = None
+        _tune(self.sock)
+
+
+# --------------------------------------------------- havuzlu istek yolu
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+MAX_REDIRECTS = 10        # urllib ile ayni
+MAX_REPEATS = 4           # ayni hedefe bu kadar gidilirse dongu sayilir
+# Bosta duran soket sunucu tarafinda kapanmis olabilir: gonderim/yanit
+# asamasinda gorulen bu hatalar TAZE baglantiyla bir kez yinelenir.
+_STALE_ERRORS = (ConnectionResetError, ConnectionAbortedError,
+                 BrokenPipeError, http.client.RemoteDisconnected,
+                 http.client.BadStatusLine, http.client.CannotSendRequest)
+
+
+def _stale(ex: BaseException) -> bool:
+    """Bosta soketin olu cikmasi mi? Zaman asimi/sertifika hatasi degil."""
+    return isinstance(ex, _STALE_ERRORS) and not isinstance(ex, TimeoutError)
+
+
+def _endpoint(url: str):
+    """(sema, ana makine, port, hedef) ya da bu yolun kapsami disinda None.
+
+    Ana makine IDNA/A-label bicimine normalisedir (SNI ve Host basligi
+    ayni yazimi gorur). ASCII disi hedef havuz yolundan cikarilir: eski
+    opener ayni istegi zaten reddeder/ kodlar."""
+    try:
+        parts = urlsplit(str(url or ""))
+        scheme = parts.scheme.lower()
+        if scheme not in ("http", "https"):
+            return None
+        host = normalise_host(parts.hostname or "")
+        port = parts.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        return None
+    if not host:
+        return None
+    target = parts.path or "/"
+    if parts.query:
+        target += "?" + parts.query
+    if not target.isascii() or not host.isascii():
+        return None
+    return scheme, host, port, target
+
+
+def _env_proxy(scheme: str, host: str) -> bool:
+    """Ortam degiskenleri bu istek icin gecit istiyor mu (urllib davranisi)?"""
+    try:
+        if urllib.request.proxy_bypass(host):
+            return False
+        proxies = urllib.request.getproxies()
+    except Exception:
+        return True               # bilinmiyorsa eski (opener) yolu kullan
+    return bool(proxies.get(scheme) or proxies.get("all"))
+
+
+def _poolable(url: str, opt: DlOptions) -> bool:
+    """Istek dogrudan mi gidiyor: havuz yolu kullanilabilir mi?
+
+    `opt.proxy`, ortam degiskeni gecidi, SOCKS tuneli ve h3 secili
+    istekler havuz disinda kalir; onlar eski yoldan gider."""
+    ep = _endpoint(url)
+    if ep is None:
+        return False
+    if getattr(opt, "proxy", ""):
+        return False
+    if h3.use_h3(url, opt):
+        return False
+    return not _env_proxy(ep[0], ep[1])
+
+
+def _send_headers(headers: dict) -> dict:
+    """Istek basliklari: `Connection` daima keep-alive.
+
+    `DlOptions.base_headers` baglantiyi kapatmayi ister (tek istek yolu);
+    havuzda bu yeniden kullanimi imkansiz kilardi. Kullanici baska bir
+    deger verdiyse bile havuz yolu keep-alive gonderir: sunucu kapatmak
+    isterse yanitta `Connection: close` ile soyler ve soket havuza donmez."""
+    out = {k: v for k, v in (headers or {}).items()
+           if str(k).strip().lower() != "connection"}
+    out["Connection"] = "keep-alive"
+    return out
+
+
+def _safe_close(conn) -> None:
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _discard(conn) -> None:
+    """Yarim okunmus soketi sessizce kapatir (RST uretmeden).
+
+    Okunmamis bayt varken `close()` karsi tarafa RST gonderir; sunucu bunu
+    baglanti hatasi olarak gorur. Kapanistan once tampondaki baytlari
+    bosaltmak normal kapanis (FIN) birakir. Okuma non-blocking'dir: veri
+    gelmiyorsa beklemeden kapatilir, `close()` asla stall suresi kadar
+    bloklamaz."""
+    sock = getattr(conn, "sock", None)
+    if sock is not None:
+        try:
+            sock.setblocking(False)
+            while sock.recv(65536):
+                pass
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError:
+            pass
+    _safe_close(conn)
+
+
+class PooledResponse:
+    """Havuzlu yanit: urllib/http.client yanit arayuzu.
+
+    `read`/`close`/`headers`/`geturl` urllib yanitiyla ayni sozlesmededir
+    (job.py, probe, fetch_small ve segments bu arayuzu kullanir). Govde
+    TAM okununca baglanti havuza doner; `close()` govde bitmeden
+    cagrilirsa soket atilir: yarim okunmus baglanti yeniden kullanilmaz."""
+
+    def __init__(self, url: str, resp, key: tuple, conn):
+        self.url = url
+        self.status = int(getattr(resp, "status", 0) or 0)
+        self.code = self.status
+        self.reason = getattr(resp, "reason", "") or ""
+        self.msg = self.reason
+        self.headers = resp.headers
+        self._resp = resp
+        self._key = key
+        self._conn = conn
+        self._done = False
+
+    # urllib benzeri arayuz ------------------------------------------
+    def geturl(self) -> str:
+        return self.url
+
+    def getcode(self) -> int:
+        return self.status
+
+    def info(self):
+        return self.headers
+
+    def getheader(self, name, default=None):
+        return self.headers.get(name, default)
+
+    def getheaders(self) -> list:
+        return list(self.headers.items())
+
+    def readable(self) -> bool:
+        return True
+
+    @property
+    def fp(self):
+        """Govde tamponu: `response_socket` soketi buradan bulur (TCP_INFO)."""
+        return getattr(self._resp, "fp", None)
+
+    def read(self, amt=None) -> bytes:
+        if self._done:
+            return b""
+        try:
+            data = self._resp.read(amt)
+        except BaseException:
+            self._drop()
+            raise
+        if self._complete():
+            self._recycle()
+        return data
+
+    def readline(self, limit: int = -1) -> bytes:
+        if self._done:
+            return b""
+        try:
+            data = self._resp.readline(limit)
+        except BaseException:
+            self._drop()
+            raise
+        if self._complete():
+            self._recycle()
+        return data
+
+    def close(self) -> None:
+        if self._done:
+            return
+        try:
+            self._resp.close()
+        except Exception:
+            pass
+        self._drop()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    # govde sonu -----------------------------------------------------
+    def _complete(self) -> bool:
+        """Govde gercekten bitti mi (baglanti yeniden kullanilabilir mi)?"""
+        resp = self._resp
+        if resp is None or not resp.isclosed():
+            return False
+        if getattr(resp, "will_close", True):
+            return False               # sunucu kapatti / HTTP/1.0
+        if getattr(resp, "version", 0) != 11:
+            return False
+        # Content-Length tam tuketilmediyse akis kesilmistir: soket guvenilmez
+        return not getattr(resp, "length", None)
+
+    def _recycle(self) -> None:
+        self._done = True
+        conn, self._conn = self._conn, None
+        if not _conn_open(conn):
+            _safe_close(conn)
+            return
+        _remember_session(conn, self._key)     # TLS 1.3 bileti burada gelir
+        _pool().put(self._key, conn)
+
+    def _drop(self) -> None:
+        self._done = True
+        conn, self._conn = self._conn, None
+        _discard(conn)
+
+
+def _new_conn(scheme: str, host: str, port: int, timeout: float,
+              tlsig: tuple | None, key: tuple):
+    """Bos bir baglanti nesnesi (henuz soket yok); TLS'te oturum sunulur."""
+    if scheme == "https":
+        settings, signature = tlsig
+        sess = _pool().session(key)
+        return PoolTLSConnection(host, port, timeout=timeout,
+                                 context=_context_for(settings, signature),
+                                 session=sess)
+    return FastHTTPConnection(host, port, timeout=timeout)
+
+
+def _remember_session(conn, key: tuple) -> None:
+    """Baglantinin TLS oturumunu anahtara yazar.
+
+    TLS 1.3 bileti el sikismasindan SONRA geldigi icin yanit okunduktan
+    sonra tazelenir; TLS 1.2'de oturum el sikismasiyla hazirdir."""
+    if not hasattr(conn, "tls_session"):
+        return
+    sock = getattr(conn, "sock", None)
+    if sock is not None:
+        try:
+            conn.tls_session = sock.session or conn.tls_session
+        except (ssl.SSLError, ValueError):
+            pass
+    _pool().store_session(key, conn.tls_session)
+
+
+def _request_once(ep: tuple, url: str, opt: DlOptions, headers: dict,
+                  timeout: float):
+    """Tek GET: havuzdan baglanti al, gonder, yaniti sar.
+
+    Bosta bulunan soket sunucu tarafinda kapanmissa istek TAZE baglantiyla
+    bir kez yinelenir: GET tekrarlanabilir, kullanici bunu gormez."""
+    scheme, host, port, target = ep
+    tlsig = None
+    if scheme == "https":
+        settings = tls_settings(opt)
+        tlsig = (settings, settings.fingerprint())
+    key = (scheme, host, port, tlsig)
+    pool = _pool()
+    for attempt in (0, 1):
+        conn = pool.take(key)
+        reused = conn is not None
+        try:
+            if conn is None:
+                conn = _new_conn(scheme, host, port, timeout, tlsig, key)
+            else:
+                # ayni soket farkli stall butcesiyle kullanilabilir
+                conn.timeout = timeout
+                if conn.sock is not None:
+                    conn.sock.settimeout(timeout)
+            conn.request("GET", target, headers=_send_headers(headers))
+            resp = conn.getresponse()
+        except (OSError, http.client.HTTPException) as ex:
+            _safe_close(conn)
+            if reused and attempt == 0 and _stale(ex):
+                continue
+            if isinstance(ex, http.client.HTTPException):
+                raise
+            raise urllib.error.URLError(ex) from ex
+        if tlsig is not None:
+            _remember_session(conn, key)
+        return PooledResponse(url, resp, key, conn)
+    raise AssertionError("erisilemez")     # pragma: no cover
+
+
+def _http_error(url: str, resp: PooledResponse,
+                msg: str | None = None) -> urllib.error.HTTPError:
+    """Yaniti HTTPError'a sarar (cagiran `close()` edebilir)."""
+    return urllib.error.HTTPError(url, resp.status, msg or resp.reason,
+                                  resp.headers, resp)
+
+
+def _drain(resp: PooledResponse) -> None:
+    """Kucuk 30x govdesini okuyup baglantiyi havuza kazandirir."""
+    try:
+        cl = resp.headers.get("Content-Length")
+        if cl is not None and cl.strip().isdigit() and int(cl) <= 65536:
+            resp.read(int(cl))
+    except Exception:
+        pass
+
+
+def _pooled_get(url: str, opt: DlOptions, headers: dict, timeout: float):
+    """Dogrudan GET: baglanti havuzu + yonlendirme zinciri.
+
+    Yonlendirme `ScopedRedirectHandler` kuralini izler: hedef koken
+    farkliysa kimlik basliklari atilir, Range/If-Range/Referer kalir (bkz.
+    `strip_credentials`). Ayni hedefe MAX_REPEATS'ten fazla gidilirse
+    dongu sayilir. Havuzun kapsamadigi bir hedefe (ASCII disi yol vb.)
+    dusulurse zincirin kalani eski opener'da biter."""
+    origin = origin_of(url)
+    hdrs = dict(headers)
+    counts: dict = {}
+    hop = 0
+    while True:
+        ep = _endpoint(url)
+        if ep is None:
+            return _open_urllib(url, opt, hdrs, timeout)
+        resp = _request_once(ep, url, opt, hdrs, timeout)
+        if resp.status not in _REDIRECT_CODES:
+            if 200 <= resp.status < 300:
+                return resp
+            raise _http_error(url, resp)
+        loc = (resp.headers.get("Location") or "").strip()
+        newurl = urljoin(url, loc) if loc else ""
+        counts[newurl] = counts.get(newurl, 0) + 1
+        _drain(resp)
+        resp.close()
+        if not newurl or hop >= MAX_REDIRECTS or counts[newurl] > MAX_REPEATS:
+            raise _http_error(url, resp, "yonlendirme izlenemedi")
+        hop += 1
+        if not same_origin(origin, newurl):
+            hdrs = strip_credentials(hdrs)
+        url = newurl
+
+
+def _req_headers(req) -> dict:
+    """Request basliklari: urllib'in do_open'i gibi unredirected + normal."""
+    hdrs = dict(getattr(req, "unredirected_hdrs", {}) or {})
+    hdrs.update(req.headers)
+    return hdrs
+
+
 class _Opener:
     """h3 farkinda opener: urllib opener'i gibi `.open` sunar.
 
-    h3 seciliyse istek h3 uzerinden gider; degilse urllib opener'i aynen
-    calisir. Metin/segment cekimi (hls.py, dash.py, segments.py) bu imzayi
-    kullandigi icin yan dosyalar ve HLS/DASH segmentleri de h3'ten gecer.
-    `.handlers` urllib opener'indan gelir."""
+    h3 seciliyse istek h3 uzerinden gider; dogrudan (proxy'siz) istekler
+    baglanti havuzundan (`_pooled_get`), kalanlar urllib opener'inden.
+    Metin/segment cekimi (hls.py, dash.py, segments.py) bu imzayi
+    kullandigi icin yan dosyalar ve HLS/DASH segmentleri de ayni yoldan
+    gecer. `.handlers` urllib opener'indan gelir."""
 
     def __init__(self, opener: urllib.request.OpenerDirector, opt: DlOptions):
         self._opener = opener
@@ -429,8 +1015,11 @@ class _Opener:
 
     def open(self, req, timeout: float | None = None, **kw):
         to = timeout or self._opt.timeout
-        if h3.use_h3(req.full_url, self._opt):
-            return _open_any(req.full_url, self._opt, dict(req.headers), to)
+        url = req.full_url
+        if h3.use_h3(url, self._opt):
+            return _open_any(url, self._opt, _req_headers(req), to)
+        if not kw and req.get_method() == "GET" and _poolable(url, self._opt):
+            return _pooled_get(url, self._opt, _req_headers(req), to)
         return self._opener.open(req, timeout=to, **kw)
 
 
@@ -468,6 +1057,7 @@ class DlOptions:
             "User-Agent": self.user_agent,
             "Accept": "*/*",
             "Accept-Encoding": "identity",  # Range dogrulugu icin
+            # havuz yolu bunu keep-alive yapar (bkz. _send_headers)
             "Connection": "close",
         }
         h.update({k: v for k, v in self.headers.items()})
@@ -535,11 +1125,22 @@ def _make_opener(opt: DlOptions, direct: bool = False):
     return opener if direct else _Opener(opener, opt)
 
 
-def _open_tcp(url: str, opt: DlOptions, headers: dict, timeout: float):
-    """stdlib (TCP/TLS) yolu: tek istek, urllib yaniti."""
+def _open_urllib(url: str, opt: DlOptions, headers: dict, timeout: float):
+    """Eski yol: urllib opener'i (proxy/socks/havuz kapsami disi istekler)."""
     opener = _make_opener(opt, direct=True)
     return opener.open(urllib.request.Request(url, headers=headers),
                        timeout=timeout)
+
+
+def _open_tcp(url: str, opt: DlOptions, headers: dict, timeout: float):
+    """stdlib (TCP/TLS) yolu: tek istek, havuzdan yeniden kullanimli yanit.
+
+    Gecitsiz dogrudan istekler baglanti havuzundan gecer (`_pooled_get`);
+    proxy/SOCKS istekleri ve havuzun kapsamadigi adresler eski urllib
+    opener'inda kalir."""
+    if _poolable(url, opt):
+        return _pooled_get(url, opt, headers, timeout)
+    return _open_urllib(url, opt, headers, timeout)
 
 
 def _open_any(url: str, opt: DlOptions, headers: dict, timeout: float):

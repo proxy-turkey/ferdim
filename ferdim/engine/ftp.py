@@ -6,6 +6,7 @@ kullanir; sertifika dogrulamasi config'teki verify_tls'e uyar.
 """
 from __future__ import annotations
 
+import errno
 import ftplib
 import os
 import re
@@ -20,6 +21,7 @@ from . import httpcli, socks
 
 BLOCK = 1 << 16          # 64 KB veri blogu
 POLL = 2.0               # veri okuma yoklamasi: durdurma en gec bu kadar bekler
+_FD_ERRNOS = frozenset({errno.EMFILE, errno.ENFILE})
 
 _FTP_WORDS = {
     421: "servis su an kullanilamiyor",
@@ -143,6 +145,10 @@ def _wrap(ex: BaseException, connecting: bool = False) -> FtpError:
                         "network", transient=True)
     if isinstance(ex, (TimeoutError, socket.timeout)):
         return FtpError("baglanti zaman asimi", "network", transient=True)
+    if isinstance(ex, OSError) and ex.errno in _FD_ERRNOS:
+        # fd tukendi (EMFILE/ENFILE): yeniden denemek ise yaramaz, job
+        # katmani bu kodu kalici altyapi hatasi sayar (bkz. job fd_exhausted)
+        return FtpError("dosya taniticisi tukendi", "fd_exhausted")
     if isinstance(ex, EOFError):
         return FtpError("kontrol baglantisi kapandi", "network",
                         transient=True)
