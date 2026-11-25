@@ -73,7 +73,9 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(sha(job.final_path), DATA_SHA)
 
     def test_03_restart_on_etag_change(self):
-        job = self._job(f"{self.base}/file.bin", segments=4)
+        # hiz limiti: baglanti yeniden kullanimiyla yerel indirme pause'dan
+        # once bitiyordu; test yarida durdurmaya dayanir
+        job = self._job(f"{self.base}/file.bin", segments=4, limit=1 << 20)
         job.start()
         t0 = time.monotonic()
         while job.done < 300_000 and time.monotonic() - t0 < 20:
