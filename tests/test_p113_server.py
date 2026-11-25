@@ -50,6 +50,7 @@ class FakeStats:
         self.removed = []       # (rev, kimlik)
         self.calls = []         # [(params)]
         self.top = {}           # rev ARTIRMAYAN ust alanlar (turbo gibi)
+        self.active = 0         # calisan is sayisi (hub kalp atisi karari)
         self.delay = 0.0        # yavas istatistik benzetimi
 
     def upsert(self, job_id: str, **fields) -> None:
@@ -74,7 +75,7 @@ class FakeStats:
             self.calls.append(dict(params))
             since = params.get("since")
             out = {"ok": True, "rev": self.rev, "total_jobs": len(self.jobs),
-                   **self.top}
+                   "active": self.active, **self.top}
             if since is None:
                 out["full"] = True
                 out["jobs"] = [snap for _r, snap in
@@ -365,6 +366,7 @@ class HubTests(unittest.TestCase):
     def test_04b_sock_watcher_gets_no_frame_when_nothing_changed(self):
         """Ayni kare iki kez uretilmez: kalp atislari bos trafik yaratmaz."""
         fake = FakeStats()
+        fake.active = 1           # mesgul: kalp atisi hesap YAPAR, kare YOK
         fake.upsert("a", state="queued")
         h = Hub(fake, interval=0.01, heartbeat=0.02)
         h.start()
@@ -599,7 +601,95 @@ class HubTests(unittest.TestCase):
             sock_a.close()
             sock_b.close()
 
-    def test_11_client_caps(self):
+    # ------------------------------------------------ bos kuyruk maliyeti
+    def test_11_idle_queue_skips_heartbeat_stats(self):
+        """Sessiz + bos kuyrukta kalp atisi istatistik HESAPLAMAZ.
+
+        10 000 iste `stats()` ~50 ms; 1 Hz'de tek basasi ~5 % CPU idi.
+        Istemci bu sirada `: ping` yorumu alir (akis canli kalir), hesap
+        yalniz notify'da ve seyrek tazelemede yapilir."""
+        fake = FakeStats()               # active=0: calisan is yok
+        fake.upsert("a", state="paused")
+        h = Hub(fake, interval=0.01, heartbeat=0.03, idle_refresh=60.0)
+        h.start()
+        a, b = socket.socketpair()
+        try:
+            self.assertIsNotNone(h.add_client(a, name="test"))
+            self.assertEqual(json.loads(LineReader(b).block(5.0))["event"],
+                             "stats")
+            calls = fake.call_count()
+            time.sleep(0.4)              # ~13 kalp atisi
+            self.assertEqual(fake.call_count(), calls,
+                             "bos kuyrukta kalp atisi hesap yapmamali")
+            # notify: degisiklik hemen hesaplanir (kacmaz)
+            fake.upsert("a", state="paused", filename="yeni.bin")
+            h.notify()
+            self.assertTrue(wait_for(lambda: fake.call_count() > calls, 5.0))
+        finally:
+            h.stop()
+            a.close()
+            b.close()
+
+    def test_12_busy_queue_keeps_heartbeat(self):
+        """Calisan is varken hiz/ilerleme 1 Hz kalp atisiyla tazelenir."""
+        fake = FakeStats()
+        fake.active = 1
+        fake.upsert("a", state="downloading")
+        h = Hub(fake, interval=0.01, heartbeat=0.03, idle_refresh=60.0)
+        h.start()
+        a, b = socket.socketpair()
+        try:
+            self.assertIsNotNone(h.add_client(a, name="test"))
+            LineReader(b).block(5.0)
+            calls = fake.call_count()
+            time.sleep(0.4)
+            self.assertGreaterEqual(fake.call_count() - calls, 4,
+                                    "mesgul kuyrukta kalp atisi hesap yapmali")
+        finally:
+            h.stop()
+            a.close()
+            b.close()
+
+    def test_13_idle_refresh_keeps_time_based_fields_fresh(self):
+        """Sessiz kuyrukta seyrek tazeleme kalir: zamana bagli alanlar
+        (nm_connected, sched_wait) sonsuza kadar bayat kalmaz."""
+        fake = FakeStats()
+        fake.upsert("a", state="paused")
+        h = Hub(fake, interval=0.01, heartbeat=0.02, idle_refresh=0.08)
+        h.start()
+        a, b = socket.socketpair()
+        try:
+            self.assertIsNotNone(h.add_client(a, name="test"))
+            LineReader(b).block(5.0)
+            calls = fake.call_count()
+            self.assertTrue(wait_for(lambda: fake.call_count() > calls, 5.0))
+            # seyrek: ayni pencerede onlarca kez hesaplanmaz
+            time.sleep(0.12)
+            self.assertLessEqual(fake.call_count() - calls, 4)
+        finally:
+            h.stop()
+            a.close()
+            b.close()
+
+    def test_14_first_frame_for_a_new_client_is_immediate(self):
+        """Bos kuyrukta yeni istemci ilk karesini beklemeden alir."""
+        fake = FakeStats()
+        fake.upsert("a", state="paused")
+        h = Hub(fake, interval=0.01, heartbeat=0.03, idle_refresh=60.0)
+        h.start()
+        a, b = socket.socketpair()
+        try:
+            h._pushed = time.monotonic()      # uyku modunda say
+            self.assertIsNotNone(h.add_client(a, name="test"))
+            first = json.loads(LineReader(b).block(2.0))
+            self.assertEqual(first["event"], "stats")
+            self.assertEqual([j["id"] for j in first["jobs"]], ["a"])
+        finally:
+            h.stop()
+            a.close()
+            b.close()
+
+    def test_15_client_caps(self):
         """Eszamanli istemci siniri: SSE ve soket izleyicisi ayri sayilir."""
         fake = FakeStats()
         h = Hub(fake, interval=10.0, heartbeat=10.0,

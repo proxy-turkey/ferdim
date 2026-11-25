@@ -33,6 +33,11 @@ SSE_KEEPALIVE = 15.0      # SSE yorum satiri araligi (sn)
 # bir kare kuyrugu tutar; sinirsiz sekme/izleyici bellegi ve CPU'yu sisirir.
 MAX_SSE = 16              # ayni anda acik web akisi (sekme)
 MAX_WATCHERS = 16         # soket izleyicisi (CLI/GTK/D-Bus koprusu)
+# Bos (calisan is yok) ve sessiz kuyrukta kalp atisi istatistik HESAPLAMAZ:
+# `stats(since=rev)` 10 000 iste ~50 ms; 1 Hz'de tek basina ~5 % CPU. Yalniz
+# zamana bagli alanlar (nm_connected, sched_wait, retry_after_until) icin
+# seyrek tazeleme kalir; SSE istemcisi `: ping` ile canli kalir.
+IDLE_REFRESH = 15.0       # sessiz kuyrukta en seyrek tam kare araligi (sn)
 
 
 def sock_frame(stats: dict) -> bytes:
@@ -214,7 +219,8 @@ class Hub:
 
     def __init__(self, stats, interval: float = PUSH_INTERVAL,
                  heartbeat: float = HEARTBEAT, max_sse: int = MAX_SSE,
-                 max_watchers: int = MAX_WATCHERS):
+                 max_watchers: int = MAX_WATCHERS,
+                 idle_refresh: float = IDLE_REFRESH):
         self._stats = stats
         self._interval = float(interval)
         self._heartbeat = float(heartbeat)
@@ -226,7 +232,10 @@ class Hub:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._listener = None
-        self._last = 0.0
+        self._last = 0.0          # hiz siniri (son itme)
+        self._pushed = 0.0        # son GERCEK istatistik hesabi
+        self._busy = True         # calisan is var mi (bilinmiyorsa: var)
+        self._idle_refresh = float(idle_refresh)
 
     # -------------------------------------------------------------- yasam
     def start(self, qm=None) -> "Hub":
@@ -328,14 +337,20 @@ class Hub:
             if self._stop.is_set():
                 break
             self._wake.clear()
+            now = time.monotonic()
             if signalled:
-                gap = self._last + self._interval - time.monotonic()
+                gap = self._last + self._interval - now
                 if gap > 0:
                     # hiz siniri: erken uyanmalar tek karede birlestirilir
                     self._stop.wait(gap)
                     if self._stop.is_set():
                         break
                     self._wake.clear()
+            elif not self._busy and now - self._pushed < self._idle_refresh:
+                # Sessiz kuyruk + calisan is yok: kalp atisi HESAP YAPMAZ
+                # (10 000 iste ~50 ms). Istemciler `: ping` yorumu alir;
+                # zamana bagli alanlar icin `_idle_refresh`de bir tazeleme.
+                continue
             self._push()
             self._last = time.monotonic()
 
@@ -343,6 +358,7 @@ class Hub:
         clients = self._snapshot()
         if not clients:
             return            # istemci yok: istatistik HESAPLANMAZ (bosta CPU)
+        self._pushed = time.monotonic()
         viewers = [c for c in clients if c.delta]
         watchers = [c for c in clients if not c.delta]
 
@@ -405,6 +421,12 @@ class Hub:
                 client.offer(sse_frame(delta), delta["rev"])
             except Exception:
                 continue      # tek istemcinin hatasi digerlerini durdurmaz
+        # Calisan is VARSA hiz/ilerleme 1 Hz kalp atisiyla tazelenir; yoksa
+        # notify gelene kadar hesap yapilmaz. `active` bilinmiyorsa (eski
+        # sunucu) guvenli taraf: mesgul say.
+        frame = delta if delta is not None else full
+        self._busy = (bool(frame.get("active")) if frame is not None
+                      and "active" in frame else True)
 
 
 def for_ctx(ctx: dict) -> Hub:
