@@ -144,11 +144,15 @@ class FeatureTests(unittest.TestCase):
                                    filename="smart-tiny.bin"))
             deadline = time.monotonic() + 25
             started = None
+            # max_concurrent=1: buyuk once baslasaydi kucuk yavas indirme
+            # boyunca QUEUED kalirdi. Kucugun ~5 ms'lik downloading anini
+            # yakalamaya calismak yoklama zamanina bagliydi (kirilgan).
             while time.monotonic() < deadline:
-                if big.state == JobState.DOWNLOADING or \
-                   small.state == JobState.DOWNLOADING:
-                    started = small.id if small.state == \
-                        JobState.DOWNLOADING else big.id
+                if small.state != JobState.QUEUED:
+                    started = small.id
+                    break
+                if big.state in (JobState.DOWNLOADING, JobState.DONE):
+                    started = big.id
                     break
                 time.sleep(0.1)
             self.assertEqual(started, small.id,
