@@ -181,7 +181,7 @@ class QueueManager:
             paused: bool = False) -> DownloadJob:
         """paused=True: is kuyruga 'durdurulmus' girer, tick baslatmaz."""
         job = DownloadJob(self.env, self.cfg, spec, job_id=job_id,
-                          on_change=self._job_changed)
+                          on_change=self._job_changed, bucket=self.bucket)
         if paused:
             job.state = JobState.PAUSED
         with self._lock:
@@ -484,12 +484,9 @@ class QueueManager:
 
     def set_speed_limit(self, bytes_per_sec: int):
         self.cfg["speed_limit"] = int(bytes_per_sec)
+        # TEK kuyruk kovasi: tum islerin iscileri bunu paylasir. Is basina
+        # `--limit` ayri kovada kalir (CombinedBucket ikisini birlikte uygular).
         self.bucket.set_rate(int(bytes_per_sec))
-        # aktif islerin kendi bucket'larini de guncelle
-        with self._lock:
-            for j in self.jobs:
-                if j.spec.limit == 0:
-                    j._bucket.set_rate(int(bytes_per_sec))
 
     # -------------------------------------------------- saat plani (1.8)
     def plan_status(self) -> dict:
@@ -598,8 +595,6 @@ class QueueManager:
                 j._turbo = True
                 j._chunk = 1 << 18
                 j._min_split = 1 << 18
-                if j.spec.limit == 0:
-                    j._bucket.set_rate(0)
         else:
             self.cfg["turbo_mode"] = False
             prev = self.cfg.pop("turbo_prev", None) or {}
@@ -612,8 +607,6 @@ class QueueManager:
                 j._turbo = False
                 j._chunk = 1 << 16
                 j._min_split = 1 << 20
-                if j.spec.limit == 0:
-                    j._bucket.set_rate(int(self.cfg.get("speed_limit", 0)))
         self.env.save_config(self.cfg)
         self._notify()
         return self.cfg["turbo_mode"]
@@ -813,7 +806,8 @@ class QueueManager:
             ephemeral=bool(rec.get("ephemeral")),
         )
         job = DownloadJob(self.env, self.cfg, spec,
-                          job_id=_text(rec.get("id")) or None)
+                          job_id=_text(rec.get("id")) or None,
+                          bucket=self.bucket)
         job.kind = _text(rec.get("kind")) or "http"
         job.created = _float(rec.get("created"), time.time())
         job._active_secs = max(0.0, _float(rec.get("active"), 0.0))
