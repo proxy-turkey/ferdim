@@ -818,6 +818,10 @@ class DownloadJob:
                 # kapi gecti: bayat rozet kalmasin (ui neden bekledigini sorsun)
                 extra.pop("retry_after_until", None)
                 retry_until = 0.0
+            if self._dir is None and not self.spec.directory:
+                # hedef klasor ilk erisimde SABITLENIR: anahtar ondan SONRA
+                # kurulmali (yoksa ilk gorunumun anahtari hep iskalar)
+                self.target_dir
             # pencere: stats cagrisi kategori->kapali pencere sozlugunu
             # paylasir; sozluk bossa kategori hic hesaplanmaz
             if windows:
@@ -2407,7 +2411,9 @@ class DownloadJob:
                             return (0.0, True)
                         raise
                     if n != len(chunk):
-                        raise IOError("kisa yazim")
+                        # kisa yazim = disk dolu/kota. Ag hatasi degil:
+                        # kalici hata kodu 'disk' olmali (ENOSPC).
+                        raise OSError(errno.ENOSPC, "kisa yazim")
                     with self._lock:
                         cursor += len(chunk)
                         self.done += len(chunk)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import heapq
 import logging
 import os
 import re
@@ -30,6 +31,11 @@ SMART_GRACE = 3.0
 STATS_LIMIT_MAX = 10000            # sayfalama ust siniri
 TICK_BUSY = 0.5                    # tick araligi: is var (calisan/kuyrukta)
 TICK_IDLE = 2.0                    # tick araligi: is yok (olay hemen uyandirir)
+# Kapanis: calisan denetim komutu icin ilk bekleme, sonra duraklatma
+# sonrasi son yazimdan onceki bekleme (motorun 8 sn'lik duraklama siniri
+# + pay). Ikisi de sinirli: kapanis asla sinirsiz beklemez.
+QUEUE_CTL_FIRST_WAIT = 2.0
+QUEUE_CTL_TAIL_WAIT = 8.0
 STATES_RUNNING = (JobState.CONNECTING, JobState.DOWNLOADING)
 # ilk goruste orneklenmesi gereken durumlar (metrik sayaci tasiyanlar)
 _METRIC_TERMINAL = (JobState.DONE, JobState.ERROR, JobState.CANCELED)
@@ -117,6 +123,13 @@ def _scrub_ephemeral(rec: dict) -> None:
     rec["user"] = ""
     rec["password"] = ""
     rec["url"] = redact_credentials(rec.get("url", ""))
+    # ayna ve merkle URL'leri de userinfo tasiyabilir: hicbiri diskte kalmasin
+    mirrors = rec.get("mirrors")
+    if isinstance(mirrors, list):
+        rec["mirrors"] = [redact_credentials(m) if isinstance(m, str) else m
+                          for m in mirrors]
+    if isinstance(rec.get("merkle"), str):
+        rec["merkle"] = redact_credentials(rec["merkle"])
     # hata metni de URL userinfo'su tasiyabilir: diske kimlik sizmasin
     rec["error"] = _redact_text(rec.get("error") or "")
 
@@ -135,6 +148,11 @@ def _opt_int(value):
         return None
 
 
+def _dispatch_key(job):
+    """Dagitim sirasi: kucuk once, esitlikte eski once (belirlenimci)."""
+    return (job.total if job.total > 0 else float("inf"), job.created)
+
+
 class QueueManager:
     def __init__(self, env: AppEnv, cfg: dict):
         self.env = env
@@ -149,6 +167,19 @@ class QueueManager:
         # plan degisikligi ile tick'in eski plani yeniden uygulamasi
         # yarisamaz (RLock: set_speed_plan tick'i kendisi cagirir)
         self._plan_lock = threading.RLock()
+
+        # is dizini: get()/_dispatch/_start_async O(1) baksin (10 000 isde
+        # her komut listeyi taramaz). _load doldurur; add/remove/reconcile
+        # guncel tutar, dogrudan listeye eklenen isler icin onarilir.
+        self._job_index: dict[str, DownloadJob] = {}
+        # boyut yoklayicisi adaylari: hazir olanlar deque+set'te tutulur,
+        # claim = popleft (is listesi TARANMAZ). _load/add/durum gecisi
+        # besler; kaldirilan islerin kaydi lazy temizlenir (claim dogrular).
+        self._size_probed: set[str] = set()
+        self._probing: set[str] = set()   # su an yoklanan isler
+        self._probe_q: deque = deque()
+        self._probe_set: set[str] = set()
+        self._have_file = False           # queue.json diskte var mi
 
         self._lock = threading.RLock()
         self._listeners: list = []       # degisiklik bildirimi (soket push)
@@ -183,9 +214,12 @@ class QueueManager:
         self._ctl_q: deque = deque()
         self._ctl_cond = threading.Condition()
         self._ctl_stop = False
+        self._ctl_busy = threading.Event()   # bir denetim komutu calisiyor
         self._ctl: threading.Thread | None = None
+        # son taramadan beri baslatilan isler (yuva sayiminda kullanilir;
+        # tarama durumu gorunce temizler)
+        self._started: dict[str, DownloadJob] = {}
         self._probe_evt = threading.Event()
-        self._probing: set[str] = set()   # su an yoklanan isler
         self.last_nm_ping = 0.0
         self.history = open_history(env)
         self._hist_state: dict[str, str] = {}   # is -> yazilmis son durum
@@ -195,7 +229,6 @@ class QueueManager:
         self._rotate_ok = True       # ana dosya -> .prev donusumu guvenli mi
         self._load()
         self._running = True
-        self._size_probed: set[str] = set()
         # start() agi yoklar (timeout + denemeler): tick iplikciginde
         # calistirmak tum kuyrugu kilitler. Baslatmasi parcaciga verilmis
         # isler yuvayi HEMEN tutar (durum 'connecting' olana kadar).
@@ -244,9 +277,14 @@ class QueueManager:
         state = job.state
         # tick uzun uykudaysa hemen uyandir (durum/ilerleme degisikligi)
         self._tick_evt.set()
-        if state == JobState.QUEUED:
-            # boyut yoklayicisi bos tarama yapmasin: olayla uyandirilir
-            self._probe_evt.set()
+        # Kalicilik DEBRONSE dogrudan girer: durum degisikligi tick'in
+        # gormesini beklemez (eskiden ~1.5 sn'ye kadar gecikirdi).
+        with self._lock:
+            self._mark_dirty_locked()
+            if state == JobState.QUEUED:
+                # boyut yoklayicisi bos tarama yapmasin: aday kuyrugu ve
+                # olay birlikte beslenir
+                self._probe_seed_locked(job)
         if state in HISTORY_STATES and self._hist_state.get(job.id) != state:
             self._hist_state[job.id] = state
             try:
@@ -268,25 +306,40 @@ class QueueManager:
             job.state = JobState.PAUSED
         with self._lock:
             self.jobs.append(job)
+            self._job_index[job.id] = job
             self._rev += 1
             self._job_rev[job.id] = self._rev
             self._mutations += 1
             self._mark_dirty_locked()
+            if not paused:
+                self._probe_seed_locked(job)   # boyutu bilinmiyor: yoklanacak
             bulk = bool(self._bulk)
-        if not paused:
-            self._probe_evt.set()            # boyutu bilinmiyor: yoklanacak
         self._tick_evt.set()
-        if not bulk:
+        # P5: tek ekleme de birlesen yaziciya girer (0.5 sn icinde kalici).
+        # Istisna: kuyruk dosyasi hic yoksa (ilk is) hemen yazilir - cokme
+        # durumunda ilk is kaybolmasin.
+        if not bulk and not self._have_file:
             self.flush()
         self._notify(job)
         return job
 
     def get(self, job_id: str) -> DownloadJob | None:
+        """Is kimligiyle O(1) arama (dizin; liste mudahalesinde onarilir)."""
         with self._lock:
-            for j in self.jobs:
-                if j.id == job_id:
-                    return j
-        return None
+            job = self._job_index.get(job_id)
+            if job is not None:
+                return job
+            if len(self._job_index) == len(self.jobs):
+                return None
+            self._reindex_locked()
+            return self._job_index.get(job_id)
+
+    def _reindex_locked(self) -> None:
+        """Is dizinini listeden yeniden kurar (kilit cagiranda).
+
+        Isler dogrudan `jobs` listesine de eklenebilir (testler/olcum
+        tohumlama): boyut uyusmazligi gorulunce indeks burada onarilir."""
+        self._job_index = {j.id: j for j in self.jobs}
 
     def control(self, job_id: str, action: str, delete_files=False) -> bool:
         job = self.get(job_id)
@@ -316,6 +369,8 @@ class QueueManager:
             job.total, job.done = -1, 0
             with self._lock:
                 self._size_probed.discard(job.id)   # yeniden yoklanacak
+                self._started.pop(job.id, None)
+                self._probe_seed_locked(job)
             self._probe_evt.set()
         return True
 
@@ -336,9 +391,9 @@ class QueueManager:
     def _dispatch(self, job_id: str, action: str, delete_files) -> bool:
         # "all" yalniz denetim eylemlerinde gecerli (remove tek is alir)
         all_ok = action != _CTL_REMOVE and job_id == "all"
+        if not all_ok and self.get(job_id) is None:
+            return False
         with self._lock:
-            if not all_ok and not any(j.id == job_id for j in self.jobs):
-                return False
             # kapanista yeni denetim kabul edilmez: isler duraklatilacak
             if self._closed or self._ctl_stop:
                 return False
@@ -361,10 +416,17 @@ class QueueManager:
                     return
                 job_id, action, delete_files = self._ctl_q.popleft()
             try:
-                if action == _CTL_REMOVE:
-                    self.remove(job_id, delete_files)
-                else:
-                    self.control(job_id, action, delete_files)
+                self._ctl_busy.set()
+                try:
+                    if action == _CTL_REMOVE:
+                        self.remove(job_id, delete_files)
+                    else:
+                        self.control(job_id, action, delete_files)
+                finally:
+                    self._ctl_busy.clear()
+                # kapanis bekliyor: komutun sonucu son yazima girsin
+                if self._ctl_stop and not self._closed:
+                    self.flush()
             except Exception:
                 log.warning("denetim komutu basarisiz: %s", action,
                             exc_info=True)
@@ -385,18 +447,41 @@ class QueueManager:
             # duran/hatali is devam etmeyecek: yarim .part, .segs/ ve
             # denetim noktasi kuyruktan cikinca sahipsiz kalirdi
             self._drop_job_files(job)
-            if delete_files:
+            if delete_files and self._may_delete_final(job):
                 try:
                     job.final_path.unlink(missing_ok=True)
                 except Exception:
                     pass
         with self._lock:
-            if job not in self.jobs:        # es zamanli iki remove
+            # es zamanli iki remove: dizin ayni isi gostermiyorsa bitti
+            if self._job_index.get(job.id) is not job:
                 return False
             self.jobs.remove(job)
             self._forget_locked(job)
             self._mark_dirty_locked()
         self._notify()
+        return True
+
+    def _may_delete_final(self, job) -> bool:
+        """Son dosyayi silmek guvenli mi?
+
+        Ayni yola yazan baska CANLI is varsa HAYIR: kullanici ayni URL'yi
+        yeniden eklediyse (ayni dosya adi) uzun suren bir silme yeni isin
+        dosyasini silmemeli."""
+        try:
+            path = job.final_path
+        except OSError:
+            return True
+        with self._lock:
+            jobs = list(self.jobs)
+        for other in jobs:
+            if other is job:
+                continue
+            try:
+                if other.final_path == path:
+                    return False
+            except OSError:
+                continue
         return True
 
     def _forget_locked(self, job) -> None:
@@ -411,11 +496,16 @@ class QueueManager:
         self._hist_state.pop(jid, None)
         self._size_probed.discard(jid)
         self._probing.discard(jid)
+        self._probe_set.discard(jid)
+        self._started.pop(jid, None)
+        self._job_index.pop(jid, None)
         self.metrics.forget(jid)
         self._rev += 1
-        if len(self._removed) >= QUEUE_TOMB_MAX:
-            # en eski kayit dusuyor: ondan eski since'ler artik tam ister
-            self._tomb_floor = max(self._tomb_floor, self._removed[0][0])
+        # sinirli gunluk: yer acmak icin en eski kayitlar dusurulur ve
+        # ondan eski `since`lerin tam gorunum istemesi icin taban ilerler
+        while len(self._removed) >= QUEUE_TOMB_MAX:
+            self._tomb_floor = max(self._tomb_floor,
+                                   self._removed.popleft()[0])
         self._removed.append((self._rev, jid))
         self._job_rev.pop(jid, None)
         self._job_gen.pop(jid, None)
@@ -522,6 +612,9 @@ class QueueManager:
                         continue
                     if prev_state != sig[0]:
                         self._count_state(prev_state, sig[0])
+                        if sig[0] == JobState.QUEUED:
+                            # kuyruga donen is (restart) yoklanmali
+                            self._probe_seed_locked(j)
                         if prev_state in STATES_RUNNING \
                                 and sig[0] not in STATES_RUNNING:
                             # kosu bitti: hiz sifirlanir (update_speed artik
@@ -531,6 +624,16 @@ class QueueManager:
                     hot.append(j)
                 if len(seen) != len(jobs):      # kuyruktan cikan isler
                     self._reconcile_seen(seen, jobs)
+        with self._lock:
+            # dogrudan liste mudahalesi (testler/olcum tohumlama): indeks
+            # boyutu tutmuyorsa canli listeden onarilir
+            if len(self._job_index) != len(self.jobs):
+                self._reindex_locked()
+            if self._started:
+                # baslatilan is artik KUYRUK'ta degilse yuva sayimindan cikar
+                for jid, job in list(self._started.items()):
+                    if job._state != JobState.QUEUED:
+                        del self._started[jid]
         self._idle = not (running or queued or starting)
         return running, queued, hot, changed
 
@@ -561,6 +664,9 @@ class QueueManager:
                 counts.pop(st, None)
             self._job_rev.pop(jid, None)
             self._job_gen.pop(jid, None)
+            self._job_index.pop(jid, None)
+            self._probe_set.discard(jid)
+            self._started.pop(jid, None)
             self.metrics.forget(jid)
 
     def _tick(self):
@@ -579,21 +685,23 @@ class QueueManager:
             if self.cfg.get("smart_queue", True) and slots:
                 # kucuk dosya once: boyutu bilinmeyenleri yoklayici
                 # isaretleyene kadar beklet, sonra kucukten buyuge basla
-                ready = [j for j in queued if j.id in self._size_probed]
                 # yoklamalar paralel: once biten (buyuk) is, kisa sure once
                 # eklenmis ve boyutu henuz bilinmeyen kucuk isin onune
                 # gecmesin. Bekleme SMART_GRACE ile sinirli (yavas yoklama
                 # kuyrugu kilitlemez).
                 now = time.time()
-                if ready and any(j.id not in self._size_probed
-                                 and now - j.created < SMART_GRACE
-                                 for j in queued):
-                    ready = []
-                if ready:
-                    ready.sort(key=lambda j: (j.total if j.total > 0
-                                              else float("inf"), j.created))
-                    for job in ready[:slots]:
-                        self._start_async(job)
+                if any(j.id not in self._size_probed
+                       and now - j.created < SMART_GRACE for j in queued):
+                    ready = ()
+                else:
+                    # hazir islerin TAMAMI siralanmaz: yalniz en kucuk
+                    # `slots` kadari secilir (nsmallest: O(n log k))
+                    ready = heapq.nsmallest(
+                        slots,
+                        (j for j in queued if j.id in self._size_probed),
+                        key=_dispatch_key)
+                for job in ready:
+                    self._start_async(job)
             elif slots:
                 for job in queued[:slots]:
                     self._start_async(job)
@@ -627,14 +735,18 @@ class QueueManager:
         kaldirildiysa ya da duraklatildiysa (artik KUYRUK'ta degilse)
         baslatilmaz - aksi halde 'silinen' is indirmeye devam ederdi."""
         with self._lock:
-            if not any(j is job for j in self.jobs) \
+            if self._job_index.get(job.id) is not job \
                     or job.state != JobState.QUEUED:
                 return False
-            busy = len({j.id for j in self.jobs if j.state in STATES_RUNNING}
-                       | self._starting)
+            # sayim: tick'in durum sayaclari + bu taramadan beri baslatilan
+            # (henuz sayaca girmemis) isler. Is listesi TARANMAZ.
+            busy = (self._state_counts.get(JobState.CONNECTING, 0)
+                    + self._state_counts.get(JobState.DOWNLOADING, 0)
+                    + len(self._started))
             if busy >= int(self.cfg.get("max_concurrent", 3)):
                 return False
             self._starting.add(job.id)
+            self._started[job.id] = job
         try:
             threading.Thread(target=self._run_start, args=(job,), daemon=True,
                              name=f"ferdim-start-{job.id}").start()
@@ -650,7 +762,7 @@ class QueueManager:
             # parcacik onu baslatmaz (remove(): _starting'den dusurur)
             with self._lock:
                 if job.id not in self._starting \
-                        or not any(j is job for j in self.jobs) \
+                        or self._job_index.get(job.id) is not job \
                         or job.state != JobState.QUEUED:
                     return
             job.start(queued_only=True)
@@ -659,6 +771,9 @@ class QueueManager:
         finally:
             with self._lock:
                 self._starting.discard(job.id)
+                if job._state == JobState.QUEUED:
+                    # baslatma tutmadi (hata/iptal): yuva sayimindan cikar
+                    self._started.pop(job.id, None)
 
     # ------------------------------------------------------- birlikte yasam
     def _coexist_tick(self, running=None):
@@ -987,6 +1102,7 @@ class QueueManager:
                         pass
                 util.atomic_write_json(path, data)
                 with self._lock:
+                    self._have_file = True
                     if not self._dirty:
                         return True
             return True
@@ -1070,6 +1186,10 @@ class QueueManager:
                 skipped += 1
                 continue
             self.jobs.append(job)
+            self._job_index[job.id] = job
+            if job.state == JobState.QUEUED and job.total < 0:
+                # boyutu bilinmeyen kuyruk isi: yoklama adayi
+                self._probe_seed_locked(job)
         if skipped:
             self._warn_state(f"{skipped} bozuk kuyruk kaydi atlandi")
         if self.state_warning:
@@ -1079,6 +1199,7 @@ class QueueManager:
                 self._save()
             except Exception as exc:
                 log.warning("onarilmis kuyruk yazilamadi: %s", exc)
+        self._have_file = path.exists()
 
     def _load_prev(self, prev) -> list:
         """Son iyi kopyayi okur; o da bozuksa silinir (sonsuz dongu olmasin)."""
@@ -1252,15 +1373,20 @@ class QueueManager:
                     self._job_rev[jid] = self._rev
             rev = self._rev if stable else rev_floor
             total = len(self.jobs)
+            # silme gunlugu sinirlidir (<= QUEUE_TOMB_MAX): kopyasi ucuz,
+            # suzme kilit DISINDA yapilir
+            tomb = tuple(self._removed)
             if since is None or not stable or since > rev \
                     or since < self._tomb_floor:
                 # tam gorunum: ilk istek, bayat since ya da geri sarmis rev
-                full, removed, picked = True, [], snaps
+                full, picked, removed = True, snaps, []
             else:
                 full = False
-                removed = [jid for r, jid in self._removed if r > since]
                 picked = [s for s in snaps
                           if self._job_rev.get(s["id"], 0) > since]
+                removed = None
+        if removed is None:
+            removed = [jid for r, jid in tomb if r > since]
         jobs_page = picked[offset:] if offset else picked
         if limit is not None:
             jobs_page = jobs_page[:limit]
@@ -1330,20 +1456,34 @@ class QueueManager:
             finally:
                 self._probe_release(job)
 
+    def _probe_seed_locked(self, job) -> None:
+        """Yoklama adayini kuyruga ekler (kilit cagiranda, O(1)).
+
+        Aday kuyrugu is listesinden bagimsizdir: 10 000 KUYRUK isinde
+        claim her seferinde listeyi bastan taramaz."""
+        if job.id in self._probe_set or not self._probe_ready(job):
+            return
+        self._probe_set.add(job.id)
+        self._probe_q.append(job)
+        self._probe_evt.set()
+
     def _probe_pending(self) -> bool:
-        """Yoklanacak is var mi (kilit altinda, ayirma yapmaz)."""
+        """Yoklanacak aday var mi (kilit altinda, ayirma yapmaz)."""
         with self._lock:
-            return any(self._probe_ready(j) for j in self.jobs)
+            return bool(self._probe_q)
 
     def _probe_claim(self):
-        """Yoklanacak isi ayirir (kimligi _probing'e yazar)."""
+        """Siradaki adayi ayirir (O(1) popleft; bayat kayitlar atlanir)."""
         with self._lock:
             if not self._running:
                 return None
-            for j in self.jobs:
-                if self._probe_ready(j):
-                    self._probing.add(j.id)
-                    return j
+            while self._probe_q:
+                job = self._probe_q.popleft()
+                self._probe_set.discard(job.id)
+                if not self._probe_ready(job):
+                    continue            # durum degisti/islendi: atla
+                self._probing.add(job.id)
+                return job
         return None
 
     def _probe_ready(self, job) -> bool:
@@ -1357,7 +1497,7 @@ class QueueManager:
         with self._lock:
             self._probing.discard(job.id)
             # kaldirilan isin kimligi _size_probed'de kalmasin (sizinti)
-            if any(j is job for j in self.jobs):
+            if self._job_index.get(job.id) is job:
                 self._size_probed.add(job.id)
 
     def _probe_job(self, job) -> None:
@@ -1399,10 +1539,13 @@ class QueueManager:
         with self._ctl_cond:
             self._ctl_cond.notify_all()
         self._probe_evt.set()
-        # calisan denetim komutu (orn. iptal join'i) bitsin: son yazim onu
-        # da kapsasin. Sinirli bekleme: kapanis yavasliga takilmaz.
-        if self._ctl is not None:
-            self._ctl.join(2.0)
+        self._tick_evt.set()
+        # CALISAN denetim komutu (iptal join'i, silme) bitsin: aksi halde
+        # kuyruktan cikan is son yazimdan SONRA dusup yeniden baslatmada
+        # geri gelirdi. Ilk bekleme kisa; duraklatmadan sonra kalan butce
+        # kadar bir kez daha beklenir. Ikisi de sinirli: kapanis asla
+        # sinirsiz beklemez.
+        self._join_ctl(QUEUE_CTL_FIRST_WAIT)
         with self._lock:
             jobs = list(self.jobs)
             # baslatmasi yeni dagitilmis isler de durdurulur: aksi halde
@@ -1411,13 +1554,28 @@ class QueueManager:
         for j in jobs:
             if j.state in STATES_RUNNING or j.id in starting:
                 j.pause()
-        # son soz diskte: kapanistan sonra yazim yok (_closed)
-        self.flush()
+        # duraklatma sirasinda hala calisan denetim varsa (uzun iptal)
+        # bitmesini bekle: sonucu son yazim kapsamali
+        if self._ctl_busy.is_set():
+            self._join_ctl(QUEUE_CTL_TAIL_WAIT)
+        # son soz diskte: kapanistan sonra yazim yok (_closed). Bu arada
+        # denetim iscisi bir sey degistirdiyse (kirli bayrak) yazim
+        # yinelenir.
+        for _attempt in range(3):
+            self.flush()
+            with self._lock:
+                if not self._dirty and not self._ctl_busy.is_set():
+                    break
         with self._lock:
             self._closed = True
         self._save_evt.set()
         if self._saver is not None:
             self._saver.join(2.0)
+
+    def _join_ctl(self, timeout: float) -> None:
+        """Denetim iscisini sinirli sure bekler (kapanis yardimcisi)."""
+        if self._ctl is not None:
+            self._ctl.join(max(0.0, timeout))
 
 
 def _version():
