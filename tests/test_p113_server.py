@@ -101,16 +101,23 @@ def wait_for(pred, timeout=20.0, step=0.01) -> bool:
 
 
 class LineReader:
-    """Soketten satir/blok okuyan kucuk yardimci (sinirli zaman asimi)."""
+    """Soketten satir/blok okuyan kucuk yardimci (sinirli zaman asimi).
+
+    Tampon OKUYUCUYA aittir: ayni okuyucu once HTTP basligini (`\r\n\r\n`)
+    sonra SSE bloklarini (`\n\n`) okursa, tek `recv`te gelen govde
+    KAYBOLMAZ. Baslik icin ayri bir okuyucu kurup ates etmek, yuklu
+    makinelerde ilk kareyi cope atiyordu (baslik + kare tek pakette
+    gelir): ayirici bu yuzden cagri basina verilir."""
 
     def __init__(self, sock: socket.socket, sep=b"\n"):
         self.sock = sock
         self.sep = sep
         self.buf = b""
 
-    def block(self, timeout=20.0) -> bytes:
+    def block(self, timeout=20.0, sep=None) -> bytes:
+        sep = sep or self.sep
         end = time.monotonic() + timeout
-        while self.sep not in self.buf:
+        while sep not in self.buf:
             left = end - time.monotonic()
             if left <= 0:
                 raise TimeoutError("blok gelmedi")
@@ -119,7 +126,7 @@ class LineReader:
             if not part:
                 raise EOFError("akis kapandi")
             self.buf += part
-        head, _, self.buf = self.buf.partition(self.sep)
+        head, _, self.buf = self.buf.partition(sep)
         return head
 
     def eof(self, timeout=20.0) -> bool:
@@ -135,6 +142,44 @@ class LineReader:
             if not part:
                 return True
         return False
+
+
+class StreamFramingTests(unittest.TestCase):
+    """Baslik + ilk kare TEK pakette gelse de kare kaybolmaz.
+
+    Distro derleyicilerinde (tek cekirdek, yuklu) olan tam olarak buydu:
+    baslik icin kurulan gecici okuyucu, ayni `recv`te gelen ilk SSE
+    karesini de yutuyordu; istemci ancak iki yazma bitince uyandigi icin
+    kare 20 sn'lik beklemeye ragmen hic gelmiyordu."""
+
+    def test_01_shared_buffer_keeps_frame_from_same_packet(self):
+        a, b = socket.socketpair()
+        try:
+            b.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: "
+                      b"text/event-stream\r\n\r\n"
+                      b'event: stats\ndata: {"ok": true, "jobs": []}\n\n')
+            reader = LineReader(a, sep=b"\r\n\r\n")
+            head = reader.block(20.0)
+            self.assertIn(b" 200 ", head.split(b"\r\n")[0])
+            # tampon paylasilir: kare zaten okunmus paketin icinde
+            frame = _SseFrames(reader=reader).next(2.0)
+            self.assertEqual(frame, {"ok": True, "jobs": []})
+        finally:
+            a.close()
+            b.close()
+
+    def test_02_body_after_headers_is_not_lost_either(self):
+        a, b = socket.socketpair()
+        try:
+            b.sendall(b"HTTP/1.1 503 Busy\r\nContent-Length: 7\r\n\r\n"
+                      b'{"ok":0}')
+            reader = LineReader(a, sep=b"\r\n\r\n")
+            head = reader.block(20.0)
+            self.assertIn(b" 503 ", head.split(b"\r\n")[0])
+            self.assertEqual(reader.buf, b'{"ok":0}')    # govde tamponda
+        finally:
+            a.close()
+            b.close()
 
 
 class _StubSock:
@@ -766,15 +811,21 @@ class HubTests(unittest.TestCase):
 
 
 class _SseFrames:
-    """SSE bloklarini ayristiran okuyucu (event/data alanlari)."""
+    """SSE bloklarini ayristiran okuyucu (event/data alanlari).
 
-    def __init__(self, sock):
-        self.reader = LineReader(sock, sep=b"\n\n")
+    `reader` verilirse tampon PAYLASILIR (HTTP basligini okuyan okuyucu):
+    baslikla ayni pakette gelen ilk kare boylece kaybolmaz."""
+
+    def __init__(self, sock=None, reader=None):
+        self.reader = reader if reader is not None else LineReader(sock)
+
+    def _block(self, timeout: float) -> bytes:
+        return self.reader.block(timeout, sep=b"\n\n")
 
     def next(self, timeout=20.0) -> dict:
         end = time.monotonic() + timeout
         while True:
-            block = self.reader.block(max(0.01, end - time.monotonic()))
+            block = self._block(max(0.01, end - time.monotonic()))
             data = []
             for line in block.decode("utf-8").split("\n"):
                 if line.startswith("data:"):
@@ -786,7 +837,7 @@ class _SseFrames:
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             try:
-                block = self.reader.block(max(0.01, end - time.monotonic()))
+                block = self._block(max(0.01, end - time.monotonic()))
             except TimeoutError:
                 return False
             if block.lstrip().startswith(b":"):
@@ -921,6 +972,16 @@ class _WebCase(unittest.TestCase):
         sock.sendall(_http(self.port, path, token, self.host))
         return sock
 
+    def _open_stream(self, token=TOKEN, path="/api/events"):
+        """Akis acar: (soket, baslik, kare_okuyucu).
+
+        Baslik ve ilk kare TEK `recv`te gelebilir: kare okuyucu basligi
+        okuyan okuyucunun tamponunu PAYLASIR, boylece ilk kare atilmaz."""
+        sock = self._open(token, path)
+        reader = LineReader(sock, sep=b"\r\n\r\n")
+        head = reader.block(20.0)
+        return sock, head, _SseFrames(reader=reader)
+
 
 class EventsEndpointTests(_WebCase):
     def test_01_requires_token(self):
@@ -931,11 +992,9 @@ class EventsEndpointTests(_WebCase):
         self.assertNotIn(b"text/event-stream", head)
 
     def test_02_streams_full_then_delta_and_ends_on_shutdown(self):
-        sock = self._open()
-        header = LineReader(sock, sep=b"\r\n\r\n").block(20.0)
+        sock, header, frames = self._open_stream()
         self.assertIn(b" 200 ", header.split(b"\r\n")[0])
         self.assertIn(b"text/event-stream", header)
-        frames = _SseFrames(sock)
         first = frames.next()
         self.assertTrue(first["full"])
         self.assertEqual([j["id"] for j in first["jobs"]], ["a"])
@@ -951,7 +1010,7 @@ class EventsEndpointTests(_WebCase):
 
         # sunucu kapanisi akisi bitirir (istek is parcacigi sizmaz)
         self.hub.stop()
-        self.assertTrue(LineReader(sock, sep=b"\n\n").eof(20.0))
+        self.assertTrue(frames.reader.eof(20.0))
 
     def test_03_no_token_in_url(self):
         # token yalniz basliktadir: sorgu dizesi kimlik dogrulamaz
@@ -973,10 +1032,9 @@ class SseCapTests(_WebCase):
     hub_kwargs = {"interval": 0.01, "heartbeat": 0.05, "max_sse": 1}
 
     def test_01_second_stream_rejected(self):
-        first = self._open()
-        head = LineReader(first, sep=b"\r\n\r\n").block(20.0)
+        first, head, frames = self._open_stream()
         self.assertIn(b" 200 ", head.split(b"\r\n")[0])
-        _SseFrames(first).next()               # kayit oturdu
+        frames.next()                          # kayit oturdu
         self.assertEqual(self.hub.count(), 1)
         second = self._open()
         rd2 = LineReader(second, sep=b"\r\n\r\n")
