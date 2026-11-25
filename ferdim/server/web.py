@@ -12,7 +12,9 @@ token'a cevrilir. Bilet yalniz Unix soketindeki `web-session` komutundan
 gelir; sayfayi okuyabilen baska bir yerel kullanici API'yi kullanamaz.
 /api/i18n herkese aciktir (ceviri metinleri gizli degil); diger /api ve
 /metrics cagrilari X-FerDim-Token ister (bayt bazinda sabit zamanli
-karsilastirma, paylasilan tutucudan okunur). Yazma amacli POST /api
+karsilastirma, paylasilan tutucudan okunur). /api/events bir SSE akisidir:
+EventSource baslik gonderemedigi icin web arayuzu fetch ile okur, token
+yine BASLIKTADIR (sorgu dizesine konmaz). Yazma amacli POST /api
 cagrilarinda Origin de yerel olmali; curl gibi Origin gondermeyen istemciler
 token ile gecer. Govde 1 MiB ile sinirlidir ve application/json ister; erken
 retler baglantiyi kapatir, boylece okunmamis govde bir sonraki istegin
@@ -32,8 +34,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import api
 from .. import metrics as _metrics
+from . import hub as _hub
 
 MAX_BODY = 1024 * 1024       # 1 MiB: API govdesi
+# GET /api/stats sorgu parametreleri: fark kareleri (since) ve sayfalama.
+# Baska parametre gecirilmez (istemci ne isterse sunucuya aktarilmaz).
+STATS_PARAMS = ("since", "limit", "offset")
 LOG = logging.getLogger("ferdim")
 _SELF_UID = os.getuid()
 _PEER_WARNED = threading.Event()
@@ -124,6 +130,27 @@ def _warn_peer_unknown() -> None:
         _PEER_WARNED.set()
         LOG.warning("peer uid okunamadi (/proc/net/tcp); HTTP istekleri "
                     "reddediliyor")
+
+
+def stats_params(query: str) -> dict:
+    """`/api/stats` sorgu parametreleri: yalniz since/limit/offset.
+
+    Degerler sayiya cevrilebiliyorsa int olur (api tarafi da kabul eder);
+    bozuk/bos deger yok sayilir. Saf islev: istek isleyicisinden ayri test
+    edilir (bkz. tests/test_p113_server.py)."""
+    qs = parse_qs(query)
+    out = {}
+    for key in STATS_PARAMS:
+        if key not in qs:
+            continue
+        raw = (qs[key] or [""])[0].strip()
+        if not raw:
+            continue
+        try:
+            out[key] = int(raw)
+        except ValueError:
+            continue
+    return out
 
 
 def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
@@ -245,6 +272,37 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
                 LOG.exception("HTTP API hatasi: %s", cmd)
                 self._send_json({"ok": False, "code": "internal"}, 500)
 
+        def _serve_events(self):
+            """SSE akisi: kareler ortak merkezden (hub) gelir.
+
+            Basliklar bu is parcaciginda yazilir; sonra soket itici
+            parcaciga devredilir ve bu is parcacigi yalnizca akis bitene
+            kadar bekler. Istemci kaybolursa yazma butcesi dolar, merkez
+            baglantiyi kapatir: is parcacigi sizmaz."""
+            hub = getattr(self.server, "hub", None)
+            if hub is None:
+                self._deny(404, "bulunamadi")
+                return
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.wfile.flush()
+            # yazma asimi: soket zaman asimi tek send()'i sinirlar, kare
+            # butcesini merkez uygular (okuma yok, is parcacigi beklemede)
+            try:
+                self.connection.settimeout(_hub.SEND_TIMEOUT)
+            except OSError:
+                pass
+            client = hub.add_sse(self.connection)
+            try:
+                client.wait_closed()
+            finally:
+                hub.remove_client(client)
+
         # ------------------------------------------------------------ routes
         def do_GET(self):
             if not self._peer_ok():
@@ -273,6 +331,13 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
                     return
                 self._send_text(_metrics.render(ctx["qm"]),
                                 "text/plain; version=0.0.4; charset=utf-8")
+            elif u.path == "/api/events":
+                # SSE: EventSource baslik gonderemez, arayuz fetch ile okur;
+                # token sorgu dizesine ASLA konmaz (baslik zorunlu).
+                if not self._authorized():
+                    self._deny(401, "yetkisiz")
+                    return
+                self._serve_events()
             elif u.path == "/api/i18n":
                 # ceviri metinleri gizli degil: token'siz okunabilir. Sayfa
                 # "oturum yok" iletisimini de bu sozlukten kurar.
@@ -282,10 +347,13 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
                 if not self._authorized():
                     self._deny(401, "yetkisiz")
                     return
+                if u.path in ("/api/stats", "/api/jobs"):
+                    # fark kareleri: {"since": rev, "limit", "offset"} —
+                    # web arayuzu 10 000 iste yalniz degisenleri tasir
+                    self._reply("stats", stats_params(u.query))
+                    return
                 cmd = {
                     "/api/version": "version",
-                    "/api/stats": "stats",
-                    "/api/jobs": "stats",
                     "/api/config": "config-get",
                 }.get(u.path)
                 if not cmd:
@@ -383,6 +451,8 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
         try:
             httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
             httpd.daemon_threads = True
+            # SSE istemcileri soket sunucusuyla AYNI merkezi kullanir
+            httpd.hub = _hub.for_ctx(ctx)
             return httpd
         except OSError:
             continue

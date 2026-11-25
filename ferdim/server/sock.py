@@ -1,10 +1,17 @@
-"""Unix socket JSON-satir RPC sunucusu + watch bildirimleri."""
+"""Unix socket JSON-satir RPC sunucusu + watch bildirimleri.
+
+Yayin (watch) is parcaciklarinin isi DEGILDIR: `qm` dinleyicisi yalnizca
+ortak merkeze (`hub.Hub`) bayrak kaldirir; tek itici parcacik istatistigi
+en fazla 0.25 sn'de bir hesaplar ve her izleyicinin tek yuvali kuyruguna
+birakir. Yavas bir istemci ne is parcaciklarini ne de diger izleyicileri
+bloklar; butcesini asan baglanti kapatilir."""
 from __future__ import annotations
 
 import json
 import os
 import socketserver
-import threading
+
+from . import hub as _hub
 
 MAX_RPC_LINE = 1024 * 1024   # tek satir istek: 1 MiB (bellek sinirsiz buyumesin)
 
@@ -45,8 +52,10 @@ class _Handler(socketserver.StreamRequestHandler):
                 # gidiyordu ve hicbir zaman islemiyordu.
                 req_id = msg.pop("req_id", None)
                 if cmd == "watch":
-                    watcher = self.wfile
-                    server.register_watcher(self.wfile)
+                    # yazma itici parcacigin isi: bu is parcacigi yalnizca
+                    # okumaya devam eder, yavas istemci onu bloklamaz
+                    if watcher is None:      # ikinci 'watch' yeni kayit acmaz
+                        watcher = server.register_watcher(self.connection)
                     continue
                 from .. import api
                 try:
@@ -74,8 +83,6 @@ class SockServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
     def __init__(self, path: str, ctx: dict):
         self.ctx = ctx
-        self._watch_lock = threading.Lock()
-        self._watchers: list = []
         try:
             os.unlink(path)
         except FileNotFoundError:
@@ -88,46 +95,23 @@ class SockServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         finally:
             os.umask(old)
         os.chmod(path, 0o600)
-        qm = ctx["qm"]
-        qm.add_listener(self._on_change)
-        # periyodik stats itmesi (GUI/CLI watch)
-        self._push_thread = threading.Thread(target=self._push_loop,
-                                             daemon=True)
-        self._push_thread.start()
+        # soket ve HTTP sunucusu AYNI merkezi paylasir (ctx["hub"]): iki ayri
+        # itici parcacik istatistigi iki kez hesaplamaz. Soket baglandiktan
+        # SONRA kurulur: baglama basarisizsa bos parcacik baslatilmaz.
+        self.hub: _hub.Hub = _hub.for_ctx(ctx)
 
-    def register_watcher(self, wfile):
-        with self._watch_lock:
-            self._watchers.append(wfile)
+    def register_watcher(self, sock):
+        """Izleyiciyi merkeze baglar; donen nesne kapatma tutamacidir."""
+        return self.hub.add_client(sock, name="sock-watch")
 
-    def unregister_watcher(self, wfile):
-        with self._watch_lock:
-            if wfile in self._watchers:
-                self._watchers.remove(wfile)
+    def unregister_watcher(self, client):
+        if client is not None:
+            self.hub.remove_client(client)
 
-    def _on_change(self, _job=None):
-        self._push()
-
-    def _push_loop(self):
-        import time
-        while True:
-            time.sleep(1.0)
-            self._push()
-
-    def _push(self):
-        from .. import api
+    def shutdown(self):
         try:
-            stats = api.handle(self.ctx, "stats", {})
-        except Exception:
-            return
-        line = (json.dumps({"event": "stats", **stats},
-                           ensure_ascii=False) + "\n").encode()
-        with self._watch_lock:
-            dead = []
-            for w in self._watchers:
-                try:
-                    w.write(line)
-                    w.flush()
-                except Exception:
-                    dead.append(w)
-            for w in dead:
-                self._watchers.remove(w)
+            super().shutdown()
+        finally:
+            # izleyici kuyruklari ve SSE akislari kapansin: daemon kapanisi
+            # bekleyen bir yazma yuzunden askida kalmasin
+            self.hub.stop()

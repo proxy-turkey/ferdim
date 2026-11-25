@@ -14,21 +14,33 @@ const ACTIONS = [["resume", "act_resume", "▶"], ["pause", "act_pause", "⏸"],
                  ["remove", "act_remove", "🗑"]];
 const DIGEST_LEN = { sha256: 64, sha512: 128, md5: 32, sha1: 40 };
 const ARCH_RE = /\.(zip|tar|tgz|tbz2|txz|tar\.(gz|xz|bz2|zst))$/i;
-const HIST_MAX = 240;       // 500 ms tarama -> 2 dakikalik grafik penceresi
-const HIST_SEC = 120;       // HIST_MAX * 0.5 sn
+const HIST_MAX = 240;       // ring derinligi (ornek sayisi)
+const HIST_GAP = 500;       // en kucuk ornek araligi (ms)
+/* 10 000 is: yalniz gorunen satirlar cizilir (pencere + dolgu). */
+const VIRTUAL_MIN = 120;    // bu sayidan fazla satirda pencere kullanilir
+const OVERSCAN = 8;         // pencere ustu/alti fazladan satir
+const ROW_EST = 64;         // olculmemis satir yuksekligi tahmini (px)
+const HIST_PAGE = 100;      // gecmis sayfasi
 
 let T = {};                 // aktif ceviri sozlugu
 let LANG = localStorage.getItem("ferdimLang") || "";
 let jobs = [], cfg = {}, filter = "all", lastStats = {};
+let jobIndex = new Map();   // is kimligi -> jobs icindeki sira (sabit sira)
+let rev = 0;                // gorulen son istatistik rev'i (0 = tam kare)
 let histTimer = 0;          // gecmis aramasi icin bekleme
 let states = new Map();     // is kimligi -> onceki durum (duyuru icin)
 let primed = false;         // ilk tarama yapildi mi (ilk tarama duyurulmaz)
 let stateWarned = false;    // durum kurtarma uyarisi bir kez gosterilir
 let polling = false;
 const rows = new Map();     // is kimligi -> satir ogeleri
+const heights = new Map();  // is kimligi -> olculen satir yuksekligi (px)
+let avgH = ROW_EST;         // olculen satirlarin ortalamasi (dolgu tahmini)
+let virtualOn = false;      // pencere modu etkin mi (kaydirma yeniden cizer)
 const histSpeed = [];       // toplam hiz ornekleri (ring)
 const histConn = [];        // acik baglanti sayisi ornekleri (ring)
+const histT = [];           // histSpeed ile hizali ornek zamanlari (ms)
 const jobHist = new Map();  // is kimligi -> hiz ornekleri; is kaybolunca silinir
+let lastSample = 0;         // son ornek zamani (ms)
 
 const CAT_ICON = { video: "🎬", music: "🎵", compressed: "🗜",
                    program: "📦", document: "📄", other: "" };
@@ -137,6 +149,9 @@ function checksumOk(s) {
 }
 /* '2:00' -> '02:00' (type=time yalniz iki basamakli saati kabul eder) */
 const hm = (s) => (/^\d:/.test(s || "") ? "0" + s : (s || ""));
+/* epoch saniye -> yerel saat HH:MM:SS (Retry-After kapisi) */
+const clock = (epoch) => new Date(epoch * 1000).toLocaleTimeString([], {
+  hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 
 /* ------------------------------------------------------------- grafikler */
 /* Grafikler yalniz yeni tarama verisi geldiginde yeniden cizilir; araya
@@ -208,13 +223,26 @@ function pushHist(arr, v) {
   if (arr.length > HIST_MAX) arr.shift();
 }
 
-/* her basarili taramada ornek alir; kaybolan islerin gecmisi silinir */
-function sampleHistory() {
+/* grafik penceresi: en eski ve en yeni ornek arasindaki gercek sure (sn).
+ * Kareler degisiklikte 4 Hz, bosta 1 Hz gelir; yalan bir "120 sn" yazmaktansa
+ * olculen aralik gosterilir. */
+function windowSec() {
+  if (histT.length < 2) return 0;
+  return Math.max(1, Math.round((histT[histT.length - 1] - histT[0]) / 1000));
+}
+
+/* her basarili karede ornek alinir (en fazla HIST_GAP'te bir); kaybolan
+ * islerin gecmisi silinir. Mini grafik yalniz inen isler icin tutulur:
+ * 10 000 iste is basina ring bellek sisirmez. */
+function sampleHistory(now) {
+  if (now - lastSample < HIST_GAP) return;
+  lastSample = now;
   let conns = 0;
   const live = new Set();
   for (const j of jobs) {
     live.add(j.id);
     conns += j.segments || 0;
+    if (!(j.state === "downloading" || j.state === "connecting")) continue;
     const h = jobHist.get(j.id) || [];
     pushHist(h, j.speed || 0);
     jobHist.set(j.id, h);
@@ -222,6 +250,7 @@ function sampleHistory() {
   for (const id of jobHist.keys()) if (!live.has(id)) jobHist.delete(id);
   pushHist(histSpeed, Number(lastStats.total_speed) || 0);
   pushHist(histConn, conns);
+  pushHist(histT, now);
 }
 
 function updateGraphs() {
@@ -231,10 +260,11 @@ function updateGraphs() {
   const peakConn = drawLine($("#connGraph"), histConn, cssColor("--ok"), true);
   $("#graphSpeedNow").textContent = rate(curSpeed);
   $("#graphConnNow").textContent = String(curConn);
+  const sec = windowSec();
   $("#speedGraph").setAttribute("aria-label", trf("graph_speed_a11y",
-    { cur: rate(curSpeed), peak: rate(peakSpeed), sec: HIST_SEC }));
+    { cur: rate(curSpeed), peak: rate(peakSpeed), sec }));
   $("#connGraph").setAttribute("aria-label", trf("graph_conn_a11y",
-    { cur: curConn, peak: peakConn, sec: HIST_SEC }));
+    { cur: curConn, peak: peakConn, sec }));
 }
 
 async function api(path, body) {
@@ -247,8 +277,7 @@ async function api(path, body) {
   if (r.status === 401) {
     // token dondurulmus/gecersiz: sekmedeki kopyayi at, sayfa yeniden yuklenir
     // ve "oturum baglantisi" iletisini gosterir (sonsuz dongu yok)
-    sessionStorage.removeItem("ferdimToken");
-    location.reload();
+    expireSession();
     return {};
   }
   return r.json();
@@ -304,8 +333,16 @@ function notesFor(j) {
   const out = [];
   if (j.adaptive && j.adaptive < j.segments_cfg)
     out.push(["info", "⚙ " + trf("adaptive_limit", j.adaptive)]);
-  if (j.state === "error" && (j.error || j.error_code))
-    out.push(["bad", "⚠ " + errText(j.error_code, j.error)]);
+  // yeniden baslatmada duraklatilmis is: neden `error`/`error_code` icinde
+  // saklanir (or. fd tukenmesi); kullanici neden bekledigini gormeli
+  if ((j.error || j.error_code) && (j.state === "error" || j.state === "paused"))
+    out.push([j.state === "error" ? "bad" : "warn",
+              "⚠ " + (j.state === "paused"
+                      ? tr("st_paused") + ": " + errText(j.error_code, j.error)
+                      : errText(j.error_code, j.error))]);
+  // 429/503 kapisi: is bekliyorsa devam saati gosterilir (duvar saati)
+  if (j.retry_after_until)
+    out.push(["info", "⏱ " + trf("retry_at", { t: clock(j.retry_after_until) })]);
   if (j.sched_wait && j.window)
     out.push(["info", "⏱ " + trf("sched_wait", { w: j.window })]);
   if (j.sources_dead > 0)
@@ -342,7 +379,7 @@ function buildRow(j) {
   r.bar = dom("div", { class: "bar", role: "progressbar",
                        "aria-valuemin": "0", "aria-valuemax": "100",
                        "aria-label": tr("a11y_progress") }, r.fill, r.plabel);
-  r.root = dom("div", { class: "row", role: "row" },
+  r.root = dom("div", { class: "row", role: "row", "data-job": j.id },
     dom("div", { class: "c-file", role: "cell" },
       dom("div", { class: "name" }, r.cat, r.name), r.notes, r.url),
     dom("div", { class: "c-prog", role: "cell" }, r.bar),
@@ -408,11 +445,81 @@ function updateRow(r, j) {
     !(j.state === "done" && ARCH_RE.test(j.filename || ""));
 }
 
-/* anahtarli guncelleme: satirlar yerinde degisir, klavye odagi korunur */
+/* ------------------------------------------------------ yeni kare uygulama
+ * Sunucu rev/full/removed/total_jobs dondururse fark kareleri uygulanir;
+ * rev yoksa (eski sunucu) her kare tamdir. Sira sunucunun ekleme sirasidir:
+ * bilinmeyen kimlik sona eklenir, `removed` listeden duser. Sayim
+ * tutmuyorsa bir kare kacmis demektir: sonraki kare tam istenir. */
+function replaceJobs(list) {
+  jobs = list.slice();
+  jobIndex = new Map();
+  jobs.forEach((j, i) => jobIndex.set(j.id, i));
+  const ids = new Set(jobIndex.keys());
+  for (const [id, r] of rows) {
+    if (!ids.has(id)) { r.root.remove(); rows.delete(id); }
+  }
+  for (const id of jobHist.keys()) if (!ids.has(id)) jobHist.delete(id);
+  for (const id of heights.keys()) if (!ids.has(id)) heights.delete(id);
+}
+
+function dropJobs(removed) {
+  const drop = new Set(removed);
+  for (const id of drop) jobIndex.delete(id);
+  jobs = jobs.filter((j) => !drop.has(j.id));
+  jobIndex.clear();
+  jobs.forEach((j, i) => jobIndex.set(j.id, i));   // toplu silmede tek gecis
+  for (const id of drop) {
+    const r = rows.get(id);
+    if (r) { r.root.remove(); rows.delete(id); }
+    jobHist.delete(id);
+    heights.delete(id);
+  }
+}
+
+function applyStats(s) {
+  if (!s || !s.ok) return false;
+  const incoming = Array.isArray(s.jobs) ? s.jobs : [];
+  const isFull = !Number.isInteger(s.rev) || s.full !== false;
+  if (isFull) {
+    replaceJobs(incoming);
+  } else {
+    if (Array.isArray(s.removed) && s.removed.length) dropJobs(s.removed);
+    for (const j of incoming) {
+      const i = jobIndex.get(j.id);
+      if (i === undefined) { jobIndex.set(j.id, jobs.length); jobs.push(j); }
+      else jobs[i] = j;                       // yerinde guncelleme
+    }
+  }
+  let next = Number.isInteger(s.rev) ? s.rev : 0;
+  if (!isFull && Number.isInteger(s.total_jobs) && s.total_jobs !== jobs.length)
+    next = 0;                                 // kacan kare: tam kare iste
+  rev = next;
+  const top = Object.assign({}, s);
+  delete top.jobs;
+  delete top.removed;
+  lastStats = Object.assign(lastStats, top);
+  return true;
+}
+
+/* ------------------------------------------------------------------ satir */
+/* anahtarli guncelleme: satirlar yerinde degisir, klavye odagi korunur.
+ * Kucuk listelerde butun satirlar cizilir; VIRTUAL_MIN uzerinde yalniz
+ * gorunen pencere cizilir (10 000 iste DOM kucuk kalir). */
 function render() {
-  const list = $("#jobList");
   const vis = jobs.filter((j) => filter === "all" || j.category === filter);
   $("#empty").hidden = vis.length > 0;
+  if (vis.length < VIRTUAL_MIN) {
+    virtualOn = false;
+    removePads();
+    renderAll(vis);
+    return;
+  }
+  virtualOn = true;
+  renderWindow(vis);
+}
+
+function renderAll(vis) {
+  const list = $("#jobList");
   let cursor = list.firstChild;
   for (const j of vis) {
     let r = rows.get(j.id);
@@ -429,6 +536,108 @@ function render() {
   for (const [id, r] of rows) {
     if (!keep.has(id)) { r.root.remove(); rows.delete(id); }
   }
+}
+
+const rowH = (id) => heights.get(id) || avgH;
+
+/* kaydirma konumuna gore cizilecek satir araligi [lo, hi) */
+function windowRange(vis) {
+  const main = document.querySelector("main");
+  const list = $("#jobList");
+  let top = 0, view = 600;
+  try {
+    const base = list.getBoundingClientRect().top
+      - main.getBoundingClientRect().top + main.scrollTop;
+    top = Math.max(0, main.scrollTop - base);
+    view = Math.max(1, main.clientHeight);
+  } catch { /* duzen yok: ilk pencere */ }
+  const bottom = top + view;
+  let y = 0, lo = 0;
+  for (let i = 0; i < vis.length; i++) {
+    if (y + rowH(vis[i].id) > top) { lo = i; break; }
+    y += rowH(vis[i].id);
+  }
+  let hi = vis.length, acc = y;
+  for (let i = lo; i < vis.length; i++) {
+    acc += rowH(vis[i].id);
+    if (acc >= bottom) { hi = i + 1; break; }
+  }
+  lo = Math.max(0, lo - OVERSCAN);
+  hi = Math.min(vis.length, hi + OVERSCAN);
+  // odakli satir her zaman cizilir: aksi halde klavye odagi DOM'dan duser
+  const fid = focusedJobId();
+  if (fid) {
+    const k = vis.findIndex((j) => j.id === fid);
+    if (k >= 0) { lo = Math.min(lo, k); hi = Math.max(hi, k + 1); }
+  }
+  return [lo, hi];
+}
+
+function focusedJobId() {
+  const a = document.activeElement;
+  const row = a && a.closest ? a.closest("#jobList .row") : null;
+  return row ? row.dataset.job || "" : "";
+}
+
+function pads() {
+  const list = $("#jobList");
+  let top = document.getElementById("rowPadTop");
+  let bot = document.getElementById("rowPadBot");
+  if (!top) {
+    top = dom("div", { id: "rowPadTop", class: "pad", role: "presentation",
+                       "aria-hidden": "true" });
+    list.prepend(top);
+  }
+  if (!bot) {
+    bot = dom("div", { id: "rowPadBot", class: "pad", role: "presentation",
+                       "aria-hidden": "true" });
+    list.append(bot);
+  }
+  return [top, bot];
+}
+
+function removePads() {
+  for (const id of ["rowPadTop", "rowPadBot"]) {
+    const n = document.getElementById(id);
+    if (n) n.remove();
+  }
+}
+
+function renderWindow(vis) {
+  const list = $("#jobList");
+  const [padTop, padBot] = pads();
+  const [lo, hi] = windowRange(vis);
+  let before = 0, after = 0;
+  for (let i = 0; i < lo; i++) before += rowH(vis[i].id);
+  for (let i = hi; i < vis.length; i++) after += rowH(vis[i].id);
+  padTop.style.height = before + "px";
+  padBot.style.height = after + "px";
+  const keep = new Set();
+  const drawn = [];
+  let cursor = padTop.nextSibling;      // ilk satir burada olmali
+  for (let i = lo; i < hi; i++) {
+    const j = vis[i];
+    keep.add(j.id);
+    let r = rows.get(j.id);
+    if (!r) { r = buildRow(j); rows.set(j.id, r); }
+    if (r.root === cursor) cursor = cursor.nextSibling;
+    else list.insertBefore(r.root, cursor);
+    updateRow(r, j);
+    drawn.push([j.id, r]);
+  }
+  for (const [id, r] of rows) {
+    if (!keep.has(id)) { r.root.remove(); rows.delete(id); }
+  }
+  // yazma bitti: TEK duzen okumasi (satir basina zorlanmis yeniden duzen yok)
+  let sum = 0, n = 0;
+  for (const [id, r] of drawn) {
+    const h = r.root.getBoundingClientRect().height;
+    if (h <= 0) continue;
+    heights.set(id, h + 6);             // margin-bottom
+    sum += h + 6;
+    n++;
+  }
+  if (n) avgH = sum / n;
 }
 
 function renderStatus() {
@@ -488,32 +697,142 @@ function announce() {
   if (finished) { loadHistory(); loadHistStats(); }
 }
 
+function setConn(kind, text) {
+  const n = $("#connState");
+  n.textContent = "● " + text;
+  n.className = "conn " + kind;
+}
+
+/* --------------------------------------------------------------- yoklama
+ * Akis koptugunda kullanilan yedek yol: ayni kare sozlesmesi, `since=rev`
+ * ile yalniz degisenler tasinir. */
+const statsPath = () => (rev > 0 ? "/api/stats?since="
+  + encodeURIComponent(String(rev)) : "/api/stats");
+
 async function poll() {
-  if (polling) return;          // yanimda surmekte olan istek varsa atla
+  if (document.hidden || polling) return;   // gizli sekmede istek yok
   polling = true;
-  let fresh = false;            // yalniz basarili tarama grafige ornek ekler
-  const conn = $("#connState");
+  let fresh = false;
   try {
-    const s = await api("/api/stats");
-    if (s && s.ok) {
-      jobs = s.jobs || []; lastStats = s; fresh = true;
-      conn.textContent = "● " + tr("daemon_ok"); conn.className = "conn ok";
-      // bozuk durum dosyasindan kurtarma: bir kez, kalici bir bildirim
-      if (s.warning === "state_recovered" && !stateWarned) {
-        stateWarned = true;
-        notice(tr("warn_state"));
-      }
-    } else {
-      conn.textContent = "● " + tr("daemon_down"); conn.className = "conn bad";
+    const s = await api(statsPath());
+    fresh = applyStats(s);
+    setConn(fresh ? "ok" : "bad", tr(fresh ? "daemon_ok" : "daemon_down"));
+    // bozuk durum dosyasindan kurtarma: bir kez, kalici bir bildirim
+    if (fresh && s.warning === "state_recovered" && !stateWarned) {
+      stateWarned = true;
+      notice(tr("warn_state"));
     }
   } catch {
-    conn.textContent = "● " + tr("daemon_down"); conn.className = "conn bad";
+    setConn("bad", tr("daemon_down"));
   }
   polling = false;
-  if (fresh) sampleHistory();
+  if (fresh) sampleHistory(Date.now());
   render(); renderStatus(); announce(); updateGraphs();
-  // profil paneli acikken ~2 sn'de bir tazelenir (her taramada degil)
-  if (hostsDlg.open && ++hostTicks % 4 === 0) loadHosts();
+  // profil paneli acikken ~2 sn'de bir tazelenir (her karede degil)
+  maybeHosts();
+}
+
+/* ------------------------------------------------------------ canli akis
+ * Tek yol /api/events (SSE). EventSource baslik gonderemez; bu yuzden akis
+ * fetch + ReadableStream ile okunur ve token BASLIKTA kalir (URL'e konmaz).
+ * Akis koparsa yoklamaya dusulur, aralik ussel buyur; sekme gizlenince
+ * akis kapatilir (bosta istek/CPU yok). */
+let stream = null;          // {ctl}
+let retryTimer = 0, pollTimer = 0;
+let streamTries = 0;
+
+function streamClose() {
+  if (stream) {
+    try { stream.ctl.abort(); } catch { /* zaten kapali */ }
+    stream = null;
+  }
+  clearTimeout(pollTimer);
+  pollTimer = 0;
+}
+
+function retryDelay() {
+  return Math.min(30000, 500 * Math.pow(2, streamTries));
+}
+
+/* akis yokken: yoklama ile tazele (rev farki), arada yeniden baglan */
+function fallbackLoop() {
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(async () => {
+    pollTimer = 0;
+    if (document.hidden) return;
+    await poll();
+    if (!stream) fallbackLoop();
+  }, 1000);
+}
+
+async function streamLoop() {
+  clearTimeout(retryTimer);
+  retryTimer = 0;
+  if (document.hidden || !TOKEN || stream) return;
+  const ctl = new AbortController();
+  stream = { ctl };
+  try {
+    const r = await fetch("/api/events", {
+      headers: { "X-FerDim-Token": TOKEN }, cache: "no-store",
+      signal: ctl.signal });
+    if (r.status === 401) { expireSession(); return; }
+    if (!r.ok || !r.body) throw new Error("akis yok");
+    setConn("ok", tr("daemon_ok"));
+    await readFrames(r.body.getReader());
+  } catch (e) {
+    if (e && e.name === "AbortError") return;      // kapanis (gizli sekme)
+    streamTries++;
+  } finally {
+    if (stream && stream.ctl === ctl) stream = null;
+  }
+  if (document.hidden) return;
+  fallbackLoop();
+  retryTimer = setTimeout(streamLoop, retryDelay());
+}
+
+/* SSE govdesi: bloklar bos satirla ayrilir; `:` ile baslayan satir yorum. */
+async function readFrames(reader) {
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const step = await reader.read();
+    if (step.done) break;
+    buf += dec.decode(step.value, { stream: true });
+    let cut;
+    while ((cut = buf.indexOf("\n\n")) >= 0) {
+      const block = buf.slice(0, cut);
+      buf = buf.slice(cut + 2);
+      handleFrame(block);
+    }
+    if (buf.length > (1 << 20)) buf = "";   // bozuk akis: birikmesin
+  }
+}
+
+function handleFrame(block) {
+  let event = "message", data = "";
+  for (const line of block.split("\n")) {
+    if (!line || line[0] === ":") continue;      // yorum / kalp atisi
+    const k = line.indexOf(":");
+    const field = k < 0 ? line : line.slice(0, k);
+    let value = k < 0 ? "" : line.slice(k + 1);
+    if (value[0] === " ") value = value.slice(1);
+    if (field === "event") event = value;
+    else if (field === "data") data += (data ? "\n" : "") + value;
+  }
+  streamTries = 0;                              // akis saglikli (kare geldi)
+  if (!data || event !== "stats") return;
+  let s;
+  try { s = JSON.parse(data); } catch { return; }
+  if (!applyStats(s)) return;
+  sampleHistory(Date.now());
+  render(); renderStatus(); announce(); updateGraphs();
+  maybeHosts();
+}
+
+/* token dondurulmus/gecersiz: sekmedeki kopyayi at, sayfa yeniden yuklenir */
+function expireSession() {
+  sessionStorage.removeItem("ferdimToken");
+  location.reload();
 }
 
 /* --------------------------------------------------------------- arsiv */
@@ -623,7 +942,14 @@ $("#zipRepair").onclick = zipRepair;
 const hostsDlg = $("#hostsDlg");
 const hostRows = new Map();      // ana makine -> {root, text, forget, sig}
 let hostsGen = 0;                // eski yanit yeni listeyi ezmesin
-let hostTicks = 0;
+let hostsAt = 0;            // son profil tazelemesi (ms)
+
+/* profil paneli acikken ~2 sn'de bir tazelenir (her karede degil) */
+function maybeHosts() {
+  if (!hostsDlg.open || Date.now() - hostsAt < 2000) return;
+  hostsAt = Date.now();
+  loadHosts();
+}
 
 function buildHostRow(host) {
   const text = dom("span", { class: "hrow-text" });
@@ -743,25 +1069,38 @@ function historyRow(h) {
       avg: Number(h.avg_links || 0).toFixed(1), peak: h.peak_links || 0 }) }));
 }
 
-async function loadHistory() {
+/* gecmis sayfalari: ilk sayfa aramayi sifirlar, "daha fazla" ekler */
+let histOffset = 0, histTotal = 0, histGen = 0;
+
+async function loadHistory(more) {
+  const gen = ++histGen;
+  const offset = more ? histOffset : 0;
   let r = {};
   try {
     r = await api("/api/history", {
       q: $("#histSearch").value.trim(), state: $("#histState").value,
-      limit: 100 });
+      limit: HIST_PAGE, offset });
   } catch { r = {}; }
+  if (gen !== histGen) return;              // daha yeni arama yolda
   const list = $("#histList");
   const empty = $("#histEmpty");
   if (!r || !r.ok) {
-    list.replaceChildren();
+    if (!more) list.replaceChildren();
     empty.hidden = true;
     $("#histStats").textContent = tr("hist_failed");
+    $("#histMore").hidden = true;
     return;
   }
-  list.replaceChildren(...r.items.map(historyRow));
+  const items = Array.isArray(r.items) ? r.items : [];
+  const nodes = items.map(historyRow);
+  if (more) list.append(...nodes);
+  else list.replaceChildren(...nodes);
+  histOffset = offset + items.length;
+  histTotal = Number(r.total) || histOffset;
+  $("#histMore").hidden = histOffset >= histTotal;
   empty.textContent = tr($("#histSearch").value.trim() || $("#histState").value
     ? "hist_none" : "hist_empty");
-  empty.hidden = r.items.length > 0;
+  empty.hidden = histOffset > 0;
 }
 
 async function loadHistStats() {
@@ -790,7 +1129,8 @@ $("#histSearch").addEventListener("input", () => {
   clearTimeout(histTimer);
   histTimer = setTimeout(loadHistory, 300);
 });
-$("#histState").onchange = loadHistory;
+$("#histState").onchange = () => loadHistory();
+$("#histMore").onclick = () => loadHistory(true);
 $("#histClear").onclick = async () => {
   if (!confirm(tr("hist_confirm_clear"))) return;
   let r = {};
@@ -1032,6 +1372,32 @@ $("#setSave").onclick = async () => {
   poll();
 };
 
+/* ---- pencere / gorunurluk ------------------------------------------------
+ * Kaydirma yalniz pencere modunda yeniden cizer; sekme gizlenince akis ve
+ * yoklama kapanir (bosta CPU/istek yok), gorununce tazelenir. */
+const scroller = document.querySelector("main");
+let scrollTick = 0;
+
+function onScroll() {
+  if (!virtualOn || scrollTick) return;
+  scrollTick = setTimeout(() => { scrollTick = 0; render(); }, 16);
+}
+scroller.addEventListener("scroll", onScroll, { passive: true });
+window.addEventListener("resize", () => {
+  if (virtualOn) onScroll();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    streamClose();
+    clearTimeout(retryTimer); retryTimer = 0;
+    return;
+  }
+  if (!TOKEN) return;
+  poll();               // hemen bir kare (sekme arkada kalmis olabilir)
+  streamLoop();         // akis yeniden acilir
+});
+
 /* ---- baslangic ---- */
 (async () => {
   TOKEN = await claimSession();
@@ -1050,5 +1416,5 @@ $("#setSave").onclick = async () => {
   await poll();
   await loadHistory();
   await loadHistStats();
-  setInterval(poll, 500);
+  streamLoop();         // 500 ms yoklama yerine SSE: degisiklikte aninda
 })();

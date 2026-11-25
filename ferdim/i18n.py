@@ -200,6 +200,7 @@ S = {
     "lbl_cat_sched": {"en": "Per-category schedule windows", "tr": "Kategori bazlı zamanlama", "es": "Horario por categoría", "ru": "Расписание по категориям"},
     "lbl_only_window": {"en": "only in window", "tr": "sadece pencerede", "es": "solo en su ventana", "ru": "только в своём окне"},
     "sched_wait":    {"en": "waits for its window {w}", "tr": "penceresini bekliyor: {w}", "es": "espera su ventana {w}", "ru": "ждёт своего окна {w}"},
+    "retry_at":      {"en": "retry at {t}", "tr": "yeniden deneme: {t}", "es": "reintento a las {t}", "ru": "повтор в {t}"},
     # ------------------------------------------------------ izlenen klasorler
     "lbl_watch_dirs": {"en": "Watched folders (one per line)", "tr": "İzlenen klasörler (her satıra bir)", "es": "Carpetas vigiladas (una por línea)", "ru": "Отслеживаемые папки (по одной в строке)"},
     "lbl_watch_done": {"en": "After queueing a file", "tr": "Kuyruğa aldıktan sonra", "es": "Tras añadir a la cola", "ru": "После добавления в очередь"},
@@ -411,6 +412,9 @@ S = {
         "tr": "ort. {avg} / tepe {peak} bağlantı",
         "es": "media {avg} / pico {peak} enlaces",
         "ru": "сред. {avg} / пик {peak} соединений"},
+    "hist_more": {
+        "en": "Show more", "tr": "Daha fazla göster",
+        "es": "Mostrar más", "ru": "Показать ещё"},
     "hist_redownload": {
         "en": "Download again", "tr": "Yeniden indir",
         "es": "Descargar de nuevo", "ru": "Скачать снова"},
