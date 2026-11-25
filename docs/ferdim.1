@@ -216,6 +216,15 @@ network, and any host on that network can probe whether a specific chunk
 is cached by requesting its hash; file names and paths never leave the
 machine. The feature is therefore off by default, and peer chunks are
 untrusted: every one is verified by SHA-256 before it is written.
+TLS options are shared by HTTP(S), HTTP/3 and FTPS: \fItls_ca_file\fR
+adds a private CA bundle to the system trust store, \fItls_client_cert\fR
+and \fItls_client_key\fR enable mutual TLS (the key may be omitted when it
+is stored in the certificate file), and \fItls_min_version\fR selects
+\fB1.2\fR or \fB1.3\fR. These files must be absolute, regular, readable,
+owned by the user (or root) and not group- or world-writable; the three
+path keys can only be changed from the local socket, not the HTTP API.
+The client certificate is global: it is offered to every HTTPS, FTPS or
+HTTP/3 server that requests one.
 .TP
 .BI history " [QUERY]"
 Show the persistent job history (SQLite database in the state directory),

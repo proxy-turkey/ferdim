@@ -629,7 +629,11 @@ def _resume_if_dry(conn: _Conn) -> None:
 
 
 def _key_of(url: str, opt, target: tuple[str, int] | None) -> tuple:
-    """Havuz anahtari: (hedef host, port, SNI, dogrulama modu)."""
+    """Havuz anahtari: hedef, SNI, dogrulama ve TLS ayar izi.
+
+    TLS izi (CA/sertifika dosyalarinin mtime/boyut imzasi + min surum)
+    anahtara girer: ayar degisince eski QUIC baglantisi yeniden
+    kullanilmaz, yeni el sikismasi gerekli sertifikalarla yapilir."""
     parts = urlsplit(url)
     host = normalise_host(parts.hostname or "")
     port = parts.port or 443
@@ -637,7 +641,11 @@ def _key_of(url: str, opt, target: tuple[str, int] | None) -> tuple:
         host = normalise_host(target[0] or host) or host
         port = target[1]
     sni = normalise_host(parts.hostname or "") or host
-    return (host, port, sni, bool(getattr(opt, "insecure", False)))
+    tls = getattr(opt, "tls", None)
+    fingerprint = tls.fingerprint() if callable(
+        getattr(tls, "fingerprint", None)) else ()
+    return (host, port, sni, bool(getattr(opt, "insecure", False)),
+            fingerprint)
 
 
 def _release_stream(stream: _Stream, reset: bool = False) -> None:
@@ -764,7 +772,7 @@ async def _conn_get(url: str, opt, target: tuple[str, int] | None) -> _Conn:
     Ayni hedef icin es zamanli istekler tek el sikismasi paylasir
     (_OPENING); MAX_STREAMS asilirsa yeni baglanti acilir."""
     key = _key_of(url, opt, target)
-    host, port, sni, insecure = key
+    host, port, sni, insecure = key[:4]
     loop = asyncio.get_running_loop()
     for _ in range(8):
         conn = _pool_pick(key)

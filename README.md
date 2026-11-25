@@ -230,6 +230,14 @@ reachable ceiling. Use `ferdim turbo off` or `ferdim limit` to share the line.
 - Credentials (Basic auth, cookies, custom headers) never follow a
   redirect or a mirror to another origin. Private-window downloads keep
   their cookies in memory only.
+- TLS options are shared by HTTP(S), HTTP/3 and FTPS: `tls_ca_file` adds a
+  private CA bundle to the system trust store, `tls_client_cert` /
+  `tls_client_key` enable mutual TLS (the key may live in the certificate
+  file) and `tls_min_version` picks `1.2` or `1.3`. Files must be
+  absolute, regular, readable, owned by the user (or root) and not group-
+  or world-writable; the three path keys are socket-only, not settable
+  over the HTTP API. The client certificate is global: it is offered to
+  every HTTPS, FTPS or HTTP/3 server that requests one.
 - The native-messaging host is registered only for FerDim's own extension ID.
 
 ## Internationalization

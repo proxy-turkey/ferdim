@@ -124,30 +124,21 @@ def _peer_dir_list(value) -> list[str]:
     return _dir_list(value, strip=True)
 
 
-def _tls_path(value) -> str:
-    """Mutlak, okunabilir dosya yolu; gecersizse bos dize."""
-    if not isinstance(value, str):
-        return ""
-    p = os.path.expanduser(value.strip())
-    if not p or "\x00" in p or not os.path.isabs(p):
-        return ""
-    try:
-        with open(p, "rb"):
-            pass
-    except OSError:
-        return ""
-    return p
-
-
 def _sanitize_tls(cfg: dict) -> str:
-    """TLS anahtarlarini dogrular; bozuk deger dusurulur ('tls_config')."""
+    """TLS anahtarlarini dogrular; bozuk deger dusurulur ('tls_config').
+
+    Yol denetimi httpcli'deki tek kaynaktan gelir: mutlak, duzenli dosya,
+    <=1 MiB, sahibi bu kullanici/root, grup/diger yazma izni yok; saklanan
+    deger realpath'tir."""
+    from .engine.httpcli import tls_file_path
+
     bad = False
     for key in ("tls_ca_file", "tls_client_cert", "tls_client_key"):
         raw = cfg.get(key, "")
         if raw in ("", None):
             cfg[key] = ""
             continue
-        path = _tls_path(raw)
+        path = tls_file_path(raw)
         if not path:
             bad = True            # yok/okunamiyor/goreli: sessizce kullanma
         cfg[key] = path
@@ -384,6 +375,11 @@ def _config_http_guard(cfg: dict, new: dict) -> dict | None:
     for key, clean in (("allowed_dirs", _allowed_dir_list),
                        ("peer_dirs", _peer_dir_list)):
         if key in new and clean(new.get(key)) != clean(cfg.get(key)):
+            return _setting_socket_only()
+    # TLS dosya yollari yerel okuma yuzeyini degistirir: HTTP API'den
+    # degistirilemez (ayni kullanici zaten soket/CLI kullanabilir).
+    for key in ("tls_ca_file", "tls_client_cert", "tls_client_key"):
+        if key in new and str(new.get(key) or "") != str(cfg.get(key) or ""):
             return _setting_socket_only()
     cur = cfg.get("download_dir")
     cur = cur if isinstance(cur, str) and cur.strip() else None

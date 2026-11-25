@@ -214,6 +214,15 @@ isteyerek onun önbellekte olup olmadığını sınayabilir; dosya adları ve
 yollar makineden çıkmaz. Bu yüzden özellik varsayılan kapalıdır ve
 eşbazdan gelen parçalar güvenilmez sayılır: yazılmadan önce her biri
 SHA-256 ile doğrulanır.
+TLS ayarları HTTP(S), HTTP/3 ve FTPS tarafından paylaşılır:
+\fItls_ca_file\fR özel bir CA paketini sistem güven deposuna ekler,
+\fItls_client_cert\fR ve \fItls_client_key\fR karşılıklı TLS'i (mTLS)
+etkinleştirir (anahtar sertifika dosyasındaysa ayrıca verilmeyebilir),
+\fItls_min_version\fR \fB1.2\fR ya da \fB1.3\fR seçer. Bu dosyalar mutlak,
+düzenli, okunabilir, kullanıcıya (ya da root'a) ait olmalı ve grup/diğer
+yazma izni taşımamalıdır; üç yol anahtarı yalnız yerel soketten
+değiştirilebilir, HTTP API'den değiştirilemez. İstemci sertifikası
+geneldir: sertifika isteyen her HTTPS, FTPS ve HTTP/3 sunucusuna sunulur.
 .TP
 .BI hosts " [\-\-forget SUNUCU | \-\-clear]"
 Öğrenilmiş sunucu bağlantı profillerini gösterir: hız denetleyicisinin
