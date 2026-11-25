@@ -26,7 +26,11 @@ QUEUE_SAVE_DEBOUNCE = 0.5
 QUEUE_TOMB_MAX = 1024              # stats: hatirlanan son silme sayisi
 PROBE_WORKERS = 3                  # es zamanli boyut yoklamasi (sinirli)
 STATS_LIMIT_MAX = 10000            # sayfalama ust siniri
+TICK_BUSY = 0.5                    # tick araligi: is var (calisan/kuyrukta)
+TICK_IDLE = 2.0                    # tick araligi: is yok (olay hemen uyandirir)
 STATES_RUNNING = (JobState.CONNECTING, JobState.DOWNLOADING)
+# ilk goruste orneklenmesi gereken durumlar (metrik sayaci tasiyanlar)
+_METRIC_TERMINAL = (JobState.DONE, JobState.ERROR, JobState.CANCELED)
 
 # Denetim kuyrugunda "remove" ayri bir eylem: control() bilmez
 _CTL_REMOVE = "remove"
@@ -129,31 +133,6 @@ def _opt_int(value):
         return None
 
 
-def _snap_key(snap: dict) -> tuple:
-    """snapshot iceriginin ucuz parmak izi (stats revizyon karsilastirmasi).
-
-    Tum sozlugu repr/json ile ozetlemek her yoklamada pahali olurdu; burada
-    yalniz gorunen alanlar hashlanabilir bir demete cevrilir. Icerik
-    degismediyse anahtar ayni kalir: iki ardisik stats cagrisi ayni `since`
-    icin is dondurmez.
-    """
-    return (
-        snap["id"], snap["url"], snap["state"], snap["filename"], snap["dir"],
-        snap["fullpath"], snap["size"], snap["done"], snap["speed"],
-        snap["eta"], snap["kind"], snap["error"], snap["error_code"],
-        tuple(snap.get("warning_codes") or ()), snap["category"],
-        snap["created"], snap["segments"], snap["segments_cfg"],
-        snap["segments_effective"], snap["adaptive"], snap["checksum"],
-        snap["merkle"], snap["checksum_note"], snap["merkle_note"],
-        tuple(snap.get("verified") or ()), snap["mirrors"],
-        tuple((m.get("url"), m.get("state"), m.get("code"))
-              for m in (snap.get("mirror_health") or ())),
-        snap["sources_dead"], snap["window"], snap["sched_wait"],
-        snap["retry_after_until"], snap["verifying"], snap["verify_done"],
-        snap["verify_total"], snap["warning"], snap["best_speed"],
-    )
-
-
 class QueueManager:
     def __init__(self, env: AppEnv, cfg: dict):
         self.env = env
@@ -181,14 +160,22 @@ class QueueManager:
         self._dirty = False
         self._bulk = 0                    # bulk_save() sayaci (ic ice)
         self._saver: threading.Thread | None = None
-        # stats revizyonlari: is basina son gorulen parmak izi ve revizyon;
-        # silinen isler sinirli bir gunlukte (since ile delta) tutulur
+        # stats revizyonlari: is basina son gorulen snapshot uretimi (gen) ve
+        # revizyon; silinen isler sinirli bir gunlukte (since ile delta) tutulur
         self._rev = 0
         self._mutations = 0               # kuyruk listesi degisti mi (stats)
         self._job_rev: dict[str, int] = {}
-        self._job_fp: dict[str, tuple] = {}
+        self._job_gen: dict[str, int] = {}
         self._removed: deque = deque()
         self._tomb_floor = 0              # bu revden eski since'ler tam ister
+        # tick: yalniz degisen islerle ugrasilir. `_job_seen` is basina son
+        # gorulen (durum, ilerleme, baglanti, hiz); `_state_counts` guncel
+        # durum sayaclari (Prometheus). Bos kuyrukta tick uzun uyur.
+        self._tick_evt = threading.Event()
+        self._idle = False
+        self._job_seen: dict[str, tuple] = {}
+        self._state_counts: dict[str, int] = {}
+        self._coexist_applied = False     # islere tavan uygulandi mi
         # denetim kuyrugu: yavas kisim (yoklama, join, dosya silme) istek
         # iplikcigini bekletmez; tek isci komutlari sirayla yurutur
         self._ctl_q: deque = deque()
@@ -200,7 +187,6 @@ class QueueManager:
         self.last_nm_ping = 0.0
         self.history = open_history(env)
         self._hist_state: dict[str, str] = {}   # is -> yazilmis son durum
-        self._last_sig: list | None = None      # tick: son yazilan durumlar
         # saklama suresi (gun): 0 = sonsuza kadar; hata kuyrugu durdurmaz
         self.history.prune(cfg.get("history_days", 365))
         self.state_warning = ""      # arayuze bildirilen durum kurtarma kodu
@@ -254,6 +240,8 @@ class QueueManager:
         Gecmis hatasi (disk dolu, bozuk DB) kuyrugu asla durdurmaz."""
         self._notify(job)
         state = job.state
+        # tick uzun uykudaysa hemen uyandir (durum/ilerleme degisikligi)
+        self._tick_evt.set()
         if state == JobState.QUEUED:
             # boyut yoklayicisi bos tarama yapmasin: olayla uyandirilir
             self._probe_evt.set()
@@ -285,6 +273,7 @@ class QueueManager:
             bulk = bool(self._bulk)
         if not paused:
             self._probe_evt.set()            # boyutu bilinmiyor: yoklanacak
+        self._tick_evt.set()
         if not bulk:
             self.flush()
         self._notify(job)
@@ -403,29 +392,33 @@ class QueueManager:
             if job not in self.jobs:        # es zamanli iki remove
                 return False
             self.jobs.remove(job)
-            self._forget_locked(job.id)
+            self._forget_locked(job)
             self._mark_dirty_locked()
         self._notify()
         return True
 
-    def _forget_locked(self, job_id: str) -> None:
+    def _forget_locked(self, job) -> None:
         """Kuyruktan cikan isin izlerini siler (kilit cagiranda).
 
-        Gecmis durumu, boyut yoklamasi ve stats revizyonu dusurulur; silme
-        sinirli gunluge yazilir ki `since` deltalari isi 'removed' olarak
-        bildirebilsin. Boylece yoklama kumeleri ve revizyon haritalari
-        silinen islerle sismez."""
-        self._hist_state.pop(job_id, None)
-        self._size_probed.discard(job_id)
-        self._probing.discard(job_id)
+        Gecmis durumu, boyut yoklamasi, metrik tabani ve stats revizyonu
+        dusurulur; silme sinirli gunluge yazilir ki `since` deltalari isi
+        'removed' olarak bildirebilsin. Durum sayaci ve `_job_seen` tick
+        is parcaciginin malidir: onlari `_reconcile_seen` temizler (tick
+        hemen uyandirilir), boylece tek yazar kurali bozulmaz."""
+        jid = job.id
+        self._hist_state.pop(jid, None)
+        self._size_probed.discard(jid)
+        self._probing.discard(jid)
+        self.metrics.forget(jid)
         self._rev += 1
         if len(self._removed) >= QUEUE_TOMB_MAX:
             # en eski kayit dusuyor: ondan eski since'ler artik tam ister
             self._tomb_floor = max(self._tomb_floor, self._removed[0][0])
-        self._removed.append((self._rev, job_id))
-        self._job_rev.pop(job_id, None)
-        self._job_fp.pop(job_id, None)
+        self._removed.append((self._rev, jid))
+        self._job_rev.pop(jid, None)
+        self._job_gen.pop(jid, None)
         self._mutations += 1
+        self._tick_evt.set()            # sayac/kayit temizligi hemen gorunsun
 
     @staticmethod
     def _drop_job_files(job) -> None:
@@ -451,7 +444,7 @@ class QueueManager:
                                       JobState.CANCELED)]
             for j in dropped:
                 self.jobs.remove(j)
-                self._forget_locked(j.id)
+                self._forget_locked(j)
             if dropped:
                 self._mark_dirty_locked()
         # disk temizligi kuyruk kilidi disinda: yavas dosya sistemi
@@ -468,19 +461,6 @@ class QueueManager:
         return util.window_open(sch.get("start", "02:00"),
                                 sch.get("stop", "08:00"))
 
-    def _in_job_window(self, job) -> bool:
-        """Kategoriye ozgu pencere (schedule.categories): o kategoriden bir
-        is yalniz kendi penceresinde baslar; digerleri kisitlanmaz."""
-        try:
-            sch = self.cfg.get("schedule") or {}
-            cats = sch.get("categories") if isinstance(sch, dict) else None
-            w = cats.get(job.category) if isinstance(cats, dict) else None
-        except Exception:
-            return True
-        if not w:
-            return True
-        return util.window_open(w.get("start", ""), w.get("stop", ""))
-
     # ---------------------------------------------------------------- ticker
     def _tick_loop(self):
         while self._running:
@@ -488,20 +468,112 @@ class QueueManager:
                 self._tick()
             except Exception:
                 pass
-            time.sleep(0.5)
+            # is yokken uzun uyu: ekleme/denetim/durum olayi (gorunmez is
+            # parcaciklari) hemen uyandirir; zaman plani icin ust sinir 2 sn
+            self._tick_evt.wait(TICK_IDLE if self._idle else TICK_BUSY)
+            self._tick_evt.clear()
+
+    def _tick_scan(self):
+        """Tek ucuz gecis: calisan/kuyruk listeleri, degisen isler, sayaclar.
+
+        10 000 duraklatilmis isde is basina maliyet dort alan okumasi ve bir
+        sozluk bakisidir; `update_speed`, metrik ornekleme ve kalicilik
+        yalniz degisen (ya da calisan) islere uygulanir. Okuma kilitsiz,
+        degisikliklerin uygulanmasi kisa ve kilitlidir: sayac sozluklerinin
+        tek yazari bu is parcacigidir (`_job_seen`/`_state_counts`)."""
+        with self._lock:
+            jobs = list(self.jobs)
+            starting = bool(self._starting)
+        seen = self._job_seen
+        running: list = []
+        queued: list = []
+        hot: list = []
+        changed = False
+        updates: list = []              # (is, imza, onceki durum)
+        for j in jobs:
+            st = j._state               # kilit yok: duz okuma
+            sig = (st, j.done, j._active, j.speed)
+            prev = seen.get(j.id)
+            if prev is None:
+                updates.append((j, sig, None))
+            elif prev != sig:
+                updates.append((j, sig, prev[0]))
+                if prev[0] != st:
+                    changed = True
+            if st in STATES_RUNNING:
+                running.append(j)
+            elif st == JobState.QUEUED:
+                queued.append(j)
+        if updates or len(seen) != len(jobs):
+            with self._lock:
+                counts = self._state_counts
+                for j, sig, prev_state in updates:
+                    seen[j.id] = sig
+                    if prev_state is None:
+                        counts[sig[0]] = counts.get(sig[0], 0) + 1
+                        # ilk goruste yalniz SAYILACAK bir sey varsa
+                        # orneklenir: bitmis is (jobs_total + bayt) ya da
+                        # ilerlemis is. Bos duraklatilmis isler 10 000'lik
+                        # kuyrukta tek tek kilitlenip sayac kopyalamaz.
+                        if sig[0] in _METRIC_TERMINAL or j.done > 0:
+                            hot.append(j)
+                        continue
+                    if prev_state != sig[0]:
+                        self._count_state(prev_state, sig[0])
+                        if prev_state in STATES_RUNNING \
+                                and sig[0] not in STATES_RUNNING:
+                            # kosu bitti: hiz sifirlanir (update_speed artik
+                            # yalniz calisan islere uygulanir)
+                            j.speed = 0.0
+                            seen[j.id] = (sig[0], sig[1], sig[2], 0.0)
+                    hot.append(j)
+                if len(seen) != len(jobs):      # kuyruktan cikan isler
+                    self._reconcile_seen(seen, jobs)
+        self._idle = not (running or queued or starting)
+        return running, queued, hot, changed
+
+    def _count_state(self, old: str, new: str) -> None:
+        """Durum sayacini gecisle gunceller (kilit cagiranda)."""
+        counts = self._state_counts
+        n = counts.get(old, 0) - 1
+        if n > 0:
+            counts[old] = n
+        else:
+            counts.pop(old, None)
+        counts[new] = counts.get(new, 0) + 1
+
+    def _reconcile_seen(self, seen: dict, jobs: list) -> None:
+        """Kuyruktan cikan islerin izlerini siler (kilit cagiranda).
+
+        Isler dogrudan `jobs` listesinden de dusurulebilir (testler/olcum
+        tohumlama): sayaclar ve metrik tabanlari bu yuzden burada da
+        temizlenir, kaynak sizmaz."""
+        alive = {j.id for j in jobs}
+        counts = self._state_counts
+        for jid in [k for k in seen if k not in alive]:
+            st = seen.pop(jid)[0]
+            n = counts.get(st, 0) - 1
+            if n > 0:
+                counts[st] = n
+            else:
+                counts.pop(st, None)
+            self._job_rev.pop(jid, None)
+            self._job_gen.pop(jid, None)
+            self.metrics.forget(jid)
 
     def _tick(self):
-        with self._lock:
-            running = [j for j in self.jobs if j.state in STATES_RUNNING]
-            queued = [j for j in self.jobs if j.state == JobState.QUEUED]
+        running, queued, hot, changed = self._tick_scan()
         self._speed_plan_tick()
         limit = int(self.cfg.get("max_concurrent", 3))
         # kapanistan sonra yeni is dagitilmaz: baslatma parcaciklari
         # beklemedeyken _tick elle cagrilirsa is baslamamali
         if self._running and self._schedule_active():
             slots = max(0, limit - len(running))
-            # kategori penceresi kapali olan isler siralarini bekler
-            queued = [j for j in queued if self._in_job_window(j)]
+            # kategori penceresi kapali olan isler siralarini bekler;
+            # pencere kumesi tick basina BIR kez hesaplanir
+            closed = util.category_windows(self.cfg)
+            if closed:
+                queued = [j for j in queued if j.category not in closed]
             if self.cfg.get("smart_queue", True) and slots:
                 # kucuk dosya once: boyutu bilinmeyenleri yoklayici
                 # isaretleyene kadar beklet, sonra kucukten buyuge basla
@@ -514,20 +586,19 @@ class QueueManager:
             elif slots:
                 for job in queued[:slots]:
                     self._start_async(job)
-        for j in self.jobs:
+        # hiz yalniz calisan islerde degisir; duraklatilmis/bitmis isler
+        # her tick'te kilit ve aritmetik odemez
+        for j in running:
             j.update_speed()
         self._coexist_tick(running)
-        with self._lock:
-            jobs = list(self.jobs)
         self.metrics.observe(
-            jobs, coexist_active=bool(self.cfg.get("coexist")
-                                      and self.coexist.active))
-        # durum degisimlerini kalici kaydet (biten/iptal edilen isler):
-        # yazim kilit altinda degil, birlestirilmis yaziciya birakilir
-        with self._lock:
-            sig = [(j.id, j.state) for j in self.jobs]
-            if sig != self._last_sig:
-                self._last_sig = sig
+            hot, coexist_active=bool(self.cfg.get("coexist")
+                                     and self.coexist.active),
+            states=self._state_counts)
+        # durum degisimleri kalici kaydedilir: yazim kilit altinda degil,
+        # birlestirilmis yaziciya birakilir
+        if changed:
+            with self._lock:
                 self._mark_dirty_locked()
 
     # -------------------------------------------------------- start dagitimi
@@ -629,16 +700,24 @@ class QueueManager:
         tasimamali. Uygulama ise yalniz kosabilecek islere yapilir (bitmis
         isin gorunumu degismesin); yeniden baslatilan is bir sonraki tick'te
         zaten tavanini alir.
-        """
+
+        Mod kapaliyken ve hicbir ise tavan uygulanmamissa is listesi HIC
+        taranmaz: 10 000 islik kuyrukta bosta tick maliyeti sifir kalir."""
+        if not active and not self._coexist_applied:
+            return
         with self._lock:
             jobs = list(self.jobs)
+        if not active:
+            for j in jobs:
+                if j._ext_cap is not None:
+                    j.set_external_cap(None)
+            self._coexist_applied = False
+            return
         for j in jobs:
-            if not active:
-                j.set_external_cap(None)
-                continue
             if j.state in HISTORY_STATES:   # done/error/canceled: kosmaz
                 continue
             j.set_external_cap(max(1, j._seg_max // 2))
+        self._coexist_applied = True
 
     def coexist_status(self) -> dict:
         """stats/CLI icin: mod acik mi, basinc ne, tavan uygulaniyor mu."""
@@ -822,6 +901,11 @@ class QueueManager:
             self._save_evt.clear()
             if self._closed or not self._running:
                 return
+            with self._lock:
+                # baska bir cagri (add/bulk cikisi/shutdown) yazdi: bosuna
+                # 10 000 islik dosyayi yeniden yazma
+                if not self._dirty:
+                    continue
             try:
                 self.flush()
             except Exception:
@@ -1108,7 +1192,11 @@ class QueueManager:
             limit = min(limit, STATS_LIMIT_MAX)
         else:
             limit = None
+        # kategori pencereleri cagri basina BIR kez: is basina `window_open`
+        # (saat dilimi + datetime matematigi) yapilmaz
+        windows = util.category_windows(self.cfg)
         snaps: list[dict] = []
+        gens: list[int] = []
         stable = False
         rev_floor = 0
         for _attempt in range(3):
@@ -1116,7 +1204,11 @@ class QueueManager:
                 muts = self._mutations
                 rev_floor = self._rev
                 jobs = list(self.jobs)
-            snaps = [j.snapshot() for j in jobs]
+            gens, snaps = [], []
+            for j in jobs:
+                gen, snap = j.snapshot_rev(windows)
+                gens.append(gen)
+                snaps.append(snap)
             with self._lock:
                 if self._mutations == muts:
                     stable = True
@@ -1128,17 +1220,25 @@ class QueueManager:
             with self._lock:
                 rev_floor = self._rev
                 jobs = list(self.jobs)
-            snaps = [j.snapshot() for j in jobs]
-        speed = sum(s["speed"] for s in snaps)
-        active = sum(1 for s in snaps if s["state"] in
-                     (JobState.CONNECTING, JobState.DOWNLOADING))
+            gens, snaps = [], []
+            for j in jobs:
+                gen, snap = j.snapshot_rev(windows)
+                gens.append(gen)
+                snaps.append(snap)
+        speed = 0
+        active = 0
         with self._lock:
-            for s in snaps:
-                fp = _snap_key(s)
-                if self._job_fp.get(s["id"]) != fp:
-                    self._job_fp[s["id"]] = fp
+            for s, gen in zip(snaps, gens):
+                jid = s["id"]
+                speed += s["speed"]
+                if s["state"] in (JobState.CONNECTING, JobState.DOWNLOADING):
+                    active += 1
+                # is gorunumu her yeniden kuruldugunda revizyon artar
+                # (snapshot onbellegi: gen yalniz icerik degisince artar)
+                if self._job_gen.get(jid) != gen:
+                    self._job_gen[jid] = gen
                     self._rev += 1
-                    self._job_rev[s["id"]] = self._rev
+                    self._job_rev[jid] = self._rev
             rev = self._rev if stable else rev_floor
             total = len(self.jobs)
             if since is None or not stable or since > rev \

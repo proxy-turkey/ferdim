@@ -1,16 +1,16 @@
 {
-  "calibration": 33.66549393023338,
-  "generated": "2026-11-25T16:48:45Z",
+  "calibration": 33.5972656099828,
+  "generated": "2026-11-25T17:46:29Z",
   "metrics": {
-    "cdc_mib_s": 78.59695987295451,
-    "engine_mib_s": 99.12288294337243,
+    "cdc_mib_s": 79.48759000789084,
+    "engine_mib_s": 401.6190953802655,
     "idle_cpu_pct": 0.0,
-    "idle_loaded_cpu_pct": 60.69808321523531,
-    "idle_loaded_rss_mib": 255.6328125,
-    "idle_rss_mib": 37.453125,
-    "queue_load_jobs_s": 9025.332641923298,
-    "queue_save_jobs_s": 64856.537661682814,
-    "stats_calls_s": 2.296727326871361
+    "idle_loaded_cpu_pct": 11.199607740465337,
+    "idle_loaded_rss_mib": 243.953125,
+    "idle_rss_mib": 32.20703125,
+    "queue_load_jobs_s": 9524.368705625791,
+    "queue_save_jobs_s": 66302.21456043818,
+    "stats_calls_s": 22.08075231346249
   },
   "platform": "linux",
   "python": "3.14.10",

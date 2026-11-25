@@ -656,6 +656,33 @@ def window_open(start, stop, now=None, days=None, tz=None) -> bool:
     return False
 
 
+def category_windows(cfg) -> dict[str, str]:
+    """Su an KAPALI kategori pencereleri: {kategori: 'HH:MM-HH:MM'}.
+
+    Her is gorunumu icin ayri `window_open` cagirmak (saat dilimi cozumu,
+    datetime matematigi) is basina pahaliydi; pencere kumesi kucuktur, bu
+    yuzden bir kez hesaplanip tum islere paylasilir."""
+    try:
+        sch = (cfg or {}).get("schedule") or {}
+        cats = sch.get("categories") if isinstance(sch, dict) else None
+    except Exception:
+        return {}
+    if not isinstance(cats, dict) or not cats:
+        return {}
+    out: dict[str, str] = {}
+    for cat, w in cats.items():
+        if not isinstance(w, dict) or not w:
+            continue
+        start, stop = w.get("start", ""), w.get("stop", "")
+        try:
+            if window_open(start, stop):
+                continue
+        except Exception:
+            continue
+        out[str(cat)] = f"{start}-{stop}"
+    return out
+
+
 def parse_days(spec) -> frozenset[int]:
     """'mon-fri', 'mon,wed', 'sat-sun' -> gun kumesi (0 = pazartesi).
     Bos ya da '*' her gundur. Bilinmeyen ad ValueError firlatir: cagiran
@@ -689,7 +716,10 @@ def parse_days(spec) -> frozenset[int]:
 def speed_plan_rule(plan, now=None):
     """Ilk eslesen speed_plan kurali (ilk eslesen kazanir); yoksa None.
 
-    `now` verilmezse yerel DST'li an kullanilir (uretim yolu)."""
+    `now` verilmezse yerel DST'li an kullanilir (uretim yolu). Plan bossa
+    saat dilimi hic cozulmez: bu fonksiyon her tick cagriliyor."""
+    if not plan:
+        return None
     now = now if now is not None else _now_local()
     for rule in plan or ():
         if not isinstance(rule, dict):
