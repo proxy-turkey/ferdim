@@ -927,10 +927,12 @@ class SseCapTests(_WebCase):
         _SseFrames(first).next()               # kayit oturdu
         self.assertEqual(self.hub.count(), 1)
         second = self._open()
-        head2 = LineReader(second, sep=b"\r\n\r\n").block(5.0)
+        rd2 = LineReader(second, sep=b"\r\n\r\n")
+        head2 = rd2.block(5.0)
         self.assertIn(b" 503 ", head2.split(b"\r\n")[0])
         self.assertNotIn(b"text/event-stream", head2)
-        body = b""
+        # baslik ve govde tek pakette gelebilir: okuyucunun artigi govdedir
+        body = rd2.buf
         while True:
             part = second.recv(65536)
             if not part:
