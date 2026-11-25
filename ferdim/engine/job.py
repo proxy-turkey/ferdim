@@ -744,6 +744,9 @@ class DownloadJob:
             if queued_only and self.state != JobState.QUEUED:
                 return
             self._run += 1             # yeni kosu: onceki hazirligin sonucu gecersiz
+            # onceki kosunun ucustaki araliklari noktaya yazildi; yeni kosu
+            # onlari _prepare ile geri yukler (kalirsa iki kez sayilirdi)
+            self._inflight.clear()
             self._start_done.clear()
             self._stop.clear()
             self.error = ""
@@ -2742,6 +2745,7 @@ class DownloadJob:
         with self._lock:
             self._restart_needed = False
             self._threads = []
+            self._inflight.clear()     # bastan: eski ucustaki araliklar gecersiz
             if self.total > 0:
                 self._pending = [(0, self.total - 1)]
                 self.done = 0
@@ -2775,6 +2779,7 @@ class DownloadJob:
         with self._lock:
             self._ranges_ignored = False
             self._threads = []
+            self._inflight.clear()     # tek akis bastan kurulur
             self.spec.segments = 1
             self._allowed = 1
             self._seg_max = 1

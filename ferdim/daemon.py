@@ -103,7 +103,9 @@ def main() -> int:
     cfg = dict(raw)
     # el ile duzenlenmis config.json'daki bozuk degerler (ya da acilamayan
     # indirme dizini) daemon'u devirmesin: guvenli araliga cekilir
-    api._sanitize_config(cfg, env)
+    warn = api._sanitize_config(cfg, env)
+    if warn:
+        logging.getLogger("ferdim").warning("config: %s (deger dusuruldu)", warn)
     if cfg != raw:
         env.save_config(cfg)
     env.reload_download_dir(cfg)    # indirme dizini canli cfg'den cozulur

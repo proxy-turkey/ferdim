@@ -340,6 +340,16 @@ class _Base(unittest.TestCase):
 
 # --------------------------------------------------------------- 1) hiz limiti
 class SharedSpeedLimitTests(_Base):
+    def test_00_new_run_drops_previous_inflight(self):
+        """Onceki kosunun ucustaki araligi noktaya yazildi; yeni kosu onu
+        _prepare ile geri yukler. Kalirsa ayni aralik iki kez sayilirdi."""
+        j = self._raw_job()
+        self.addCleanup(j.cancel)
+        j._inflight[0] = (0, 99)
+        j.state = JobState.PAUSED
+        j.start()      # 127.0.0.1:1 baglanmaz; temizlik baslatmada
+        self.assertEqual(j._inflight, {})
+
     def test_01_queue_bucket_shared_per_job_limit_additive(self):
         env = AppEnv(root=tmp_root(self, "p112-share-"))
         qm = QueueManager(env, env.load_config())

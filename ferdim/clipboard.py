@@ -161,6 +161,8 @@ class ClipboardWatcher:
                 lambda: self.undo(job.id))
         except Exception:
             status = "error"
+        if self._stop.is_set():
+            return      # kapaniyor: is duraklatilmis kalir, sonra gorulur
         if status is True or status == ACTION_OK:
             self._schedule(self.grace, lambda: self._resume(job.id))
             return

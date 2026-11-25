@@ -240,7 +240,10 @@ def fetch_range(url: str, opt: httpcli.DlOptions, bucket: TokenBucket,
     (kesilen okuma) yeniden denenebilir oldugu icin ConnectionError'dur.
     """
     end = start + length - 1
-    cap = min(length, BODY_MAX)
+    if length > BODY_MAX:
+        raise StreamError(f"segment {start}-{end}: govde siniri asildi",
+                          "stream_too_large")
+    cap = length
     opener = httpcli._make_opener(opt)
     req = httpcli.request_of(url, opt)
     req.add_header("Range", f"bytes={start}-{end}")
