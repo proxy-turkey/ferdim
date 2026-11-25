@@ -52,6 +52,8 @@ import time
 import urllib.error
 from urllib.parse import SplitResult, urlsplit
 
+from ..profiles import normalise_host
+
 MODES = ("off", "auto", "force")
 BROKEN_SECS = 600.0             # h3 hatasi sonrasi TCP'de kalma suresi
 ALT_SVC_DEFAULT_MAX_AGE = 86400.0
@@ -144,10 +146,13 @@ def available() -> bool:
 
 # ------------------------------------------------------- Alt-Svc onbellegi
 def origin(url: str) -> str:
-    """Sema + ana makine + port (Alt-Svc/bozuk kaynak anahtari)."""
+    """Sema + ana makine + port (Alt-Svc/bozuk kaynak anahtari).
+
+    Ana makine IDNA'ya normalise edilir: ayni sunucunun unicode ve punycode
+    yazimlari tek onbellek kaydini paylasir."""
     p = urlsplit(url)
     port = p.port or (443 if p.scheme == "https" else 80)
-    return f"{p.scheme}://{(p.hostname or '').lower()}:{port}"
+    return f"{p.scheme}://{normalise_host(p.hostname or '')}:{port}"
 
 
 def parse_alt_svc(value: str | None) -> tuple[str, int, float] | None:
@@ -311,7 +316,7 @@ def use_h3(url: str, opt) -> bool:
 
 # --------------------------------------------------------- istek/yanit
 def _authority(parts: SplitResult) -> str:
-    host = parts.hostname or ""
+    host = normalise_host(parts.hostname or "")
     if ":" in host:
         host = f"[{host}]"
     port = parts.port or 443
@@ -626,12 +631,12 @@ def _resume_if_dry(conn: _Conn) -> None:
 def _key_of(url: str, opt, target: tuple[str, int] | None) -> tuple:
     """Havuz anahtari: (hedef host, port, SNI, dogrulama modu)."""
     parts = urlsplit(url)
-    host = (parts.hostname or "").lower()
+    host = normalise_host(parts.hostname or "")
     port = parts.port or 443
     if target is not None:
-        host = (target[0] or host).lower()
+        host = normalise_host(target[0] or host) or host
         port = target[1]
-    sni = (parts.hostname or host).lower()
+    sni = normalise_host(parts.hostname or "") or host
     return (host, port, sni, bool(getattr(opt, "insecure", False)))
 
 
@@ -704,9 +709,11 @@ async def _conn_close(conn: _Conn) -> None:
         _kill_transport(conn)
 
 
-async def _conn_open(key: tuple, host: str, port: int, sni: str,
-                     insecure: bool, url: str, opt) -> _Conn:
-    """Yeni bir QUIC baglantisi kurar (el sikismasi dahil)."""
+def _quic_config(sni: str, insecure: bool, tls=None):
+    """QUIC istemci yapilandirmasi; `tls` verilirse CA/mTLS uygulanir.
+
+    QUIC zaten yalniz TLS 1.3 kullanir; asgari surum ayri bir anahtar
+    gerektirmez. Dogrulama ayari SNI ile kaynagin adina baglidir."""
     api = _load()
     conf = api["QuicConfiguration"](
         is_client=True,
@@ -715,6 +722,16 @@ async def _conn_open(key: tuple, host: str, port: int, sni: str,
         server_name=sni,
         verify_mode=ssl.CERT_NONE if insecure else ssl.CERT_REQUIRED,
     )
+    if tls is not None:
+        tls.apply_quic(conf)
+    return conf
+
+
+async def _conn_open(key: tuple, host: str, port: int, sni: str,
+                     insecure: bool, url: str, opt) -> _Conn:
+    """Yeni bir QUIC baglantisi kurar (el sikismasi dahil)."""
+    api = _load()
+    conf = _quic_config(sni, insecure, getattr(opt, "tls", None))
     conn = _Conn(key, url)
     proto_cls = _protocol_class()
 
@@ -1058,8 +1075,8 @@ def request(url: str, opt, headers: dict | None = None,
     Durum >= 400 ise govde okunmaz: urllib ile ayni davranis olsun diye
     HTTPError firlatilir (job.py 429/503 dallari bunu bekler). 3xx
     yonlendirme desteklenmez: kaynak bozuk isaretlenip H3Error verilir ki
-    auto modda TCP (yonlendirmeyi izleyen yol) kullanilsin.
-    """
+    auto modda TCP (yonlendirmeyi izleyen yol) kullanilsin. TLS ayarlari
+    `opt.tls` uzerinden uygulanir (CA + istemci sertifikasi)."""
     session = _Session(url, opt, headers, float(timeout or 30),
                        target=alt_svc_target(url, _insecure(opt)))
     try:

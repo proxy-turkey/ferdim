@@ -73,6 +73,13 @@ DEFAULTS = {
     "peer_cache": False,
     "peer_port": 8379,
     "peer_dirs": [],               # bos = indirme klasoru taranir
+    # --- TLS ortak ayarlari (1.12) ---
+    # HTTP, h3 ve FTPS ayni degerleri kullanir. Yollar mutlak ve okunabilir
+    # olmali; tls_client_key bos ise anahtar sertifika dosyasindadir.
+    "tls_ca_file": "",             # ek CA paketi (sistem koklerine eklenir)
+    "tls_client_cert": "",         # mTLS istemci sertifikasi
+    "tls_client_key": "",          # "" -> anahtar sertifika dosyasinda
+    "tls_min_version": "",         # "" varsayilan | "1.2" | "1.3"
 }
 
 

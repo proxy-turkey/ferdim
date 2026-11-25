@@ -360,6 +360,11 @@ S = {
         "tr": "bu ayar yalnız masaüstü uygulamasından ya da komut satırından değiştirilebilir",
         "es": "este ajuste solo se puede cambiar desde la aplicación de escritorio o la línea de comandos",
         "ru": "эту настройку можно изменить только из приложения или командной строки"},
+    "err_tls_config": {
+        "en": "the TLS certificate or key file could not be read",
+        "tr": "TLS sertifikası ya da anahtar dosyası okunamadı",
+        "es": "no se pudo leer el certificado o la clave TLS",
+        "ru": "не удалось прочитать сертификат или ключ TLS"},
     # --------------------------------------------------------------- gecmis
     "hist_title": {
         "en": "History", "tr": "Geçmiş", "es": "Historial", "ru": "История"},

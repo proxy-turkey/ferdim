@@ -85,8 +85,13 @@ def _parse_file(raw) -> tuple[dict[str, dict], dict, int]:
     if isinstance(hosts, dict):
         for host, val in hosts.items():
             rec = _entry(val)
-            if isinstance(host, str) and host and rec is not None:
-                data[host.lower()] = rec
+            key = _normalise_key(host) if isinstance(host, str) else ""
+            if not key or rec is None:
+                continue
+            # iki yazim ayni anahtara duserse daha yeni olcum kazanir
+            old = data.get(key)
+            if old is None or rec["last_seen"] >= old["last_seen"]:
+                data[key] = rec
     extra = {k: v for k, v in raw.items() if k not in ("version", "hosts")}
     return data, extra, version
 
@@ -98,23 +103,83 @@ _DEFAULT_PORTS = {"http": (80,), "https": (443,), "ftp": (21,),
 log = logging.getLogger("ferdim.profiles")
 
 
+def normalise_host(host: str) -> str:
+    """Ana makine adini kucuk harfli ASCII (IDNA/A-label) bicime getirir.
+
+    `Bücher.example` ile `xn--bcher-kva.example` ayni anahtara duser:
+    profil, cerez ve kimlik kapsami kullanicinin yapistirdigi yazima gore
+    degismez. IPv6 sayisal adlar ve zaten punycode olan adlar korunur;
+    kok noktasi (sondaki '.') atilir. Cozulemeyen ad bos doner.
+    """
+    h = (host or "").strip()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    if not h or any(c in h for c in " /?#@\t\r\n"):
+        return ""
+    if ":" in h:                    # IPv6 (veya gecersiz): kucuk harf
+        return h.lower()
+    if h.endswith("."):             # DNS kok noktasi eslesmeyi bozmaz
+        h = h[:-1]
+    if not h:
+        return ""
+    try:
+        return h.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return h.lower()
+
+
+def _normalise_key(text: str) -> str:
+    """Saklanan anahtar bicimi: normalised ana makine + (varsa) port.
+
+    Anahtar URL degil, "host" ya da "host:port" bicimidir; IPv6 kosede
+    tasinir ("[::1]:8080"). Gecersiz anahtar bos doner.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end < 0:
+            return ""
+        host = normalise_host(raw[1:end])
+        rest = raw[end + 1:]
+        if not host:
+            return ""
+        if rest:
+            if not rest.startswith(":") or not rest[1:].isdigit():
+                return ""
+            return f"[{host}]{rest}"
+        return f"[{host}]"
+    if raw.count(":") > 1:          # ciplak IPv6
+        return normalise_host(raw)
+    host, sep, port = raw.rpartition(":")
+    if sep:
+        if not host or not port.isdigit():
+            return ""
+        h = normalise_host(host)
+        return f"{h}:{port}" if h else ""
+    return normalise_host(raw)
+
+
 def host_key(text: str) -> str:
-    """Profil anahtari: kucuk harfli ana makine; varsayilan disi port eklenir.
+    """Profil anahtari: IDNA ana makine; varsayilan disi port eklenir.
 
     Ciplak ana makine de kabul edilir ("ornek.com:8080"): CLI'den unutma
     komutu URL yazmayi gerektirmez; listede gorunen anahtar birebir eslesir.
-    Sayisal IP'ler oldugu gibi kalir.
+    Sayisal IP'ler oldugu gibi kalir. Unicode adlar ASCII (punycode) bicime
+    normalise edilir; ayni sunucunun iki yazimi tek profili paylasir.
     """
     raw = (text or "").strip()
     if not raw:
         return ""
     if "://" not in raw:
-        host = raw.lower()
         # ciplak girdi bir ana makinedir; yol/sorgu/kimlik bilgisi olamaz
-        return "" if any(c in host for c in "/?#@ ") else host
+        if any(c in raw for c in "/?#@ "):
+            return ""
+        return _normalise_key(raw)
     try:
         parts = urlsplit(raw)
-        host = (parts.hostname or "").lower()
+        host = normalise_host(parts.hostname or "")
         port = parts.port
     except ValueError:
         return ""
