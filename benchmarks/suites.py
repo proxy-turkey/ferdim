@@ -62,7 +62,10 @@ IDLE_FULL = 8.0
 IDLE_QUICK = 4.0
 IDLE_SETTLE = 1.5               # acilis gecisi (ilk kuyruk yazimi vb.)
 SSE_SETTLE = 2.0                # SSE ilk tam kareyi alana kadar
-QUEUED_FULL = 500               # KUYRUK'ta tutulan is sayisi (bkz. docs)
+QUEUED_FULL = 10_000            # KUYRUK'ta tutulan is sayisi (bkz. docs):
+                                # yoklama adaylari O(1) ve kapali
+                                # pencerede yoklama beklendigi icin
+                                # tum kuyruk KUYRUK'ta tutulabilir
 QUEUED_QUICK = 100
 IDLE_WINDOW = 0.5               # CPU ornekleme penceresi (sn)
 IO_BYTES = 2_000_000            # I/O kalibrasyonu: ~15 MiB JSON
