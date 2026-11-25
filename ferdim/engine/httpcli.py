@@ -28,6 +28,7 @@ import http.client
 import os
 import socket
 import ssl
+import stat
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field, replace
@@ -61,15 +62,59 @@ class TlsConfigError(Exception):
     code = "tls_config"
 
 
-def _readable_file(path: str) -> bool:
-    if not path or "\x00" in path or not os.path.isabs(path):
-        return False
+# TLS dosyasi ust siniri: sertifika/anahtar dosyalari kucuktur; buyuk bir
+# dosyayi (ya da bir aygit/FIFO'yu) okumak saldiri yuzeyi olurdu.
+MAX_TLS_FILE = 1 << 20          # 1 MiB
+
+
+def tls_file_path(value) -> str:
+    """TLS dosyasini dogrular ve gercek (realpath) yolunu dondurur.
+
+    Kural: mutlak yol, duzenli dosya (FIFO/aygit degil), en fazla 1 MiB,
+    sahibi bu kullanici ya da root, grup/diger yazma izni yok. Gecersizse
+    bos dize. Boylece HTTP API'den ya da elle yazilmis config.json'dan
+    gelen bir yol aygit okumasina ya da baskasinin yazabildigi bir
+    sertifikaya donusemez. Acmadan once `stat` ile tur denetlenir.
+    """
+    if not isinstance(value, str):
+        return ""
+    raw = value.strip()
+    if not raw or "\x00" in raw:
+        return ""
+    p = os.path.expanduser(raw)
+    if not os.path.isabs(p):
+        return ""
     try:
-        with open(path, "rb"):
-            pass
+        real = os.path.realpath(p)
+        st = os.stat(real)
+    except (OSError, ValueError):
+        return ""
+    if not stat.S_ISREG(st.st_mode):
+        return ""
+    if st.st_size > MAX_TLS_FILE:
+        return ""
+    if st.st_uid not in (os.geteuid(), 0):
+        return ""
+    if st.st_mode & 0o022:          # grup/diger yazma: degistirilebilir
+        return ""
+    try:
+        fd = os.open(real, os.O_RDONLY)
     except OSError:
-        return False
-    return True
+        return ""
+    os.close(fd)
+    return real
+
+
+def _file_signature(path: str):
+    """Dosyanin (realpath, mtime_ns, boyut) imzasi; yoksa None."""
+    if not path:
+        return None
+    try:
+        real = os.path.realpath(path)
+        st = os.stat(real)
+    except (OSError, ValueError):
+        return (path, -1, -1)
+    return (real, st.st_mtime_ns, st.st_size)
 
 
 @dataclass(frozen=True)
@@ -105,13 +150,23 @@ class TlsConfig:
         return t
 
     def validate(self) -> None:
-        """Dosyalar mutlak/okunabilir mi; anahtar sertifikasiz olmaz."""
+        """Dosyalar mutlak, duzenli ve guvenli mi; anahtar sertifikasiz olmaz."""
         for path in (self.ca_file, self.client_cert, self.client_key):
-            if path and not _readable_file(path):
+            if path and not tls_file_path(path):
                 raise TlsConfigError(f"TLS dosyasi okunamadi: {path}")
         if self.client_key and not self.client_cert:
             raise TlsConfigError(
                 "TLS istemci anahtari sertifika olmadan kullanilamaz")
+
+    def fingerprint(self) -> tuple:
+        """TLS ayar izi: min surum + her dosyanin (mtime_ns, boyut) imzasi.
+
+        SSL baglami onbellegi ve h3 baglanti havuzu bunu anahtara katar:
+        CA/sertifika dosyasi degistirilince eski baglanti yeniden
+        kullanilmaz."""
+        return (self.min_version,
+                tuple(_file_signature(p) for p in
+                      (self.ca_file, self.client_cert, self.client_key)))
 
     def apply_quic(self, conf) -> None:
         """aioquic QuicConfiguration'a CA + istemci sertifikasi uygular.
@@ -128,8 +183,11 @@ class TlsConfig:
 
 
 @functools.lru_cache(maxsize=8)
-def _context_for(settings: TlsConfig) -> ssl.SSLContext:
-    """Ayarlardan SSL baglami uretir (ayar basina onbelleklenir)."""
+def _context_for(settings: TlsConfig, signature: tuple) -> ssl.SSLContext:
+    """Ayarlardan SSL baglami uretir (ayar + dosya imzasi basina onbellek).
+
+    `signature` yalnizca onbellek anahtarinin parcasi; dosya degistiginde
+    (mtime_ns/boyut) yeni bir baglam uretilir, eski baglam kullanilmaz."""
     settings.validate()
     ctx = ssl.create_default_context()
     if settings.ca_file:
@@ -163,8 +221,12 @@ def tls_settings(opt) -> TlsConfig:
 
 
 def ssl_context(opt) -> ssl.SSLContext:
-    """Paylasilan TLS baglami: HTTP/FTPS ayni ayardan ayni nesneyi alir."""
-    return _context_for(tls_settings(opt))
+    """Paylasilan TLS baglami: HTTP/FTPS ayni ayardan ayni nesneyi alir.
+
+    Onbellek anahtari dosyalarin (mtime_ns, boyut) imzasini da tasir:
+    CA/sertifika degistirilince yeni baglam kurulur."""
+    settings = tls_settings(opt)
+    return _context_for(settings, settings.fingerprint())
 
 
 # ------------------------------------------------------- kimlik kapsami
@@ -574,7 +636,14 @@ def probe(url: str, opt: DlOptions) -> ProbeResult:
         if e.code not in _PROBE_RANGE_REJECT:
             raise
         # duz GET: Range basligi yok, yalniz basliklar ilgilendirir
-        res = _open_any(url, opt, opt.headers_for(url), opt.timeout)
+        try:
+            res = _open_any(url, opt, opt.headers_for(url), opt.timeout)
+        except urllib.error.HTTPError as plain:
+            try:
+                plain.close()
+            except Exception:
+                pass
+            raise
         fallback = True
     try:
         out = _probe_from(res)
@@ -619,7 +688,15 @@ def open_range(url: str, opt: DlOptions, start: int, end: int,
 
 def request_of(url: str, opt: DlOptions) -> urllib.request.Request:
     """Tek istek nesnesi. Basliklar koken kapsamina gore suzulur
-    (`headers_for`): ayna/yan dosya baska koken ise kimlik gitmez."""
+    (`headers_for`): ayna/yan dosya baska koken ise kimlik gitmez.
+
+    Yalniz http(s) kabul edilir: bu fabrika yan dosya/manifest/segment
+    istekleri icindir; ftp/file gibi semalar urllib opener'ina sizmamali
+    (FTP isleri ftp.py uzerinden gider)."""
+    scheme = urlsplit(str(url or "")).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(
+            f"desteklenmeyen tasima semasi: {scheme or 'yok'}")
     req = urllib.request.Request(url, headers=opt.headers_for(url))
     # yonlendirme zinciri boyunca ILK koken korunur (ScopedRedirectHandler)
     req._ferdim_origin = origin_of(url)

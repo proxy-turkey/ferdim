@@ -14,6 +14,7 @@ Butun ag testleri yerel sunucular kullanir (internet yok, uyku yok).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import ssl
 import subprocess
@@ -298,6 +299,30 @@ class TlsTests(unittest.TestCase):
                          (str(self.certs.client), str(self.certs.client_key)))
         self.assertEqual(conf.kw["server_name"], "example.test")
 
+    def test_context_cache_invalidates_when_file_changes(self):
+        tls = httpcli.TlsConfig(ca_file=str(self.certs.ca))
+        first_fp = tls.fingerprint()
+        a = httpcli.ssl_context(tls)
+        st = os.stat(str(self.certs.ca))
+        os.utime(str(self.certs.ca),
+                 ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        self.assertNotEqual(tls.fingerprint(), first_fp)
+        b = httpcli.ssl_context(tls)
+        self.assertIsNot(a, b, "degisen CA yeni baglam uretmeli")
+
+    def test_h3_pool_key_includes_tls_fingerprint(self):
+        opt = httpcli.DlOptions(
+            tls=httpcli.TlsConfig(ca_file=str(self.certs.ca)))
+        url = "https://example.test/x.bin"
+        k1 = h3._key_of(url, opt, None)
+        st = os.stat(str(self.certs.ca))
+        os.utime(str(self.certs.ca),
+                 ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000))
+        k2 = h3._key_of(url, opt, None)
+        self.assertEqual(len(k1), 5)
+        self.assertEqual(k1[:4], k2[:4], "hedef/SNI/mod degismemeli")
+        self.assertNotEqual(k1, k2, "TLS ayar izi havuz anahtarina girmeli")
+
 
 class TlsConfigSanitizeTests(unittest.TestCase):
     def setUp(self):
@@ -312,12 +337,13 @@ class TlsConfigSanitizeTests(unittest.TestCase):
 
     def test_valid_paths_and_version_kept(self):
         cfg = dict(paths.DEFAULTS)
+        real = os.path.realpath(str(self.file))
         cfg.update(tls_ca_file=str(self.file),
                    tls_client_cert=str(self.file),
                    tls_client_key=str(self.file),
                    tls_min_version="1.3")
         self.assertEqual(api._sanitize_config(cfg), "")
-        self.assertEqual(cfg["tls_ca_file"], str(self.file))
+        self.assertEqual(cfg["tls_ca_file"], real)
         self.assertEqual(cfg["tls_min_version"], "1.3")
 
     def test_bad_values_dropped_with_warning(self):
@@ -347,7 +373,112 @@ class TlsConfigSanitizeTests(unittest.TestCase):
         r = api.handle(ctx, "config-set",
                        {"config": {"tls_ca_file": str(self.file)}})
         self.assertNotIn("warning", r)
-        self.assertEqual(cfg["tls_ca_file"], str(self.file))
+        self.assertEqual(cfg["tls_ca_file"],
+                         os.path.realpath(str(self.file)))
+
+    def test_tls_file_keys_are_socket_only(self):
+        env = AppEnv(root=tmp_root(self, "ferdim-p112-tls-http-"))
+        cfg = env.load_config()
+        real = os.path.realpath(str(self.file))
+        http_ctx = {"qm": None, "env": env, "cfg": cfg,
+                    "set_cfg": env.save_config, "transport": "http",
+                    "restrict_paths": True}
+        for key in ("tls_ca_file", "tls_client_cert", "tls_client_key"):
+            r = api.handle(http_ctx, "config-set",
+                           {"config": {key: str(self.file)}})
+            self.assertFalse(r.get("ok"), (key, r))
+            self.assertEqual(r.get("code"), "setting_socket_only")
+            self.assertEqual(cfg[key], "")
+        # ayni degeri yeniden gondermek gecer (web tum config'i gonderir)
+        cfg["tls_ca_file"] = real
+        r = api.handle(http_ctx, "config-set",
+                       {"config": {"tls_ca_file": real}})
+        self.assertTrue(r.get("ok"), r)
+        # soket/CLI yolu serbest
+        sock_ctx = {k: v for k, v in http_ctx.items()
+                    if k not in ("transport", "restrict_paths")}
+        cfg["tls_ca_file"] = ""
+        r = api.handle(sock_ctx, "config-set",
+                       {"config": {"tls_ca_file": real}})
+        self.assertTrue(r.get("ok"), r)
+        self.assertEqual(cfg["tls_ca_file"], real)
+
+
+class TlsFileValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tmp_root(self, "ferdim-p112-tls-file-")
+
+    def test_regular_owned_file_is_accepted(self):
+        p = self.root / "ca.pem"
+        p.write_text("x", "utf-8")
+        os.chmod(p, 0o600)
+        self.assertEqual(httpcli.tls_file_path(str(p)),
+                         os.path.realpath(str(p)))
+
+    def test_relative_and_missing_rejected(self):
+        self.assertEqual(httpcli.tls_file_path("ca.pem"), "")
+        self.assertEqual(httpcli.tls_file_path(str(self.root / "yok")), "")
+
+    def test_fifo_rejected(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("mkfifo yok")
+        p = self.root / "fifo"
+        os.mkfifo(p)
+        self.assertEqual(httpcli.tls_file_path(str(p)), "")
+
+    def test_device_rejected(self):
+        if not os.path.exists("/dev/zero"):
+            self.skipTest("/dev/zero yok")
+        self.assertEqual(httpcli.tls_file_path("/dev/zero"), "")
+
+    def test_world_or_group_writable_rejected(self):
+        p = self.root / "w.pem"
+        p.write_text("x", "utf-8")
+        os.chmod(p, 0o666)
+        self.assertEqual(httpcli.tls_file_path(str(p)), "")
+        os.chmod(p, 0o664)
+        self.assertEqual(httpcli.tls_file_path(str(p)), "")
+
+    def test_oversized_rejected(self):
+        p = self.root / "big.pem"
+        with open(p, "wb") as f:
+            f.truncate(httpcli.MAX_TLS_FILE + 1)
+        os.chmod(p, 0o600)
+        self.assertEqual(httpcli.tls_file_path(str(p)), "")
+
+    def test_symlink_resolved(self):
+        target = self.root / "real.pem"
+        target.write_text("x", "utf-8")
+        os.chmod(target, 0o600)
+        link = self.root / "link.pem"
+        os.symlink(target, link)
+        self.assertEqual(httpcli.tls_file_path(str(link)),
+                         os.path.realpath(str(target)))
+
+    def test_sanitize_uses_same_rules(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("mkfifo yok")
+        p = self.root / "fifo"
+        os.mkfifo(p)
+        cfg = dict(paths.DEFAULTS)
+        cfg["tls_ca_file"] = str(p)
+        self.assertEqual(api._sanitize_config(cfg), "tls_config")
+        self.assertEqual(cfg["tls_ca_file"], "")
+
+
+class RequestSchemeTests(unittest.TestCase):
+    def test_request_of_rejects_non_http(self):
+        opt = httpcli.DlOptions()
+        for url in ("ftp://example.org/a", "file:///etc/passwd", "",
+                    "mailto:a@b"):
+            with self.assertRaises(ValueError):
+                httpcli.request_of(url, opt)
+
+    def test_request_of_accepts_http_and_https(self):
+        opt = httpcli.DlOptions()
+        for url in ("http://example.org/a", "https://example.org/a",
+                    "HTTP://example.org/a"):
+            self.assertIsNotNone(httpcli.request_of(url, opt))
 
 
 # --------------------------------------------------------------------- IDNA
