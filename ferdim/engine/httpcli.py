@@ -254,10 +254,19 @@ def ssl_context(opt) -> ssl.SSLContext:
 #  - Proxy-Authorization BURADA YOK: gecidin kimligi hedefe gitmez. Gecitli
 #    atlamada urllib'in ProxyHandler'i onu proxy URL'inden yeniden ekler;
 #    statik bir baslik yabanci kokenin sunucusuna sizardi.
+#  - Host BURADA YOK: kullanicinin verdigi Host basligi o kokenin sanal
+#    sunucusuna aittir. Yabanci koken hedefi Host'unu URL'den uretir; aksi
+#    halde 30x hedefi sanal sunucu secimini ele gecirebilirdi.
 _OPEN_HEADERS = frozenset({
-    "host", "user-agent", "accept", "accept-encoding", "connection",
+    "user-agent", "accept", "accept-encoding", "connection",
     "range", "if-range", "referer",
 })
+
+# Yonlendirme hedefi yalniz http(s) olabilir. Baska bir sema (file:, data:,
+# ftp:) indirmeyi baska bir tasimaya kacirirdi: kural `request_of` ile
+# aynidir (baslangic URL'i), fark yalnizca ifade bicimi - orada cagiranin
+# hatasi (ValueError), burada sunucu kaynakli hedef (HTTPError).
+_REDIRECT_SCHEMES = frozenset({"http", "https"})
 
 
 def origin_of(url: str) -> tuple:
@@ -298,10 +307,11 @@ def same_origin(origin: tuple, url: str) -> bool:
 
 def strip_credentials(headers: dict) -> dict:
     """Kimlik basliklarini atar: Authorization, Cookie, kullanicinin ozel
-    basliklari ve Proxy-Authorization. Kimlik OLMAYANLAR kalir: User-Agent,
-    Accept-Encoding, Connection, Range, If-Range, Referer (bak:
-    `_OPEN_HEADERS`). Gecitli atlamada proxy kimligini urllib'in ProxyHandler
-    kendisi proxy URL'inden ekler; statik bir kopya hedefe sizardi."""
+    basliklari (Host dahil) ve Proxy-Authorization. Kimlik OLMAYANLAR
+    kalir: User-Agent, Accept-Encoding, Connection, Range, If-Range,
+    Referer (bak: `_OPEN_HEADERS`). Gecitli atlamada proxy kimligini
+    urllib'in ProxyHandler kendisi proxy URL'inden ekler; statik bir kopya
+    hedefe sizardi."""
     return {k: v for k, v in headers.items()
             if str(k).strip().lower() in _OPEN_HEADERS
 }
@@ -408,9 +418,20 @@ class ScopedRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     Zincir boyunca ILK koken tasinir (`_ferdim_origin`): A->B->A donusunde
     kimlik geri gelmez, cunku A istegi B isteginin (kimliksiz) basliklari
-    uzerine kurulur. Bir kez atilan kimlik o istek icin atilmis kalir."""
+    uzerine kurulur. Bir kez atilan kimlik o istek icin atilmis kalir.
+
+    Sema kapisi: hedef http(s) degilse (file:/data:/ftp:) `HTTPError` -
+    indirme baska bir tasimaya kacamaz (bkz. `_REDIRECT_SCHEMES`). stdlib
+    yalniz file:/data:'yi kendisi reddeder; ftp: serbestti."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urljoin(str(getattr(req, "full_url", "") or ""),
+                         str(newurl or ""))
+        scheme = urlsplit(target).scheme.lower()
+        if scheme not in _REDIRECT_SCHEMES:
+            raise urllib.error.HTTPError(
+                getattr(req, "full_url", ""), code,
+                _scheme_reject_msg(scheme), headers, fp)
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is None:
             return None
@@ -423,6 +444,11 @@ class ScopedRedirectHandler(urllib.request.HTTPRedirectHandler):
         return new
 
 
+def _scheme_reject_msg(scheme: str) -> str:
+    """Sema reddi metni: `request_of` ile ayni ifade (bkz. `request_of`)."""
+    return f"yonlendirme semasi desteklenmiyor: {scheme or 'yok'}"
+
+
 # --------------------------------------------------------- baglanti havuzu
 # Range istekleri kisa: istek basina yeni TCP + TLS el sikismasi, indirilen
 # birkac yuz kilobayttan pahali. Havuz govdesi TAM okunmus ve sunucu
@@ -432,15 +458,19 @@ class ScopedRedirectHandler(urllib.request.HTTPRedirectHandler):
 # Kapsam: yalnizca DOGRUDAN (proxy'siz, socks'suz) http/https istekleri.
 # Proxy/SOCKS/h3 yollari eski urllib/h3 yolunda kalir (bkz. `_poolable`).
 POOL_TTL = 30.0          # bosta en fazla bu kadar saniye
-POOL_PER_KEY = 32        # anahtar basina bosta baglanti
-POOL_MAX = 256           # toplam bosta baglanti
+POOL_PER_KEY = 16        # anahtar basina bosta baglanti
+POOL_RESERVE = 64        # job._fd_budget'in dosya/gecici kol icin ayirdigi fd
+POOL_MAX = POOL_RESERVE // 2   # havuz fd payi: 64'un yarisi
 
 
 def _pool_max() -> int:
-    """Toplam bosta baglanti tavani: fd butcesinin sekizde biri (en cok 256).
+    """Toplam bosta baglanti tavani: fd payinin HAVUZ tarafi.
 
-    Havuzdaki her baglanti bir fd tutar; indirme isleri ayni butceyi
-    kullandigi icin tavan RLIMIT_NOFILE'dan turetilir."""
+    `job._fd_budget` baglantilara `soft - 64` fd verir ve 64'u dosya/gecici
+    kollar icin ayirir. Havuz ayni 64'luk payin en fazla yarisini kullanir:
+    boylece (linkler + havuz + dosyalar) <= soft kalir, iki katman birbirini
+    yormaz. Cok kucuk sinirlarda (soft <= 128) havuz 8'e iner; indirme yolu
+    hep calisir. Bu tavan `_ConnPool.per_key` ile birlikte uygulanir."""
     try:
         import resource
         soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
@@ -448,7 +478,7 @@ def _pool_max() -> int:
         return POOL_MAX
     if not soft or soft <= 0 or soft == getattr(resource, "RLIM_INFINITY", -1):
         return POOL_MAX
-    return max(16, min(POOL_MAX, int(soft) // 8))
+    return max(8, min(POOL_MAX, int(soft) // 16))
 
 
 class _Idle:
@@ -604,6 +634,11 @@ def close_pool(keep_sessions: bool = False) -> None:
     _POOL.clear(keep_sessions)
 
 
+def pool_max() -> int:
+    """Bosta baglanti tavani (fd butcesinin havuz payi; bkz. `_pool_max`)."""
+    return _POOL.max
+
+
 def pool_stats() -> dict:
     """Havuz sayaclari (gozlem/test): idle, keys, sessions."""
     return _POOL.stats()
@@ -651,6 +686,10 @@ class PoolTLSConnection(http.client.HTTPSConnection):
 
 # --------------------------------------------------- havuzlu istek yolu
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+# Govdesiz/sifir govdeli yanitlar: http.client bunlarda uzunlugu KOSULSUZ 0
+# sayar. Sunucu yine de bayt gondermisse sokette okunmamis veri kalir; boyle
+# bir baglanti asla havuza donmez (bkz. PooledResponse._complete).
+_BODYLESS_STATUS = frozenset({204, 304}) | frozenset(range(100, 200))
 MAX_REDIRECTS = 10        # urllib ile ayni
 MAX_REPEATS = 4           # ayni hedefe bu kadar gidilirse dongu sayilir
 # Bosta duran soket sunucu tarafinda kapanmis olabilir: gonderim/yanit
@@ -729,6 +768,11 @@ def _send_headers(headers: dict) -> dict:
     return out
 
 
+# Atilan sokette bosaltilacak en fazla bayt: gelen tampon (~2 x RCVBUF)
+# kadari yeter; fazlasi icin okumak bekleme/bellek maliyeti olurdu.
+_DRAIN_MAX = min(1 << 20, 2 * RCVBUF)
+
+
 def _safe_close(conn) -> None:
     if conn is None:
         return
@@ -743,17 +787,22 @@ def _discard(conn) -> None:
 
     Okunmamis bayt varken `close()` karsi tarafa RST gonderir; sunucu bunu
     baglanti hatasi olarak gorur. Kapanistan once tampondaki baytlari
-    bosaltmak normal kapanis (FIN) birakir. Okuma non-blocking'dir: veri
-    gelmiyorsa beklemeden kapatilir, `close()` asla stall suresi kadar
-    bloklamaz."""
+    bosaltmak normal kapanis (FIN) birakir. Okuma non-blocking'dir ve
+    TOPLAMda en fazla `_DRAIN_MAX` bayt okunur: veri gelmiyorsa (EAGAIN)
+    ya da tampon bosaldiysa beklemeden kapatilir - `close()` asla stall
+    suresi kadar bloklamaz, tampon bosaltmak bellegi de sisirmez."""
     sock = getattr(conn, "sock", None)
     if sock is not None:
+        left = _DRAIN_MAX
         try:
             sock.setblocking(False)
-            while sock.recv(65536):
-                pass
+            while left > 0:
+                data = sock.recv(min(left, 65536))
+                if not data:
+                    break             # tampon bos
+                left -= len(data)
         except (BlockingIOError, InterruptedError):
-            pass
+            pass                      # veri yok: beklemeden kapat
         except OSError:
             pass
     _safe_close(conn)
@@ -767,13 +816,14 @@ class PooledResponse:
     TAM okununca baglanti havuza doner; `close()` govde bitmeden
     cagrilirsa soket atilir: yarim okunmus baglanti yeniden kullanilmaz."""
 
-    def __init__(self, url: str, resp, key: tuple, conn):
+    def __init__(self, url: str, resp, key: tuple, conn, method: str = "GET"):
         self.url = url
         self.status = int(getattr(resp, "status", 0) or 0)
         self.code = self.status
         self.reason = getattr(resp, "reason", "") or ""
         self.msg = self.reason
         self.headers = resp.headers
+        self.method = method
         self._resp = resp
         self._key = key
         self._conn = conn
@@ -845,16 +895,33 @@ class PooledResponse:
 
     # govde sonu -----------------------------------------------------
     def _complete(self) -> bool:
-        """Govde gercekten bitti mi (baglanti yeniden kullanilabilir mi)?"""
+        """Govde gercekten bitti mi (baglanti yeniden kullanilabilir mi)?
+
+        http.client govdeyi tamamen okudugunda yaniti kapatir (`fp is None`).
+        Kalan bayt sayisi da denetlenir: `read(n)` kalan sayiyi dusurur,
+        `read()` (sinirsiz) Content-Length'i sifirlar, parcali (chunked)
+        govdede terim parcasi okununca `length` None kalir. Yarim kalan
+        govde (kalan > 0) asla havuza donmez.
+
+        204/304/1xx ve HEAD yanitlarinda http.client govdeyi KOSULSUZ sifir
+        sayar (`length = 0`); karsi taraf yine de bayt gondermisse sokette
+        okunmamis veri kalir ve yeniden kullanim sonraki yaniti kaydirirdi.
+        Bu durumlar (ve kurallara uymayan govde) hic havuza donmez."""
         resp = self._resp
-        if resp is None or not resp.isclosed():
+        if resp is None:
             return False
+        if self.method == "HEAD" or self.status in _BODYLESS_STATUS:
+            return False               # govde sozlesmesi belirsiz: kullanma
+        if not resp.isclosed():
+            return False               # govde bitmedi
         if getattr(resp, "will_close", True):
             return False               # sunucu kapatti / HTTP/1.0
         if getattr(resp, "version", 0) != 11:
-            return False
-        # Content-Length tam tuketilmediyse akis kesilmistir: soket guvenilmez
-        return not getattr(resp, "length", None)
+            return False               # HTTP/1.0 keep-alive: guvenilmez
+        remaining = getattr(resp, "length", None)
+        if getattr(resp, "chunked", False):
+            return remaining is None   # terim parcasi okundu
+        return not remaining           # Content-Length tukendi
 
     def _recycle(self) -> None:
         self._done = True
@@ -934,7 +1001,7 @@ def _request_once(ep: tuple, url: str, opt: DlOptions, headers: dict,
             raise urllib.error.URLError(ex) from ex
         if tlsig is not None:
             _remember_session(conn, key)
-        return PooledResponse(url, resp, key, conn)
+        return PooledResponse(url, resp, key, conn, method="GET")
     raise AssertionError("erisilemez")     # pragma: no cover
 
 
@@ -961,8 +1028,13 @@ def _pooled_get(url: str, opt: DlOptions, headers: dict, timeout: float):
     Yonlendirme `ScopedRedirectHandler` kuralini izler: hedef koken
     farkliysa kimlik basliklari atilir, Range/If-Range/Referer kalir (bkz.
     `strip_credentials`). Ayni hedefe MAX_REPEATS'ten fazla gidilirse
-    dongu sayilir. Havuzun kapsamadigi bir hedefe (ASCII disi yol vb.)
-    dusulurse zincirin kalani eski opener'da biter."""
+    dongu sayilir.
+
+    Sema kapisi hemen uygulanir: http(s) disi hedef (file:/data:/ftp:)
+    HTTPError ile reddedilir - eski opener'a dusup yerel dosya okumak
+    indirmeyi baska bir tasimaya kacirirdi. Havuzun kapsamadigi bir hedef
+    (ortam gecidi, ASCII disi yol) zincirin kalanini eski opener'da bitirir:
+    o istek icin gecit/karakter karari yeniden verilir (`_poolable`)."""
     origin = origin_of(url)
     hdrs = dict(headers)
     counts: dict = {}
@@ -983,9 +1055,16 @@ def _pooled_get(url: str, opt: DlOptions, headers: dict, timeout: float):
         resp.close()
         if not newurl or hop >= MAX_REDIRECTS or counts[newurl] > MAX_REPEATS:
             raise _http_error(url, resp, "yonlendirme izlenemedi")
+        scheme = urlsplit(newurl).scheme.lower()
+        if scheme not in _REDIRECT_SCHEMES:
+            raise _http_error(url, resp, _scheme_reject_msg(scheme))
         hop += 1
         if not same_origin(origin, newurl):
             hdrs = strip_credentials(hdrs)
+        if not _poolable(newurl, opt):
+            # ortam gecidi/ASCII disi hedef: kalan zincir eski opener'da
+            # (kimlik basliklari bu noktada zaten koken kapsamina gore suzuldu)
+            return _open_urllib(newurl, opt, hdrs, timeout)
         url = newurl
 
 
@@ -1097,12 +1176,26 @@ class ProbeResult:
     content_disposition: str = ""
 
 
+# Opener'in sema kapsami: yalniz http(s). stdlib'in `build_opener`i
+# varsayilan olarak FileHandler/FTPHandler/DataHandler ekler; bir yonlendirme
+# hedefi ya da hatali bir cagri yerel dosya okutabilirdi. Bu yuzden opener
+# elle kurulur: yalniz gereken varsayilanlar (hata/yanit isleme + bilinmeyen
+# sema) ve http(s) tasiyicilari. FTP indirmeleri ftp.py uzerinden gider.
+_OPENER_DEFAULTS = (
+    urllib.request.HTTPErrorProcessor,
+    urllib.request.HTTPDefaultErrorHandler,
+    urllib.request.UnknownHandler,
+)
+
+
 def _make_opener(opt: DlOptions, direct: bool = False):
     """Opener kurar; h3 seciliyse `open` istekleri h3'e devreder.
 
     direct=True: h3 yonlendirmesi kapali (h3'un TCP'ye dusus yolu, sonsuz
     donguye girmesin) ve dogrudan urllib opener'i doner. TLS baglami
-    HTTPS istegi acilinca kurulur (bozuk TLS ayari duz http isini etkilemez)."""
+    HTTPS istegi acilinca kurulur (bozuk TLS ayari duz http isini etkilemez).
+    Opener YALNIZ http(s) acar: file:/data:/ftp: isleyicileri hic kurulmaz
+    (bkz. `_OPENER_DEFAULTS`, `_REDIRECT_SCHEMES`)."""
     handlers: list[urllib.request.BaseHandler] = []
     if opt.proxy and socks.is_socks(opt.proxy):
         # SOCKS5: gecit HTTP degil, tunel acar; ProxyHandler kullanilmaz.
@@ -1118,15 +1211,24 @@ def _make_opener(opt: DlOptions, direct: bool = False):
         handlers.append(FastHTTPSHandler(opt))
         handlers.append(FastHTTPHandler())
     # yonlendirme kimlik kapsami: SOCKS/duz yol ayrimi yok, her opener'da
-    # stdlib HTTPRedirectHandler'in yerine gecer (build_opener alt sinifi
-    # gorunce varsayilani atlar)
+    # stdlib HTTPRedirectHandler'in yerine gecer
     handlers.append(ScopedRedirectHandler())
-    opener = urllib.request.build_opener(*handlers)
+    opener = urllib.request.OpenerDirector()
+    for cls in _OPENER_DEFAULTS:
+        opener.add_handler(cls())
+    for handler in handlers:
+        opener.add_handler(handler)
     return opener if direct else _Opener(opener, opt)
 
 
 def _open_urllib(url: str, opt: DlOptions, headers: dict, timeout: float):
-    """Eski yol: urllib opener'i (proxy/socks/havuz kapsami disi istekler)."""
+    """Eski yol: urllib opener'i (proxy/socks/havuz kapsami disi istekler).
+
+    Yalniz http(s): baska bir sema (file:/data:/ftp:) `request_of` ile ayni
+    gerekceyle reddedilir - buraya yalniz http(s) URL'i gelmelidir."""
+    scheme = urlsplit(str(url or "")).scheme.lower()
+    if scheme not in _REDIRECT_SCHEMES:
+        raise ValueError(f"desteklenmeyen tasima semasi: {scheme or 'yok'}")
     opener = _make_opener(opt, direct=True)
     return opener.open(urllib.request.Request(url, headers=headers),
                        timeout=timeout)

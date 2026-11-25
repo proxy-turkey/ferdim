@@ -19,7 +19,10 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 const BUS_NAME = 'org.ferdim.Daemon';
 const OBJECT_PATH = '/org/ferdim/Daemon';
 const INTERFACE = 'org.ferdim.Daemon1';
-const REFRESH_SECONDS = 2;
+// Panel `Changed` sinyaliyle beslenir (kopru kucuk kare yollar: toplamlar +
+// etkin isler). Bu yoklama yalniz kurtarma icin: kopru/daemon yeniden
+// baslarsa ya da bir sinyal kacarsa gorunum en gec bu kadar sonra duzelir.
+const RECOVERY_SECONDS = 30;
 
 function formatSpeed(bytes) {
     if (!bytes || bytes < 1)
@@ -116,7 +119,7 @@ class FerDimIndicator extends PanelMenu.Button {
         }
 
         this._refresh();
-        this._tracker.timeout(REFRESH_SECONDS, () => {
+        this._tracker.timeout(RECOVERY_SECONDS, () => {
             this._refresh();
             return GLib.SOURCE_CONTINUE;
         });
@@ -160,13 +163,18 @@ class FerDimIndicator extends PanelMenu.Button {
         } catch (e) {
             return;
         }
+        // Kopru `Changed`i kucuk tasir: toplamlar + etkin isler (biten ve
+        // iptal edilen isler listede yok). Ayni alanlar `Stats` yanitinda da
+        // var; iki yol da burada tek bicime iner.
         const jobs = Array.isArray(stats.jobs) ? stats.jobs : [];
-        const active = jobs.filter(j =>
-            j.state === 'connecting' || j.state === 'downloading');
+        const active = Number.isInteger(stats.active)
+            ? stats.active
+            : jobs.filter(j =>
+                j.state === 'connecting' || j.state === 'downloading').length;
         const speed = Number(stats.total_speed) || 0;
 
-        this._label.text = active.length
-            ? `↓ ${formatSpeed(speed)} · ${active.length}`
+        this._label.text = active
+            ? `↓ ${formatSpeed(speed)} · ${active}`
             : '';
 
         const signature = JSON.stringify(jobs.map(j =>

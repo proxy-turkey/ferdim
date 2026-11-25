@@ -139,6 +139,91 @@ class StaticTest(unittest.TestCase):
         for needle in ("def gtr(", "def set_gui_lang(", "def run_async("):
             self.assertIn(needle, src)
 
+    def test_14_queue_uses_delta_and_row_cap(self):
+        """10 000 islik kuyrukta tam kare (~6-7 MB) her karede cekilmez."""
+        src = (GUI_DIR / "app.py").read_text("utf-8")
+        self.assertIn("present.StatsWindow", src)
+        self.assertIn("self.queue.params", src)
+        self.assertIn("self.queue.apply(st)", src)
+        self.assertIn("ROW_LIMIT", src)
+        self.assertIn("REFRESH_MS", src)
+        # eski 500 ms'lik tam yoklama kalmamali; yoklama >= 1 sn
+        self.assertNotIn("timeout_add(500", src)
+        self.assertIn("timeout_add(self.REFRESH_MS", src)
+        # turbo icin ek (tam) stats istegi yok: durum son kareden
+        self.assertEqual(src.count('request("stats"'), 1)
+        # satirlar kimlige gore yerinde guncellenir (odak korunur)
+        self.assertIn("row.update(job)", src)
+
+
+class StatsWindowTest(unittest.TestCase):
+    """Kuyruk karesi sozlesmesi: delta birlestirme + pencere tavani.
+
+    `present.StatsWindow` Gtk import etmez; 10 000 islik kuyrukta arayuzun
+    her karede tam govde (~6-7 MB) cekmedigini burada dogrudan dogrulariz.
+    """
+
+    def test_01_first_frame_is_full_then_delta(self):
+        w = present.StatsWindow(limit=10)
+        self.assertEqual(w.params, {"limit": 10})
+        out = w.apply({"rev": 5, "full": True, "total_jobs": 2,
+                       "jobs": [{"id": "a"}, {"id": "b"}]})
+        self.assertEqual([j["id"] for j in out["upsert"]], ["a", "b"])
+        self.assertEqual(out["removed"], [])
+        self.assertEqual(out["total"], 2)
+        self.assertEqual(w.params, {"limit": 10, "since": 5})
+
+    def test_02_delta_merges_and_drops_removed(self):
+        w = present.StatsWindow(limit=100)
+        w.apply({"rev": 3, "full": True, "total_jobs": 2,
+                 "jobs": [{"id": "a", "state": "queued"},
+                          {"id": "b", "state": "downloading"}]})
+        out = w.apply({"rev": 4, "full": False, "total_jobs": 2,
+                       "jobs": [{"id": "b", "state": "done"}],
+                       "removed": ["a"]})
+        self.assertEqual(out["removed"], ["a"])
+        self.assertEqual([j["state"] for j in out["upsert"]], ["done"])
+        self.assertEqual(w.jobs["b"]["state"], "done")
+        self.assertNotIn("a", w.jobs)
+        # silinen is pencerede yer acti: siradaki is icin tam kare istenir
+        self.assertTrue(w.full_pending)
+        self.assertEqual(w.params, {"limit": 100})
+
+    def test_03_delta_does_not_grow_past_the_cap(self):
+        w = present.StatsWindow(limit=2)
+        w.apply({"rev": 7, "full": True, "total_jobs": 2,
+                 "jobs": [{"id": "a"}, {"id": "b"}]})
+        out = w.apply({"rev": 8, "full": False, "total_jobs": 9,
+                       "jobs": [{"id": "z"}]})       # pencere disi
+        self.assertEqual(out["upsert"], [])
+        self.assertEqual(len(w.jobs), 2)
+        self.assertEqual(w.params, {"limit": 2, "since": 8})
+
+    def test_04_full_frame_drops_rows_outside_the_page(self):
+        w = present.StatsWindow(limit=3)
+        w.apply({"rev": 2, "full": True, "total_jobs": 3,
+                 "jobs": [{"id": "a"}, {"id": "b"}, {"id": "c"}]})
+        out = w.apply({"rev": 3, "full": True, "total_jobs": 3,
+                       "jobs": [{"id": "a"}, {"id": "c"}, {"id": "d"}]})
+        self.assertEqual(sorted(out["removed"]), ["b"])
+        self.assertEqual(sorted(j["id"] for j in out["upsert"]),
+                         ["a", "c", "d"])
+
+    def test_05_lost_frame_resyncs(self):
+        w = present.StatsWindow(limit=10)
+        w.apply({"rev": 9, "full": True, "total_jobs": 3,
+                 "jobs": [{"id": f"j{i}"} for i in range(3)]})
+        # sayim tutmuyor (rev geri sarmis / kare kacti): tam kare iste
+        w.apply({"rev": 4, "full": False, "total_jobs": 1,
+                 "jobs": [{"id": "j0"}]})
+        self.assertTrue(w.full_pending)
+        self.assertEqual(w.params, {"limit": 10})
+
+    def test_06_bad_rev_forces_full(self):
+        w = present.StatsWindow()
+        self.assertTrue(w.apply({"jobs": []})["upsert"] == [])
+        self.assertEqual(w.params, {"limit": 500})   # since yok: tam kare
+
 
 class KeyTest(unittest.TestCase):
     def test_20_new_keys_all_languages(self):

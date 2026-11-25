@@ -167,6 +167,37 @@ class SyntaxTests(unittest.TestCase):
         self.assertIn("resource:///", output, output)
 
 
+class ChangedContractTests(unittest.TestCase):
+    """Panel/kopru sozlesmesi: Changed kucuk kare tasir.
+
+    Kopru (ferdim/dbusbridge.py) her watch karesini toplamlar + etkin
+    islere indirger; kabuk tarafi ayni alanlari okur ve kendi yoklamasini
+    yalniz kurtarma icin tutar. Iki dosya birlikte gonderilir.
+    """
+
+    def test_01_extension_reads_compact_fields(self):
+        src = source()
+        self.assertIn("Number.isInteger(stats.active)", src)
+        self.assertIn("stats.total_speed", src)
+        self.assertIn("stats.jobs", src)
+
+    def test_02_polling_is_recovery_only(self):
+        src = source()
+        self.assertIn("RECOVERY_SECONDS", src)
+        self.assertNotIn("REFRESH_SECONDS", src)
+        # 2 sn'lik tam yoklama kaldirildi: panel Changed ile beslenir
+        self.assertNotIn("timeout(REFRESH_SECONDS", src)
+
+    def test_03_bridge_and_extension_share_the_fields(self):
+        bridge = (ROOT / "ferdim" / "dbusbridge.py").read_text("utf-8")
+        src = source()
+        for field in ("total_speed", "active", "jobs"):
+            self.assertIn(field, src, field)
+            self.assertIn(field, bridge, field)
+        self.assertIn("compact_frame", bridge)
+        self.assertIn("STATS_JOBS_DEFAULT", bridge)
+
+
 @unittest.skipUnless(shutil.which("gnome-extensions"),
                      "gnome-extensions yok (gnome-shell paketi)")
 class PackTests(unittest.TestCase):

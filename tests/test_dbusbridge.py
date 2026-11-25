@@ -62,6 +62,73 @@ class BridgeMappingTests(unittest.TestCase):
         self.assertEqual(json.loads(payload)["total_speed"], 0)
         self.assertEqual(client.calls[1][0], "stats")
 
+    def test_stats_pulls_a_bounded_window(self):
+        """10 000 islik kuyrukta tam govde (~6-7 MB) yontemden gecmemeli.
+
+        D-Bus imzasi argumansiz kalir (eski cagiranlar bozulmaz); pencere
+        koprude varsayilanla sinirlanir, istege bagli limit verilebilir."""
+        client = FakeClient({"ok": True, "jobs": [], "total_speed": 0})
+        bridge = dbusbridge.Bridge(client)
+        bridge.call("Stats")
+        self.assertEqual(client.calls[-1],
+                         ("stats", {"limit": dbusbridge.STATS_JOBS_DEFAULT}))
+        bridge.call("Stats", 25)
+        self.assertEqual(client.calls[-1], ("stats", {"limit": 25}))
+        for bad in (0, -4, "abc", None):
+            self.assertEqual(dbusbridge.stats_params(bad),
+                             {"limit": dbusbridge.STATS_JOBS_DEFAULT}, bad)
+
+    def test_stats_dbus_signature_unchanged(self):
+        """Stats D-Bus'ta HALA argumansiz: imza degisirse eski cagiranlar
+        (gdbus call ... .Stats) kirilirdi."""
+        xml = dbusbridge.introspection_xml()
+        if not HAVE_GI:
+            self.assertNotIn("<arg type=\"i\" name=\"limit\"", xml)
+            return
+        node = Gio.DBusNodeInfo.new_for_xml(xml)
+        method = node.interfaces[0].lookup_method("Stats")
+        self.assertIsNotNone(method)
+        self.assertEqual(len(method.in_args), 0)
+        self.assertEqual(len(method.out_args), 1)
+
+    def test_changed_frame_is_compact(self):
+        """Changed: toplamlar + etkin isler; bitenler listeye girmez."""
+        jobs = [{"id": f"j{i}", "state": "downloading", "url": "http://h/"}
+                for i in range(3)]
+        jobs += [{"id": "durakladi", "state": "paused", "url": "http://h/"},
+                 {"id": "bitti", "state": "done", "url": "http://h/"},
+                 {"id": "iptal", "state": "canceled", "url": "http://h/"}]
+        frame = {"event": "stats", "rev": 9, "full": False, "removed": [],
+                 "total_speed": 1234, "active": 3, "total_jobs": len(jobs),
+                 "jobs": jobs}
+        out = json.loads(dbusbridge.compact_frame(json.dumps(frame)))
+        self.assertEqual(out["total_speed"], 1234)
+        self.assertEqual(out["active"], 3)
+        self.assertEqual(out["total_jobs"], len(jobs))
+        self.assertEqual(out["jobs_total"], 4)      # paused de menude gorunur
+        states = {j["state"] for j in out["jobs"]}
+        self.assertNotIn("done", states)
+        self.assertNotIn("canceled", states)
+        self.assertNotIn("removed", out)            # tel ayrintilari gitmez
+        self.assertNotIn("full", out)
+
+    def test_changed_frame_caps_the_job_list(self):
+        many = [{"id": f"j{i}", "state": "downloading"} for i in
+                range(dbusbridge.CHANGED_JOBS_MAX + 20)]
+        out = json.loads(dbusbridge.compact_frame(
+            json.dumps({"total_speed": 1, "jobs": many})))
+        self.assertEqual(len(out["jobs"]), dbusbridge.CHANGED_JOBS_MAX)
+        self.assertEqual(out["jobs_total"], len(many))
+
+    def test_changed_frame_rejects_garbage(self):
+        for text in ("", "  ", "bozuk", "[1, 2]", "42", "null"):
+            self.assertEqual(dbusbridge.compact_frame(text), "", text)
+        # `jobs` alani bozuksa tabanlar yine tasinir (bos liste)
+        out = json.loads(dbusbridge.compact_frame('{"total_speed": 5}'))
+        self.assertEqual(out["total_speed"], 5)
+        self.assertEqual(out["jobs"], [])
+        self.assertEqual(out["jobs_total"], 0)
+
     def test_daemon_error_becomes_bridge_error(self):
         bridge = dbusbridge.Bridge(FakeClient({"ok": False,
                                                "error": "is yok"}))
@@ -211,6 +278,11 @@ class BridgeEndToEndTests(unittest.TestCase):
             " --method %s.List" % (dbusbridge.BUS_NAME,
                                    dbusbridge.OBJECT_PATH,
                                    dbusbridge.INTERFACE),
+            # Stats imzasi argumansiz kaldi (kopru pencereyi kendi sinirlar)
+            "gdbus call --session --dest %s --object-path %s"
+            " --method %s.Stats" % (dbusbridge.BUS_NAME,
+                                    dbusbridge.OBJECT_PATH,
+                                    dbusbridge.INTERFACE),
             "gdbus call --session --dest %s --object-path %s"
             " --method %s.WebUrl" % (dbusbridge.BUS_NAME,
                                      dbusbridge.OBJECT_PATH,
@@ -226,6 +298,8 @@ class BridgeEndToEndTests(unittest.TestCase):
         output = proc.stdout + proc.stderr
         self.assertEqual(proc.returncode, 0, output)
         self.assertIn("jobs", proc.stdout)
+        # Stats argumansiz calisir (imza degismedi)
+        self.assertIn("total_speed", proc.stdout)
         self.assertIn(__version__, proc.stdout)
         self.assertIn("http://127.0.0.1:8378/#s=e2e", proc.stdout)
 

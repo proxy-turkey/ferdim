@@ -67,7 +67,11 @@ def _fd_budget(cfg: dict) -> int:
     Her aralik baglantisi ~1 fd tutar; dosya taniticisi ve gecici kollar
     icin 64 fd pay birakilir. Eszamanli is sayisina bolunur ki kuyruk
     geneli toplam tavan asilmasin. Kucuk sinirlarda en az 1 link kalir;
-    sinir okunamazsa 32 (davranis degismez)."""
+    sinir okunamazsa 32 (davranis degismez).
+
+    Bosta baglanti havuzu (httpcli) ayni 64 fd'lik payin en fazla yarisini
+    kullanir (`httpcli._pool_max`), yani linkler + havuz + dosyalar <=
+    RLIMIT_NOFILE kalir: iki katman birbirinin butcesini yemez."""
     if resource is None:      # pragma: no cover - POSIX disi
         return 32
     try:
