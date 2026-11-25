@@ -463,6 +463,9 @@ _SIZE_TEXT_RE = re.compile(
 
 
 _ZONE_CACHE: dict = {}
+# Yerel bolge cozumu: (TZ degeri ya da /etc/localtime kimligi) -> ZoneInfo.
+# Her cagride en fazla bir stat yapilir; kural degisince anahtar degisir.
+_LOCAL_ZONE: dict = {}
 
 
 def _zone_from_key(key):
@@ -487,21 +490,28 @@ def _zone_from_key(key):
     return zone
 
 
-def local_zone():
-    """Yerel saat dilimi: DST gecislerini modelleyen IANA bolgesi.
+def _local_zone_key(raw_tz: str):
+    """Yerel bolge onbellek anahtari: TZ degeri ya da /etc/localtime kimligi.
 
-    Once TZ ortam degiskeni (IANA anahtari ya da TZif yolu), sonra
-    /etc/localtime sembolik bag hedefi denenir; ikisi de cozulemezse
-    sabit ofsetli yerel saat dilimine dusulur (gecis yok, eski davranis)."""
-    import datetime as _dt
-    raw_tz = (os.environ.get("TZ") or "").strip()
+    Dosya kimligi (device/inode/mtime) hedef ZoneInfo dosyasini tanimlar;
+    sembolik bag baska bir bolgeye cevrilirse anahtar degisir."""
     if raw_tz:
-        zone = _zone_from_key(raw_tz)
-        if zone is not None:
-            return zone
-        # TZ gecerli bir IANA anahtari degil (POSIX kurali olabilir):
-        # libc'nin cozdugu sabit ofsete dus, /etc/localtime'a DONME.
-        return _dt.datetime.now().astimezone().tzinfo
+        return ("tz", raw_tz)
+    try:
+        st = os.stat("/etc/localtime")
+    except OSError:
+        return ("yok",)
+    return ("file", st.st_dev, st.st_ino, st.st_mtime_ns)
+
+
+def _resolve_local_zone(raw_tz: str):
+    """TZ / /etc/localtime sirasini uygular; cozulemezse None.
+
+    TZ gecerli bir IANA anahtari degilse (POSIX kurali) /etc/localtime'a
+    DONULMEZ: eski davranis gibi libc'nin sabit ofsetine dusulur.
+    """
+    if raw_tz:
+        return _zone_from_key(raw_tz)
     try:
         target = os.path.realpath("/etc/localtime")
         marker = os.sep + "zoneinfo" + os.sep
@@ -510,12 +520,33 @@ def local_zone():
             if zone is not None:
                 return zone
         if os.path.isfile("/etc/localtime"):
-            zone = _zone_from_key("/etc/localtime")
-            if zone is not None:
-                return zone
+            return _zone_from_key("/etc/localtime")
     except OSError:
         pass
-    return _dt.datetime.now().astimezone().tzinfo
+    return None
+
+
+def local_zone():
+    """Yerel saat dilimi: DST gecislerini modelleyen IANA bolgesi.
+
+    Once TZ ortam degiskeni (IANA anahtari ya da TZif yolu), sonra
+    /etc/localtime sembolik bag hedefi denenir; ikisi de cozulemezse
+    sabit ofsetli yerel saat dilimine dusulur (gecis yok, eski davranis).
+
+    Cozum (TZ degeri, /etc/localtime kimligi) anahtariyla onbelleklenir:
+    her cagride en fazla bir stat yapilir, kural degisince yeniden
+    cozulur. Sabit ofsetli yedek ONBELLEKLENMEZ: DST'de kaymis olurdu."""
+    import datetime as _dt
+    raw_tz = (os.environ.get("TZ") or "").strip()
+    key = _local_zone_key(raw_tz)
+    if _LOCAL_ZONE.get("key") == key:
+        return _LOCAL_ZONE["zone"]
+    zone = _resolve_local_zone(raw_tz)
+    if zone is None:
+        return _dt.datetime.now().astimezone().tzinfo
+    _LOCAL_ZONE["key"] = key
+    _LOCAL_ZONE["zone"] = zone
+    return zone
 
 
 def _now_local(zone=None):
