@@ -691,6 +691,46 @@ with sync_playwright() as p:
     page.reload()
     page.wait_for_selector("#jobList .row:has-text('arsiv.zip')", timeout=15000)
 
+    # ------------- sayim tutmazsa CANLI akis tam kareyle yeniden kurulur
+    # Istemci liste eksik gorurse rev=0 yalniz yoklamayi duzeltir; akis
+    # sunucu tarafinda kendi rev'ini tutar. Bu yuzden akis KAPATILIR,
+    # tam kare yoklanir ve akis yeniden acilir (resync).
+    def gap_events(route):
+        full = {"ok": True, "jobs": three, "rev": 41, "full": True,
+                "removed": [], "total_jobs": 3, "turbo": False,
+                "download_dir": ""}
+        # 42. rev: kare bos ama sunucu 5 is diyor -> liste eksik kaldi
+        gap = {"ok": True, "jobs": [], "rev": 42, "full": False,
+               "removed": [], "total_jobs": 5, "turbo": False,
+               "download_dir": ""}
+        try:
+            route.fulfill(status=200,
+                          headers={"Content-Type": "text/event-stream",
+                                   "Cache-Control": "no-store"},
+                          body="".join("event: stats\ndata: " + json.dumps(f)
+                                       + "\n\n" for f in (full, gap)))
+        except Exception:
+            pass
+
+    def seen(prefix):
+        return sum(1 for u in reqs if prefix in u)
+
+    reqs.clear()
+    page.route("**/api/events", gap_events)
+    page.reload()                    # ilk yuklemede akis + yoklama esitlenir
+    page.wait_for_selector("#jobList .row", timeout=15000)
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 8 and not (seen("/api/events") >= 2
+                                             and seen("/api/stats") >= 2):
+        page.wait_for_timeout(100)
+    check("resync: akis yeniden acilir", seen("/api/events") >= 2,
+          (seen("/api/events"), seen("/api/stats")))
+    check("resync: tam kare yoklamasi yapilir", seen("/api/stats") >= 2,
+          (seen("/api/events"), seen("/api/stats")))
+    page.unroute("**/api/events", gap_events)
+    page.reload()
+    page.wait_for_selector("#jobList .row:has-text('arsiv.zip')", timeout=15000)
+
     # -------------------------------------------------- azaltılmış hareket
     ctx2 = browser.new_context(viewport={"width": 1280, "height": 800},
                                reduced_motion="reduce", locale="tr-TR")

@@ -56,6 +56,11 @@ class _Handler(socketserver.StreamRequestHandler):
                     # okumaya devam eder, yavas istemci onu bloklamaz
                     if watcher is None:      # ikinci 'watch' yeni kayit acmaz
                         watcher = server.register_watcher(self.connection)
+                        if watcher is None:
+                            # izleyici siniri dolu: JSON hata satiri yaz
+                            self.wfile.write(
+                                b'{"ok":false,"code":"too_many"}\n')
+                            self.wfile.flush()
                     continue
                 from .. import api
                 try:
