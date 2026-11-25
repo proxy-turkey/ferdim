@@ -209,6 +209,9 @@ class QueueRecoveryTests(unittest.TestCase):
         qm = self._queue()
         a = self._add(qm, "a.bin")
         b = self._add(qm, "b.bin")
+        # tek is ekleme artik debonse girer (P5): ikinci tam yazim ve
+        # dolayisiyla .prev burada acikca uretilir
+        qm.flush()
         qm.shutdown()                       # ikinci yazim .prev'i olusturur
         self.assertTrue(self.path.exists())
         self.assertTrue(self.prev.exists(), "son iyi kopya yazilmaliydi")

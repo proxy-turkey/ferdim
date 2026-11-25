@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ferdim import api, util
 from ferdim.engine import queue as queue_mod
-from ferdim.engine.job import JobSpec, JobState
+from ferdim.engine.job import DownloadJob, JobSpec, JobState
 from ferdim.engine.queue import QUEUE_FILE, QueueManager
 from ferdim.paths import AppEnv
 from tests.helpers import tmp_root
@@ -53,17 +53,19 @@ def wait_until(pred, timeout=10.0):
 class QueueCase(unittest.TestCase):
     """Ortak kurulum: arka plan donguleri kapali, ag erisimi yok."""
 
-    def _queue(self, prober=False, **over) -> QueueManager:
+    def _queue(self, prober=False, saver=False, **over) -> QueueManager:
         self.env = AppEnv(root=tmp_root(self, "ferdim-p113-"))
         self.cfg = self.env.load_config()
         self.cfg.update({"max_concurrent": 0, "smart_queue": False,
                          "retries": 0, "timeout": 1, "schedule": {}})
         self.cfg.update(over)
         patches = [
-            # yazici ve tick elle denetlenir (ag yok, sabit dis yazimi yok)
+            # tick elle denetlenir (ag yok); yazici varsayilan kapali
             mock.patch.object(QueueManager, "_tick_loop", lambda self: None),
-            mock.patch.object(QueueManager, "_save_loop", lambda self: None),
         ]
+        if not saver:
+            patches.append(mock.patch.object(QueueManager, "_save_loop",
+                                             lambda self: None))
         if not prober:
             patches.append(mock.patch.object(QueueManager, "_prober_loop",
                                              lambda self: None))
@@ -110,10 +112,94 @@ class PersistenceTests(QueueCase):
         self.assertEqual(writes[0], 500, "tek yazim tum kuyrugu tasimali")
         self.assertEqual(len(self._raw_queue()), 500)
 
-    def test_single_add_is_durable_immediately(self):
+    def test_first_add_writes_and_later_adds_are_debounced(self):
+        """P5: tek ekleme debonse girer; ilk is (dosya yokken) hemen yazilir."""
+        qm = self._queue()
+        first = self._add(qm)
+        self.assertEqual([r["id"] for r in self._raw_queue()], [first.id])
+        writes = []
+        real = util.atomic_write_json
+
+        def counting(path, data):
+            writes.append(len(data))
+            real(path, data)
+
+        with mock.patch.object(util, "atomic_write_json", counting):
+            second = self._add(qm, "http://127.0.0.1:1/ikinci.bin")
+        self.assertEqual(writes, [], "tek ekleme kuyrugu hemen yazdi")
+        self.assertTrue(qm._dirty, "ekleme kirli bayragi isaretlemeli")
+        qm.flush()
+        self.assertEqual([r["id"] for r in self._raw_queue()],
+                         [first.id, second.id])
+
+    def test_state_change_is_persisted_by_the_debounced_saver(self):
+        """M3: durum gecisi tick'i beklemez, 0.5 sn pencerede diske girer."""
+        qm = self._queue(saver=True)
+        job = self._add(qm)
+        qm.flush()                      # baslangic temiz
+        self.assertFalse(qm._dirty)
+        job.state = JobState.ERROR
+        job.error = "agnet"
+        qm._job_changed(job)            # tick yok: yalniz bildirim
+        self.assertTrue(qm._dirty, "bildirim kirli bayragi isaretlemeli")
+        path = self.env.state_dir / QUEUE_FILE
+
+        def persisted():
+            try:
+                recs = json.loads(path.read_text("utf-8"))
+            except (OSError, ValueError):
+                return False
+            return any(r["id"] == job.id and r["state"] == JobState.ERROR
+                       and r["error"] == "agnet" for r in recs)
+
+        self.assertTrue(wait_until(persisted, 5),
+                        "debounce penceresinde yazilmadi")
+
+    def test_shutdown_waits_for_a_control_op_that_finishes_late(self):
+        """M2: ilk join penceresinden SONRA biten silme son yazima girer."""
         qm = self._queue()
         job = self._add(qm)
-        self.assertEqual([r["id"] for r in self._raw_queue()], [job.id])
+        entered = threading.Event()
+        real_remove = qm.remove
+
+        def slow_remove(job_id, delete_files=False):
+            entered.set()
+            time.sleep(0.05)            # ilk join penceresinden sonra biter
+            return real_remove(job_id, delete_files)
+
+        with mock.patch.object(qm, "remove", slow_remove), \
+                mock.patch.object(queue_mod, "QUEUE_CTL_FIRST_WAIT", 0.0):
+            self.assertTrue(qm.remove_async(job.id))
+            self.assertTrue(entered.wait(5))
+            qm.shutdown()
+        self.assertIsNone(qm.get(job.id))
+        self.assertEqual(self._raw_queue(), [],
+                         "gec biten silme son yazima girmeliydi")
+
+    def test_shutdown_does_not_hang_on_a_stuck_control_op(self):
+        qm = self._queue()
+        job = self._add(qm)
+        entered, release = threading.Event(), threading.Event()
+        real_remove = qm.remove
+
+        def stuck_remove(job_id, delete_files=False):
+            entered.set()
+            release.wait(10)
+            return real_remove(job_id, delete_files)
+
+        try:
+            with mock.patch.object(qm, "remove", stuck_remove), \
+                    mock.patch.object(queue_mod, "QUEUE_CTL_FIRST_WAIT", 0.0), \
+                    mock.patch.object(queue_mod, "QUEUE_CTL_TAIL_WAIT", 0.05):
+                self.assertTrue(qm.remove_async(job.id))
+                self.assertTrue(entered.wait(5))
+                t0 = time.monotonic()
+                qm.shutdown()
+                self.assertLess(time.monotonic() - t0, 3.0,
+                                "kapanis takildi")
+        finally:
+            release.set()
+        self.assertTrue(qm._closed)
 
     def test_shutdown_persists_the_latest_state(self):
         # yazici is parcacigi kapali: shutdown'in eszamanli yazimi kanitlanir
@@ -213,6 +299,21 @@ class StatsTests(QueueCase):
         self.assertTrue(future["full"], "daemon yeniden basladi: tam gorunum")
         self.assertEqual(len(future["jobs"]), 3)
         self.assertEqual(future["removed"], [])
+
+    def test_tombstone_log_stays_bounded(self):
+        """M2: silme gunlugu sinirlidir; eski since tam gorunum ister."""
+        qm = self._queue()
+        jobs = [self._add(qm, f"http://127.0.0.1:1/tb{i}.bin")
+                for i in range(6)]
+        with mock.patch.object(queue_mod, "QUEUE_TOMB_MAX", 3):
+            for job in jobs:
+                qm.remove(job.id)
+            self.assertLessEqual(len(qm._removed), 3,
+                                 "silme gunlugu sinirsiz buyudu")
+        self.assertGreater(qm._tomb_floor, 0)
+        st = qm.stats(since=0)
+        self.assertTrue(st["full"], "gunluk tasdi: tam gorunum gerekli")
+        self.assertEqual(st["removed"], [])
 
     def test_since_older_than_the_tombstone_window_is_full(self):
         qm = self._queue()
@@ -375,6 +476,31 @@ class StatsTests(QueueCase):
         self.assertIn(late.id, [j["id"] for j in delta["jobs"]])
 
 
+class EphemeralScrubTests(QueueCase):
+    def test_ephemeral_record_redacts_mirror_and_merkle_urls(self):
+        """L6: ayna ve merkle URL'lerindeki kimlik bilgisi diske yazilmaz."""
+        qm = self._queue()
+        spec = JobSpec(
+            url="http://kullanici:sifre@127.0.0.1:1/dosya.bin",
+            mirrors=["ftp://ayna:gizli@127.0.0.1:1/yedek.bin",
+                     "https://127.0.0.1:1/temiz.bin"],
+            merkle=("https://kullanici:sifre@127.0.0.1:1/"
+                    "dosya.bin.ferdim-merkle"),
+            ephemeral=True)
+        job = qm.add(spec, paused=True)
+        qm.flush()
+        raw = (self.env.state_dir / QUEUE_FILE).read_text("utf-8")
+        for secret in ("sifre", "gizli"):
+            self.assertNotIn(secret, raw, "ozel pencere sirri diskte")
+        rec = json.loads(raw)[0]
+        self.assertEqual(rec["mirrors"][0], "ftp://127.0.0.1:1/yedek.bin")
+        self.assertEqual(rec["mirrors"][1], "https://127.0.0.1:1/temiz.bin")
+        self.assertEqual(rec["merkle"],
+                         "https://127.0.0.1:1/dosya.bin.ferdim-merkle")
+        # bellekteki is etkilenmez (indirme kimlik bilgisiyle surer)
+        self.assertIn("ayna:gizli@", job.spec.mirrors[0])
+
+
 class TickCostTests(QueueCase):
     """Bosta tick: yalniz degisen/calisan islerle ugrasilir."""
 
@@ -512,6 +638,46 @@ class ControlTests(QueueCase):
         self.assertEqual(self._raw_queue(), [])
 
 
+    def test_delete_files_keeps_a_new_jobs_file(self):
+        """L3: ayni yola yazan canli is varsa son dosya SILINMEZ."""
+        qm = self._queue()
+        old = self._add(qm, URL)
+        path = old.final_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"eski indirme")
+        again = self._add(qm, URL)          # ayni URL yeniden eklendi
+        self.assertEqual(again.final_path, path)
+        self.assertTrue(qm.remove(old.id, delete_files=True))
+        self.assertTrue(path.exists(), "yeni isin dosyasi silindi")
+        # canli is kalmadiysa dosya silinir
+        self.assertTrue(qm.remove(again.id, delete_files=True))
+        self.assertFalse(path.exists())
+
+
+class JobIndexTests(QueueCase):
+    def test_get_and_remove_keep_the_index_consistent(self):
+        qm = self._queue()
+        a = self._add(qm)
+        b = self._add(qm, "http://127.0.0.1:1/b.bin")
+        self.assertIs(qm.get(a.id), a)
+        self.assertEqual(len(qm._job_index), 2)
+        self.assertTrue(qm.remove(a.id))
+        self.assertIsNone(qm.get(a.id))
+        self.assertNotIn(a.id, qm._job_index)
+        self.assertIs(qm.get(b.id), b)
+        # dogrudan listeye eklenen is (testler/olcum): indeks onarilir
+        stray = DownloadJob(qm.env, qm.cfg,
+                            JobSpec(url="http://127.0.0.1:1/s.bin"))
+        with qm._lock:
+            qm.jobs.append(stray)
+        self.assertIs(qm.get(stray.id), stray)
+        # kaldirilan isin izleri tick taramasinda temizlenir
+        with qm._lock:
+            qm.jobs.remove(stray)
+        qm._tick()
+        self.assertNotIn(stray.id, qm._job_index)
+
+
 class ProberTests(QueueCase):
     def test_at_most_three_parallel_probes_and_removed_ids_are_forgotten(self):
         concurrency = {"now": 0, "peak": 0}
@@ -556,6 +722,61 @@ class ProberTests(QueueCase):
             qm.remove(gone.id)
             self.assertNotIn(gone.id, qm._size_probed)
             self.assertNotIn(gone.id, qm._probing)
+
+
+    def test_probe_claims_do_not_scan_the_queue(self):
+        """P3: 10 000 KUYRUK isinde claim listeyi taramaz (O(1) popleft)."""
+        qm = self._queue()
+        with qm.bulk_save():
+            for i in range(10000):
+                qm.add(JobSpec(url=f"http://127.0.0.1:1/q{i}.bin"))
+        self.assertEqual(len(qm._probe_q), 10000, qm._probe_q)
+        self.assertEqual(len(qm._probe_set), 10000)
+        calls = []
+        real = QueueManager._probe_ready
+
+        def counting(self_, job):
+            calls.append(job.id)
+            return real(self_, job)
+
+        with mock.patch.object(QueueManager, "_probe_ready", counting):
+            t0 = time.perf_counter()
+            claimed = [qm._probe_claim() for _ in range(200)]
+            elapsed = time.perf_counter() - t0
+        self.assertEqual(len([j for j in claimed if j is not None]), 200)
+        self.assertEqual(len(calls), 200, "claim is listesini taradi")
+        self.assertLess(elapsed, 0.05, f"200 claim {elapsed * 1000:.0f} ms")
+        self.assertEqual(len(qm._probe_q), 9800)
+        self.assertEqual(len(qm._probing), 200)
+
+
+class DispatchTests(QueueCase):
+    def test_dispatch_picks_with_nsmallest_and_counts_slots(self):
+        """P6: hazir islerin tamami siralanmaz; yuva sayimi artiklardan."""
+        qm = self._queue(max_concurrent=1, smart_queue=True)
+        jobs = [self._add(qm, f"http://127.0.0.1:1/s{i}.bin", paused=False)
+                for i in range(20)]
+        for i, job in enumerate(jobs):
+            job.total = (i + 1) * 1000
+            with qm._lock:
+                qm._size_probed.add(job.id)
+        started = []
+        with mock.patch.object(qm, "_start_async",
+                               lambda job: started.append(job) or True), \
+                mock.patch.object(queue_mod.heapq, "nsmallest",
+                                  wraps=queue_mod.heapq.nsmallest) as spy:
+            qm._tick()
+        self.assertEqual(spy.call_count, 1, "tek nsmallest cagrisi beklenir")
+        self.assertEqual([j.id for j in started], [jobs[0].id],
+                         "tek yuvaya en kucuk is secilmeli")
+        # yuva dolu: durum sayaci (artimli) yeni is baslatmaz
+        jobs[0].state = JobState.DOWNLOADING
+        started.clear()
+        qm._tick()
+        self.assertEqual(started, [], "calisan is varken yeni is baslamaz")
+        # _start_async de sayaci kullanir (is listesi taramaz)
+        self.assertFalse(qm._start_async(jobs[5]))
+        self.assertEqual(qm._started, {})
 
 
 class LocalZoneCacheTests(unittest.TestCase):
