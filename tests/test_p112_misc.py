@@ -69,6 +69,34 @@ class FilenameTests(unittest.TestCase):
         self.assertEqual(util.sanitize_filename(""), "download.bin")
         self.assertEqual(util.sanitize_filename(". ."), "download.bin")
 
+    def test_05_control_and_bidi_chars_are_stripped(self):
+        raw = "a\x01b\u202Ec\u200Fd\u2066e\x00f\u2069g.txt"
+        name = util.sanitize_filename(raw)
+        self.assertEqual(name, "abcdefg.txt")
+        self.assertLessEqual(len(name.encode("utf-8")), util.NAME_MAX_BYTES)
+
+    def test_06_control_chars_do_not_eat_the_byte_budget(self):
+        # 300 'a' + bidi: once 300 'a' kalir, 255 bayta kirpilir
+        name = util.sanitize_filename("a" * 300 + "\u202E" + ".txt")
+        self.assertLessEqual(len(name.encode("utf-8")), util.NAME_MAX_BYTES)
+        self.assertNotIn("\u202e", name)
+        self.assertTrue(name.endswith(".txt"))
+
+
+class UniquePathTests(unittest.TestCase):
+    def test_suffix_keeps_name_within_255_bytes_and_extension(self):
+        root = tmp_root(self, "ferdim-p112-unique-")
+        root.mkdir(parents=True, exist_ok=True)
+        name = "a" * 251 + ".txt"
+        first = util.unique_path(root, name)
+        self.assertEqual(len(first.name.encode("utf-8")), util.NAME_MAX_BYTES)
+        second = util.unique_path(root, name)
+        data = second.name.encode("utf-8")
+        self.assertLessEqual(len(data), util.NAME_MAX_BYTES)
+        self.assertEqual(data.decode("utf-8"), second.name)
+        self.assertIn(" (1)", second.name)
+        self.assertTrue(second.name.endswith(".txt"))
+
 
 class ContentDispositionTests(unittest.TestCase):
     def test_01_plain_filename(self):
@@ -136,6 +164,42 @@ class DstWindowTests(unittest.TestCase):
         noon = dt.datetime(2026, 5, 1, 12, 0)
         self.assertTrue(util.window_open("10:00", "13:00", noon))
         self.assertFalse(util.window_open("02:00", "08:00", noon))
+
+
+class LocalZoneRuntimeTests(unittest.TestCase):
+    """Uretim cagrilari (now yok) bilincli yerel saat dilimini kullanmali."""
+
+    def test_01_local_zone_uses_tz_env(self):
+        with mock.patch.dict("os.environ", {"TZ": "Europe/Berlin"}):
+            zone = util.local_zone()
+        self.assertEqual(getattr(zone, "key", str(zone)), "Europe/Berlin")
+
+    @unittest.skipUnless(BERLIN is not None, "zoneinfo/Europe/Berlin yok")
+    def test_02_default_window_call_takes_the_tz_path(self):
+        second = dt.datetime(2026, 10, 25, 2, 30,
+                             tzinfo=BERLIN, fold=1)
+        with mock.patch.object(util, "local_zone", return_value=BERLIN), \
+                mock.patch.object(util, "_now_local", return_value=second):
+            self.assertFalse(util.window_open("02:15", "02:45"))
+        # naive yol ayni duvarsaatini hala "acik" sayar (eski davranis)
+        self.assertTrue(util.window_open(
+            "02:15", "02:45", second.replace(tzinfo=None)))
+
+    @unittest.skipUnless(BERLIN is not None, "zoneinfo/Europe/Berlin yok")
+    def test_03_speed_plan_default_calls_take_the_tz_path(self):
+        second = dt.datetime(2026, 10, 25, 2, 30,
+                             tzinfo=BERLIN, fold=1)
+        plan = [{"days": "", "from": "02:15", "to": "02:45",
+                 "limit": "1MB"}]
+        with mock.patch.object(util, "local_zone", return_value=BERLIN), \
+                mock.patch.object(util, "_now_local", return_value=second):
+            self.assertIsNone(util.speed_plan_rule(plan))
+            self.assertEqual(util.speed_plan_limit(plan), 0)
+        first = second.replace(fold=0)
+        with mock.patch.object(util, "local_zone", return_value=BERLIN), \
+                mock.patch.object(util, "_now_local", return_value=first):
+            self.assertIs(util.speed_plan_rule(plan), plan[0])
+            self.assertEqual(util.speed_plan_limit(plan), 1024 * 1024)
 
 
 ROUTE4 = """\
@@ -268,7 +332,8 @@ URL = "http://example.test/film.mp4"
 
 
 class ClipboardConfirmTests(unittest.TestCase):
-    def _watcher(self, action_result=True, confirm=True, grace=10.0):
+    def _watcher(self, action_result=True, confirm=True, grace=10.0,
+                 async_notify=None):
         self.qm = FakeQM()
         self.events: list = []
         self.timers: list = []
@@ -289,7 +354,8 @@ class ClipboardConfirmTests(unittest.TestCase):
         watcher = ClipboardWatcher(
             self.qm, {"clipboard_confirm": confirm, "language": "en",
                       "clipboard_extensions": ""},
-            notify_action=action, notify_plain=plain, timer=timer, grace=grace)
+            notify_action=action, notify_plain=plain, timer=timer, grace=grace,
+            async_notify=async_notify or (lambda fn: fn()))
         return watcher
 
     def test_01_action_capable_backend_queues_paused_then_resumes(self):
@@ -338,6 +404,29 @@ class ClipboardConfirmTests(unittest.TestCase):
         self.assertEqual([e[0] for e in self.events], ["plain"])
         self.assertEqual(self.timers, [])
 
+    def test_07_failed_action_keeps_the_grace_window(self):
+        w = self._watcher(action_result="error")
+        w._queue(URL)
+        job = next(iter(self.qm.jobs.values()))
+        self.assertEqual(job.state, "paused", "hata sessizce baslatmamali")
+        self.assertNotIn(("resume", "j1"), self.qm.calls)
+        self.assertEqual(self.events[-1][0], "plain")
+        self.assertEqual(len(self.timers), 1)
+        self.timers[0].fire()
+        self.assertEqual(job.state, "queued")
+
+    def test_08_notification_runs_off_the_watcher_thread(self):
+        pending: list = []
+        w = self._watcher(async_notify=pending.append)
+        w._queue(URL)
+        job = next(iter(self.qm.jobs.values()))
+        self.assertEqual(job.state, "paused")
+        self.assertEqual(self.events, [], "gdbus cagrisi bekletilmeli")
+        self.assertEqual(self.timers, [])
+        pending[0]()                       # arka plan iscisi calisti
+        self.assertEqual(self.events[0][0], "action")
+        self.assertEqual(len(self.timers), 1)
+
     def test_06_i18n_keys_present_in_every_language(self):
         for key in ("clipboard_confirm_title", "clipboard_confirm_body",
                     "clipboard_undo", "clipboard_queued_title",
@@ -356,8 +445,11 @@ class NotifyActionTests(unittest.TestCase):
 
     def test_02_scan_invokes_undo_once(self):
         hits = []
-        lines = ["giris", "ActionInvoked (uint32 7, 'undo_9_9')",
-                 "ActionInvoked (uint32 8, 'baska')"]
+        lines = ["giris",
+                 "/org/freedesktop/Notifications: org.freedesktop."
+                 "Notifications.ActionInvoked (uint32 7, 'undo_9_9')",
+                 "/org/freedesktop/Notifications: org.freedesktop."
+                 "Notifications.ActionInvoked (uint32 8, 'baska')"]
         self.assertTrue(notify_mod._scan_actions(
             lines, "undo_9_9", lambda: hits.append(1)))
         self.assertEqual(hits, [1])
@@ -398,6 +490,116 @@ class NotifyActionTests(unittest.TestCase):
             "t", "b", bus_available=lambda: False))
         self.assertTrue(notify_mod.send_plain(
             "t", "b", bus_available=lambda: True, run=lambda cmd: True))
+
+
+class ClipboardProcessTests(unittest.TestCase):
+    class Proc:
+        def __init__(self, stdout=()):
+            self.stdout = list(stdout)
+            self.terminated = False
+            self.waits: list = []
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            self.waits.append(timeout)
+            return 0
+
+    def _watcher(self):
+        return ClipboardWatcher(
+            FakeQM(), {"clipboard_extensions": ""},
+            notify_action=lambda *a: False,
+            notify_plain=lambda *a: True,
+            async_notify=lambda fn: fn())
+
+    def test_01_wayland_watch_process_is_owned_and_stopped(self):
+        w = self._watcher()
+        proc = self.Proc()
+        thread = mock.Mock()
+        with mock.patch.dict("os.environ", {"WAYLAND_DISPLAY": "wayland-0"}), \
+                mock.patch("ferdim.clipboard.shutil.which",
+                           return_value="/usr/bin/wl-paste"), \
+                mock.patch("ferdim.clipboard.subprocess.Popen",
+                           return_value=proc) as popen, \
+                mock.patch("ferdim.clipboard.threading.Thread",
+                           return_value=thread):
+            w.start()
+        self.assertEqual(popen.call_args.args[0],
+                         ["wl-paste", "--watch", "cat"])
+        self.assertIs(w._proc, proc)
+        thread.start.assert_called_once()
+        w.stop()
+        self.assertIsNone(w._proc)
+        self.assertTrue(proc.terminated)
+        self.assertTrue(proc.waits, "izleyici sureci beklenmeli (zombi yok)")
+
+    def test_02_without_wayland_polling_loop_is_used(self):
+        w = self._watcher()
+        thread = mock.Mock()
+        with mock.patch.dict("os.environ", {"WAYLAND_DISPLAY": ""}), \
+                mock.patch("ferdim.clipboard.subprocess.Popen") as popen, \
+                mock.patch("ferdim.clipboard.threading.Thread",
+                           return_value=thread):
+            w.start()
+        popen.assert_not_called()
+        self.assertIsNone(w._proc)
+        thread.start.assert_called_once()
+
+    def test_03_early_watch_exit_falls_back_to_polling(self):
+        w = self._watcher()
+        polled = []
+        w._loop = lambda: polled.append(1)
+        proc = self.Proc(stdout=[])
+        w._watch_loop(proc)
+        self.assertEqual(polled, [1])
+        self.assertTrue(proc.waits)
+
+
+class NotifyHardeningTests(unittest.TestCase):
+    def test_01_action_key_is_random(self):
+        keys = {notify_mod._action_key() for _ in range(5)}
+        self.assertEqual(len(keys), 5)
+        for key in keys:
+            self.assertRegex(key, r"^undo_[0-9a-f]{16}$")
+
+    def test_02_action_event_parses_fields_exactly(self):
+        prefix = ("/org/freedesktop/Notifications: org.freedesktop."
+                  "Notifications.ActionInvoked ")
+        self.assertTrue(notify_mod._action_event(
+            prefix + "(uint32 7, 'undo_abcd')", "undo_abcd"))
+        self.assertFalse(notify_mod._action_event(
+            prefix + "(uint32 7, 'undo_abcd_extra')", "undo_abcd"))
+        self.assertFalse(notify_mod._action_event(
+            prefix + "(uint32 7, 'undo_abcd', 'x')", "undo_abcd"))
+        self.assertFalse(notify_mod._action_event(
+            "sozde 'undo_abcd' ActionInvoked", "undo_abcd"))
+
+    def test_03_gvariant_text_strips_controls_and_bidi(self):
+        out = notify_mod._gv("a\x01\u202Eb'c\u2066d\u200F")
+        self.assertEqual(out, "'ab\\'cd'")
+        self.assertNotIn("\x01", out)
+        self.assertNotIn("\u202e", out)
+
+    def test_04_action_status_truthiness(self):
+        self.assertTrue(notify_mod.ActionStatus(notify_mod.ACTION_OK))
+        self.assertFalse(notify_mod.ActionStatus(
+            notify_mod.ACTION_UNSUPPORTED))
+        self.assertFalse(notify_mod.ActionStatus(notify_mod.ACTION_ERROR))
+
+    def test_05_reap_terminates_and_waits(self):
+        proc = ClipboardProcessTests.Proc()
+        notify_mod._reap(proc, timeout=0.5)
+        self.assertTrue(proc.terminated)
+        self.assertEqual(proc.waits, [0.5])
+
+
+class DaemonLifecycleTests(unittest.TestCase):
+    def test_clipboard_watcher_is_stopped_on_shutdown(self):
+        src = (Path(__file__).resolve().parent.parent
+               / "ferdim" / "daemon.py").read_text("utf-8")
+        self.assertIn("clipboard_watcher = ClipboardWatcher(qm, cfg)", src)
+        self.assertIn("clipboard_watcher.stop()", src)
 
 
 if __name__ == "__main__":

@@ -9,13 +9,16 @@ gunluge bir kez bilgi satiri yazilir.
 """
 from __future__ import annotations
 
-import itertools
 import logging
 import os
+import re
+import secrets
+import shutil
 import stat
 import subprocess
 import threading
 import time
+import unicodedata
 
 from . import util
 from .i18n import detect_lang, error_text, t
@@ -71,10 +74,23 @@ def _run(cmd: list[str]) -> bool:
         return False
 
 
+_BIDI_CHARS = frozenset(
+    list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A))
+    + [0x200E, 0x200F])
+_UNSAFE_CATS = frozenset(("Cc", "Cf", "Cs"))
+
+
+def _safe_text(text) -> str:
+    """Kontrol/bicim/vekil ve bidi karakterleri atar (gdbus argv guvenligi)."""
+    return "".join(
+        ch for ch in str(text)
+        if ord(ch) not in _BIDI_CHARS and unicodedata.category(ch)
+        not in _UNSAFE_CATS)
+
+
 def _gv(text: str) -> str:
-    """GVariant metin literali: tek tirnak ve ters bolu kacirilir."""
-    out = (text.replace("\\", "\\\\").replace("'", "\\'")
-               .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
+    """GVariant metin literali: kontrol karakterleri atilir, tirnak kacirilir."""
+    out = _safe_text(text).replace("\\", "\\\\").replace("'", "\\'")
     return "'" + out + "'"
 
 
@@ -126,12 +142,21 @@ def send_plain(title: str, body: str, *, run=None, bus_available=None) -> bool:
 
 # ------------------------------------------------------------ eylem bildirimi
 # freedesktop Notify eylem dizisi: duz ['ad', 'Etiket', ...]. Eylem adi
-# surec basina benzersizdir; boylece baska uygulamanin 'undo'su eslesmez.
-_ACTION_SEQ = itertools.count(1)
+# rastgele bir jetondur; boylece baska uygulamanin 'undo'su eslesmez.
+ACTION_OK = "ok"
+ACTION_UNSUPPORTED = "unsupported"      # masaustu eylemi yok: hemen kuyruk
+ACTION_ERROR = "error"                  # denendi ama basarisiz: zarif pencere
+
+
+class ActionStatus(str):
+    """notify_action sonucu; yalnizca ACTION_OK dogrudur (bool uyumlu)."""
+
+    def __bool__(self) -> bool:
+        return self == ACTION_OK
 
 
 def _action_key() -> str:
-    return "undo_%d_%d" % (os.getpid(), next(_ACTION_SEQ))
+    return "undo_" + secrets.token_hex(8)
 
 
 def _gv_array(items) -> str:
@@ -147,7 +172,8 @@ def _freedesktop_action_cmd(title: str, body: str, action_key: str,
         "--object-path", "/org/freedesktop/Notifications",
         "--method", "org.freedesktop.Notifications.Notify",
         _gv(APP_NAME), "uint32 0", _gv("ferdim"), _gv(title), _gv(body),
-        _gv_array([action_key, action_label]), "@a{sv} {}", "int32 %d" % timeout_ms,
+        _gv_array([action_key, action_label]), "@a{sv} {}",
+        "int32 %d" % timeout_ms,
     ]
 
 
@@ -164,9 +190,18 @@ def _call(cmd: list[str], timeout: float = 6.0) -> tuple[bool, str]:
         return False, ""
 
 
+# gdbus monitor ciktisi: '<yol>: org.freedesktop.Notifications.'
+# 'ActionInvoked (uint32 <id>, \\'<eylem>\\')'. Alanlar tam eslesir; metin
+# icinde gecen anahtar alt dizgi olarak kabul EDILMEZ.
+_ACTION_RE = re.compile(
+    r"org\.freedesktop\.Notifications\.ActionInvoked\s+"
+    r"\(\s*uint32\s+\d+\s*,\s*'((?:[^'\\]|\\.)*)'\s*\)\s*$")
+
+
 def _action_event(line: str, action_key: str) -> bool:
-    """gdbus monitor satiri ActionInvoked + bizim eylem anahtarimiz mi?"""
-    return "ActionInvoked" in line and ("'%s'" % action_key) in line
+    """gdbus monitor satiri tam olarak bizim ActionInvoked'imiz mi?"""
+    m = _ACTION_RE.search(str(line).strip())
+    return bool(m) and m.group(1) == action_key
 
 
 def _scan_actions(lines, action_key: str, on_action) -> bool:
@@ -176,6 +211,18 @@ def _scan_actions(lines, action_key: str, on_action) -> bool:
             on_action()
             return True
     return False
+
+
+def _reap(proc, timeout: float = 1.0) -> None:
+    """Izleyici surecini sonlandirip bekle (zombi kalmasin)."""
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=timeout)
+    except Exception:
+        pass
 
 
 def _watch_actions(action_key: str, on_action, *, spawn=None,
@@ -201,34 +248,39 @@ def _watch_actions(action_key: str, on_action, *, spawn=None,
             if timer is not None:
                 timer.cancel()
             if proc is not None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+                _reap(proc)
     threading.Thread(target=worker, daemon=True,
                      name="ferdim-notify-action").start()
 
 
 def notify_action(title: str, body: str, action_label: str,
                   on_action=None, *, timeout_ms: int = 10_000,
-                  run=None, bus_available=None, spawn=None) -> bool:
-    """Eylemli freedesktop bildirimi; tasiyici eylemi destekliyor mu?
+                  run=None, bus_available=None, spawn=None) -> ActionStatus:
+    """Eylemli freedesktop bildirimi; sonuc bir ActionStatus'tur.
 
-    Yalnizca freedesktop (gdbus) yolu eylem kabul eder; portal ya da
-    notify-send burada denenmez. False donerse cagiran bugunku davranisa
-    (eylemsiz/hemen kuyruk) duser. Tiklama ActionInvoked sinyalinden
-    okunur; kimlik yerine benzersiz eylem adi eslesir."""
+    - ACTION_OK: eylemli bildirim kabul edildi (tiklama izlenir).
+    - ACTION_UNSUPPORTED: oturum veriyolu ya da gdbus yok; eylem yok.
+    - ACTION_ERROR: cagri denendi ama basarisiz (servis yok, parse hatasi).
+      Cagiran bunu "eylem yok" saymamali: panodaki is bekleme penceresinde
+      kalir, eylemsiz bildirim yedegi gonderilir.
+    Yalnizca freedesktop (gdbus) yolu eylem kabul eder."""
     if not (bus_available or _bus_available)():
-        return False
+        return ActionStatus(ACTION_UNSUPPORTED)
+    if run is None and not shutil.which("gdbus"):
+        return ActionStatus(ACTION_UNSUPPORTED)
     key = _action_key()
-    result = (run or _call)(
-        _freedesktop_action_cmd(title, body, key, action_label, timeout_ms))
+    try:
+        result = (run or _call)(
+            _freedesktop_action_cmd(title, body, key, action_label,
+                                    timeout_ms))
+    except Exception:
+        return ActionStatus(ACTION_ERROR)
     ok = bool(result[0]) if isinstance(result, tuple) else bool(result)
     if not ok:
-        return False
+        return ActionStatus(ACTION_ERROR)
     if on_action is not None:
         _watch_actions(key, on_action, spawn=spawn, timeout_ms=timeout_ms)
-    return True
+    return ActionStatus(ACTION_OK)
 
 
 def _compose(events: list[dict], lang: str) -> tuple[str, str]:
