@@ -9,6 +9,7 @@ gunluge bir kez bilgi satiri yazilir.
 """
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import stat
@@ -104,6 +105,130 @@ def _freedesktop(run, title: str, body: str) -> bool:
 def _notify_send(run, title: str, body: str) -> bool:
     return run(["notify-send", "--app-name=" + APP_NAME, "--icon=ferdim",
                 title, body])
+
+
+def _try_backends(run, title: str, body: str) -> bool:
+    """Portal -> freedesktop -> notify-send; ilk basarili tasiyici kazanir."""
+    for backend in _BACKENDS:
+        fn = {"portal": _portal, "freedesktop": _freedesktop,
+              "notify-send": _notify_send}[backend]
+        if fn(run, title, body):
+            return True
+    return False
+
+
+def send_plain(title: str, body: str, *, run=None, bus_available=None) -> bool:
+    """Eylem desteklemeyen basit bildirim (pano geri bildirimi icin)."""
+    if not (bus_available or _bus_available)():
+        return False
+    return _try_backends(run or _run, title, body)
+
+
+# ------------------------------------------------------------ eylem bildirimi
+# freedesktop Notify eylem dizisi: duz ['ad', 'Etiket', ...]. Eylem adi
+# surec basina benzersizdir; boylece baska uygulamanin 'undo'su eslesmez.
+_ACTION_SEQ = itertools.count(1)
+
+
+def _action_key() -> str:
+    return "undo_%d_%d" % (os.getpid(), next(_ACTION_SEQ))
+
+
+def _gv_array(items) -> str:
+    return "@as [" + ", ".join(_gv(str(i)) for i in items) + "]"
+
+
+def _freedesktop_action_cmd(title: str, body: str, action_key: str,
+                            action_label: str, timeout_ms: int) -> list[str]:
+    """org.freedesktop.Notifications.Notify + eylem listesi (gdbus argv)."""
+    return [
+        "gdbus", "call", "--session",
+        "--dest", "org.freedesktop.Notifications",
+        "--object-path", "/org/freedesktop/Notifications",
+        "--method", "org.freedesktop.Notifications.Notify",
+        _gv(APP_NAME), "uint32 0", _gv("ferdim"), _gv(title), _gv(body),
+        _gv_array([action_key, action_label]), "@a{sv} {}", "int32 %d" % timeout_ms,
+    ]
+
+
+def _call(cmd: list[str], timeout: float = 6.0) -> tuple[bool, str]:
+    """Komutu calistirip (basarili mi, stdout) dondurur (bildirim kimligi)."""
+    env = _child_env()
+    if env is None:
+        return False, ""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, env=env)
+        return p.returncode == 0, (p.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+
+
+def _action_event(line: str, action_key: str) -> bool:
+    """gdbus monitor satiri ActionInvoked + bizim eylem anahtarimiz mi?"""
+    return "ActionInvoked" in line and ("'%s'" % action_key) in line
+
+
+def _scan_actions(lines, action_key: str, on_action) -> bool:
+    """Satirlari tarar; eslesen eylemde geri cagriyi calistirir (saf)."""
+    for line in lines:
+        if _action_event(line, action_key):
+            on_action()
+            return True
+    return False
+
+
+def _watch_actions(action_key: str, on_action, *, spawn=None,
+                   timeout_ms: int = 10_000) -> None:
+    """ActionInvoked sinyalini izler; sure dolunca izleyici kapanir."""
+    def worker():
+        proc = None
+        timer = None
+        try:
+            proc = (spawn or subprocess.Popen)(
+                ["gdbus", "monitor", "--session", "--dest",
+                 "org.freedesktop.Notifications"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            timer = threading.Timer(max(1.0, timeout_ms / 1000.0),
+                                    proc.terminate)
+            timer.daemon = True
+            timer.start()
+            if proc.stdout is not None:
+                _scan_actions(proc.stdout, action_key, on_action)
+        except (OSError, subprocess.SubprocessError, AttributeError):
+            return
+        finally:
+            if timer is not None:
+                timer.cancel()
+            if proc is not None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+    threading.Thread(target=worker, daemon=True,
+                     name="ferdim-notify-action").start()
+
+
+def notify_action(title: str, body: str, action_label: str,
+                  on_action=None, *, timeout_ms: int = 10_000,
+                  run=None, bus_available=None, spawn=None) -> bool:
+    """Eylemli freedesktop bildirimi; tasiyici eylemi destekliyor mu?
+
+    Yalnizca freedesktop (gdbus) yolu eylem kabul eder; portal ya da
+    notify-send burada denenmez. False donerse cagiran bugunku davranisa
+    (eylemsiz/hemen kuyruk) duser. Tiklama ActionInvoked sinyalinden
+    okunur; kimlik yerine benzersiz eylem adi eslesir."""
+    if not (bus_available or _bus_available)():
+        return False
+    key = _action_key()
+    result = (run or _call)(
+        _freedesktop_action_cmd(title, body, key, action_label, timeout_ms))
+    ok = bool(result[0]) if isinstance(result, tuple) else bool(result)
+    if not ok:
+        return False
+    if on_action is not None:
+        _watch_actions(key, on_action, spawn=spawn, timeout_ms=timeout_ms)
+    return True
 
 
 def _compose(events: list[dict], lang: str) -> tuple[str, str]:
@@ -273,12 +398,9 @@ class Notifier:
                 self._no_bus_logged = True
             return False
         self._no_bus_logged = False
-        for backend in _BACKENDS:
-            fn = {"portal": _portal, "freedesktop": _freedesktop,
-                  "notify-send": _notify_send}[backend]
-            if fn(self._run, title, body):
-                self._no_backend_logged = False
-                return True
+        if _try_backends(self._run, title, body):
+            self._no_backend_logged = False
+            return True
         if not self._no_backend_logged:
             log.info("masaustu bildirimi gonderilemedi: portal/"
                      "org.freedesktop.Notifications/notify-send erisilemedi")

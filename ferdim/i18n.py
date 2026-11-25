@@ -642,6 +642,32 @@ S = {
         "tr": "şifreli bir HLS segmenti çözülemedi",
         "es": "no se pudo descifrar un segmento HLS cifrado",
         "ru": "не удалось расшифровать зашифрованный сегмент HLS"},
+    # ---- 1.12 pano onayi (eylemli bildirim + geri al)
+    "clipboard_confirm_title": {
+        "en": "Queued from clipboard",
+        "tr": "Panodan kuyruğa alındı",
+        "es": "En cola desde el portapapeles",
+        "ru": "Добавлено из буфера обмена"},
+    "clipboard_confirm_body": {
+        "en": "{name} will start in {secs} s.",
+        "tr": "{name} {secs} sn içinde başlayacak.",
+        "es": "{name} comenzará en {secs} s.",
+        "ru": "{name} начнётся через {secs} с."},
+    "clipboard_undo": {
+        "en": "Undo",
+        "tr": "Geri al",
+        "es": "Deshacer",
+        "ru": "Отменить"},
+    "clipboard_queued_title": {
+        "en": "Queued from clipboard",
+        "tr": "Panodan kuyruğa alındı",
+        "es": "En cola desde el portapapeles",
+        "ru": "Добавлено из буфера обмена"},
+    "clipboard_queued_body": {
+        "en": "{name} queued from the clipboard.",
+        "tr": "{name} panodan kuyruğa alındı.",
+        "es": "{name} en cola desde el portapapeles.",
+        "ru": "{name} добавлено из буфера обмена."},
 }
 
 

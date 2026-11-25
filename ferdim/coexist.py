@@ -34,22 +34,39 @@ DEFAULT_LEAVE = 10.0
 DEFAULT_LATENCY = 2.5     # TTFB sismesi esigi: guncel EMA / taban
 
 
-def is_line_iface(name: str) -> bool:
-    """Arayuz hattin kendisini mi temsil ediyor? (sanal olanlar hayir)"""
+def _include_set(include) -> frozenset:
+    if isinstance(include, str):
+        include = (include,)
+    return frozenset(n for n in (include or ()) if n)
+
+
+def is_line_iface(name: str, include=()) -> bool:
+    """Arayuz hattin kendisini mi temsil ediyor? (sanal olanlar hayir)
+
+    `include` verilen adlar (varsayilan rotayi tasiyan wg*/tun* ya da
+    kullanici listesi) atlama kuralini EZER: VPN uzerinden giden hattin
+    gercek trafigi de izlenir."""
+    if name in _include_set(include):
+        return True
     return name not in SKIP_EXACT and not name.startswith(SKIP_PREFIX)
 
 
-def parse_net_dev(text: str) -> int:
+def parse_net_dev(text: str, include=()) -> int:
     """/proc/net/dev metninden hat arayuzlerinin toplam rx+tx bayti.
 
     Baslik satirlari ve sanal arayuzler atlanir; bozuk satir sayilmaz.
-    """
+    `include` DOLUYSA yalniz o adlar sayilir (VPN/tunnel dahil); bos ise
+    eski davranis (sanal olanlari atla) gecerlidir."""
     total = 0
+    only = _include_set(include)
     for line in text.splitlines():
         if ":" not in line:
             continue
         name, rest = line.split(":", 1)
-        if not is_line_iface(name.strip()):
+        name = name.strip()
+        if only and name not in only:
+            continue
+        if not only and not is_line_iface(name):
             continue
         cols = rest.split()
         if len(cols) < 9:
@@ -61,14 +78,102 @@ def parse_net_dev(text: str) -> int:
     return total
 
 
-def read_net_dev() -> int:
+def parse_route(text: str) -> str | None:
+    """/proc/net/route: varsayilan rotayi (00000000) tasiyan arayuz.
+
+    En dusuk metrik kazanir; varsayilan rota yoksa None."""
+    best = None
+    for line in text.splitlines()[1:]:
+        cols = line.split()
+        if len(cols) < 8:
+            continue
+        iface, dest, _gw, _flags, _ref, _use, metric, _mask = cols[:8]
+        if dest.lower() != "00000000":
+            continue
+        try:
+            m = int(metric, 16)
+        except ValueError:
+            continue
+        if best is None or m < best[0]:
+            best = (m, iface)
+    return best[1] if best else None
+
+
+def parse_route6(text: str) -> str | None:
+    """/proc/net/ipv6_route: ::/0 varsayilan rotasini tasiyan arayuz.
+
+    Satir bicimi: dest(32 hex) prefixlen dest_src src_plen gw metric ...
+    iface. En dusuk metrik kazanir; varsayilan rota yoksa None."""
+    best = None
+    for line in text.splitlines():
+        cols = line.split()
+        if len(cols) < 10:
+            continue
+        dest, plen, metric = cols[0], cols[1], cols[5]
+        try:
+            if int(dest, 16) != 0 or int(plen, 16) != 0:
+                continue
+            m = int(metric, 16)
+        except ValueError:
+            continue
+        if best is None or m < best[0]:
+            best = (m, cols[-1])
+    return best[1] if best else None
+
+
+def default_route_interface(route_path: str = "/proc/net/route",
+                            route6_path: str = "/proc/net/ipv6_route"
+                            ) -> str | None:
+    """Varsayilan rotayi tasiyan arayuz (IPv4 once, yoksa IPv6).
+
+    Okunamayan dosya yok sayilir; ikisi de yoksa None (eski davranis)."""
+    for path, parser in ((route_path, parse_route),
+                         (route6_path, parse_route6)):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                iface = parser(f.read())
+        except OSError:
+            iface = None
+        if iface:
+            return iface
+    return None
+
+
+def resolve_interfaces(cfg=None, route_path: str = "/proc/net/route",
+                       route6_path: str = "/proc/net/ipv6_route") -> tuple:
+    """Izlenecek arayuzler: cfg['coexist_interfaces'] varsa o, yoksa
+    varsayilan rotanin arayuzu, o da yoksa bos demet (eski davranis)."""
+    raw = (cfg or {}).get("coexist_interfaces") if cfg else None
+    if isinstance(raw, str):
+        names = [n for n in raw.replace(",", " ").split() if n]
+    elif isinstance(raw, (list, tuple)):
+        names = [str(n).strip() for n in raw if str(n).strip()]
+    else:
+        names = []
+    if names:
+        return tuple(names)
+    iface = default_route_interface(route_path, route6_path)
+    return (iface,) if iface else ()
+
+
+def read_net_dev(path: str = "/proc/net/dev", include=()) -> int:
     """Canli sayac; okunamazsa -1 (izleyici fail-open davranir)."""
     try:
-        with open("/proc/net/dev", "r", encoding="utf-8",
-                  errors="replace") as f:
-            return parse_net_dev(f.read())
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return parse_net_dev(f.read(), include)
     except OSError:
         return -1
+
+
+def read_net_dev_default(path: str = "/proc/net/dev",
+                         route_path: str = "/proc/net/route",
+                         route6_path: str = "/proc/net/ipv6_route") -> int:
+    """Varsayilan rotanin arayuzunu (VPN/tunnel dahil) izleyen okuyucu.
+
+    Varsayilan rota bulunamazsa eski davranisa (sanal arayuzleri atla)
+    duser."""
+    iface = default_route_interface(route_path, route6_path)
+    return read_net_dev(path, (iface,) if iface else ())
 
 
 class LatencySignal:
@@ -159,8 +264,16 @@ class LineMonitor:
     def __init__(self, read=None, clock=None, threshold=DEFAULT_THRESHOLD,
                  interval=DEFAULT_INTERVAL, enter_secs=DEFAULT_ENTER,
                  leave_secs=DEFAULT_LEAVE,
-                 latency_factor=DEFAULT_LATENCY):
-        self._read = read or read_net_dev
+                 latency_factor=DEFAULT_LATENCY, interfaces=None):
+        if read is not None:
+            self._read = read
+        elif interfaces is None:
+            # Varsayilan rotanin arayuzu (VPN/tunnel dahil) izlenir.
+            self._read = read_net_dev_default
+        else:
+            # cfg['coexist_interfaces'] gibi acik bir liste atlamayi ezer.
+            getter = interfaces if callable(interfaces) else (lambda: interfaces)
+            self._read = lambda: read_net_dev(include=getter())
         self.clock = clock or time.monotonic
         self.threshold = float(threshold)
         self.interval = float(interval)
