@@ -4,6 +4,13 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [1.9.1] — 2026-11-25
+
+### Fixed
+- Two new tests failed on build machines without time-zone data
+  (openSUSE) or with strict certificate checks (Arch), so those packages
+  did not get 1.9.0. No functional changes.
+
 ## [1.9.0] — 2026-11-25
 
 Protocol completeness and edge cases.

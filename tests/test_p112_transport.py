@@ -63,7 +63,10 @@ class _Certs:
                  "-keyout", str(self.ca_key), "-out", str(self.ca),
                  "-days", "1", "-subj", "/CN=FerDim Test CA",
                  "-addext", "basicConstraints=critical,CA:TRUE",
-                 "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+                 "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+                 # siki X.509 dogrulamasi (Python 3.13+ VERIFY_X509_STRICT)
+                 # anahtar kimliklerini ister; her openssl surumu eklemez
+                 "-addext", "subjectKeyIdentifier=hash")
         self._leaf("server", "serverAuth", "IP:127.0.0.1,DNS:localhost",
                    self.server, self.server_key)
         self._leaf("client", "clientAuth", None,
@@ -78,7 +81,9 @@ class _Certs:
         ext = self.root / f"{name}.ext"
         lines = ["basicConstraints=CA:FALSE",
                  "keyUsage=digitalSignature,keyEncipherment",
-                 f"extendedKeyUsage={usage}"]
+                 f"extendedKeyUsage={usage}",
+                 "subjectKeyIdentifier=hash",
+                 "authorityKeyIdentifier=keyid,issuer"]
         if san:
             lines.append(f"subjectAltName={san}")
         ext.write_text("\n".join(lines) + "\n", "utf-8")

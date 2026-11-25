@@ -169,6 +169,7 @@ class DstWindowTests(unittest.TestCase):
 class LocalZoneRuntimeTests(unittest.TestCase):
     """Uretim cagrilari (now yok) bilincli yerel saat dilimini kullanmali."""
 
+    @unittest.skipUnless(BERLIN is not None, "zoneinfo/Europe/Berlin yok")
     def test_01_local_zone_uses_tz_env(self):
         with mock.patch.dict("os.environ", {"TZ": "Europe/Berlin"}):
             zone = util.local_zone()
