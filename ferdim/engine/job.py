@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import heapq
 import http.client
 import os
 import random
@@ -38,6 +39,8 @@ from . import dash, ftp, hls, httpcli, segments, socks
 CHUNK = 1 << 16            # 64 KB okuma blogu
 MIN_SPLIT = 1 << 20        # 1 MB'dan kucuk aralik bolunmez
 CHECKPOINT_INTERVAL = 2.0  # sn
+GOVERNOR_INTERVAL = 2.5    # sn: verim valisi olcum araligi
+WAKE_FALLBACK = 5.0        # sn: kacan bir uyandirma isi kilitlemesin
 SWRR_FLOOR = 0.05          # yavas kaynaklar bile en iyinin %5'i kadar pay alir
 RATE_WINDOW = 2.0          # kaynak hizi olcum penceresi (sn)
 SIDECAR_ALGOS = ("sha256", "sha512", "md5", "sha1")   # en gucluden
@@ -443,6 +446,75 @@ class JobSpec:
         )
 
 
+class PendingRanges:
+    """Kalan aralik kuyrugu: O(log n) en buyuk aralik + toplam bayt sayaci.
+
+    Eski kod her alista listenin TAMAMINI siralayip son elemani aliyordu
+    (esit boyda en SON eklenen kazanir); heapq ayni sirayi verir. Toplam
+    bayt her push/pop/clear'da guncellenir: governor pending boyutunu
+    taramadan bilir. Diske yazilan bicim degismez (`to_list`).
+
+    Kilit YOKTUR: cagiran (DownloadJob) kendi kilidi altinda kullanir."""
+
+    __slots__ = ("_heap", "_seq", "_total")
+
+    def __init__(self, ranges=()):
+        self._heap: list[tuple[int, int, int, int]] = []
+        self._seq = 0
+        self._total = 0
+        for s, e in ranges:
+            self.push(s, e)
+
+    def push(self, s: int, e: int) -> None:
+        self._seq += 1
+        self._total += e - s + 1
+        heapq.heappush(self._heap, (-(e - s + 1), -self._seq, s, e))
+
+    def pop_largest(self) -> tuple[int, int] | None:
+        if not self._heap:
+            return None
+        _, _, s, e = heapq.heappop(self._heap)
+        self._total -= e - s + 1
+        return (s, e)
+
+    def clear(self) -> None:
+        self._heap.clear()
+        self._total = 0
+
+    @property
+    def total(self) -> int:
+        return self._total
+
+    def to_list(self) -> list[tuple[int, int]]:
+        """Ekleme sirasinda liste (denetim noktasi ve karsilastirmalar)."""
+        return [(s, e) for _, _, s, e in
+                sorted(self._heap, key=lambda x: -x[1])]
+
+    def __iter__(self):
+        return iter(self.to_list())
+
+    def __len__(self) -> int:
+        return len(self._heap)
+
+    def __contains__(self, rng) -> bool:
+        try:
+            s, e = rng
+        except (TypeError, ValueError):
+            return False
+        return any((s, e) == (p, q) for _, _, p, q in self._heap)
+
+    def __eq__(self, other) -> bool:
+        # eski liste gorunumu: testler/kurtarma kodu listeyle karsilastirir
+        if isinstance(other, PendingRanges):
+            return self.to_list() == other.to_list()
+        try:
+            return self.to_list() == list(other)
+        except TypeError:
+            return NotImplemented
+
+    __hash__ = None
+
+
 class DownloadJob:
     def __init__(self, env: AppEnv, cfg: dict, spec: JobSpec,
                  job_id: str | None = None, on_change=None, bucket=None):
@@ -510,7 +582,7 @@ class DownloadJob:
         self._probe_t: threading.Thread | None = None   # ayna yoklamasi
         self._runner: threading.Thread | None = None   # hls/dash/ftp kosucusu
         self._fd: int | None = None
-        self._pending: list[tuple[int, int]] = []   # kalan araliklar
+        self._ranges = PendingRanges()      # kalan araliklar (heap + toplam)
         self._etag = ""
         self._last_modified = ""
         self._ftp_mtime = ""      # FTP MDTM: resume dogrulamasi
@@ -562,7 +634,11 @@ class DownloadJob:
         self._content_type = ""    # sunucunun bildirdigi tur (yumusak 404)
         self._reserved: Path | None = None   # sahiplenilmis son ad (yer tutucu)
         self._sc_lock = threading.Lock()   # yan dosya <-> bitis el skmasmasi
+        # yazma nobeti: pwrite KILIT DISINDA yapilir, fd kapatma bu nobeti
+        # bekler (fd numarasi yazma sirasinda geri donusume ugrayamaz)
+        self._write_lock = threading.Lock()
         self._finalized = threading.Event()
+        self._publishing = False   # _finalize_file yer tutucuyu yayinliyor
         self._dir: Path | None = None    # hedef klasor: ilk erisimde sabitlenir
         self._retries = 5
         self._stall = 20           # sn: bu kadar sure bayt gelmezse akis durdu
@@ -807,15 +883,26 @@ class DownloadJob:
     def _close_fd(self) -> None:
         """Acik .part taniticiyi kapatir. Her hazirlik ONCE kapatir: duraklat
         /devam dongusunde her turda bir fd acikta kaliyordu (sizinti).
-        Kilit altinda: esbaz onbelleginin yazma denetimi fd'yi AYNI anda
-        gormeli (kapanmis numara yeni kosuda yeniden kullanilabilir)."""
-        with self._lock:
-            fd, self._fd = self._fd, None
+        Yazma nobeti once alinir: suren bir pwrite bitmeden fd kapanmaz
+        (numara geri donusume ugrayip baska dosyaya yazilmaz); ic kilit
+        yalnizca takas icindir, pwrite'i beklemez."""
+        with self._write_lock:
+            with self._lock:
+                fd, self._fd = self._fd, None
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
+
+    def _pwrite(self, data: bytes, off: int) -> int:
+        """`.part`a yazar. `_lock` TUTULMAZ: yalniz yazma nobeti alinir;
+        boylece yavas disk denetim noktasini/duraklatmayi kilitlemez."""
+        with self._write_lock:
+            fd = self._fd
+            if fd is None:
+                raise OSError(errno.EBADF, "fd kapali")
+            return os.pwrite(fd, data, off)
 
     def _open_part(self, flags: int) -> int:
         """`.part` taniticisini acar (tek nokta: testler fd tukenmesini
@@ -842,9 +929,14 @@ class DownloadJob:
         """Sahiplenilmis ama doldurulmamis son ad yer tutucusunu siler.
 
         Kilit altinda: yayinlama ile ayni kritik bolumde karar verilir.
-        Yayinlandiysa (`_reserved` replace sonrasi temizlenir) hicbir sey
-        silinmez - gercek dosya yer tutucu sanilip kaldirilmaz."""
+        Yayinlama suruyorsa (`_publishing`) ad finalize'in elindedir: burada
+        birakilmaz, yoksa arada baska bir is ayni adi sahiplenip iki yayin
+        birbirinin dosyasini ezebilirdi. Yayinlandiysa (`_reserved` replace
+        sonrasi temizlenir) hicbir sey silinmez - gercek dosya yer tutucu
+        sanilip kaldirilmaz."""
         with self._lock:
+            if self._publishing:
+                return
             p, self._reserved = self._reserved, None
             if p is None or self._finalized.is_set():
                 return
@@ -978,7 +1070,7 @@ class DownloadJob:
 
         if self._resumable(resume_meta, p):
             self._pending = [tuple(r) for r in resume_meta["ranges"]]
-            self.done = max(0, self.total - sum(e - s + 1 for s, e in self._pending)) \
+            self.done = max(0, self.total - self._pending.total) \
                 if self.total > 0 else int(resume_meta.get("done", 0))
             # sunucunun kabul ettigi isci sayisini hatirla
             if resume_meta.get("allowed"):
@@ -1183,12 +1275,30 @@ class DownloadJob:
         mon.start()
         self._monitor = mon
 
+    # ------------------------------------------------------------- araliklar
+    @property
+    def _pending(self) -> PendingRanges:
+        """Kalan aralik kuyrugu. Liste atamasi (testler, kurtarma) kabul
+        edilir: liste ayni ekleme sirasiyla PendingRanges'e cevrilir."""
+        return self._ranges
+
+    @_pending.setter
+    def _pending(self, ranges) -> None:
+        self._ranges = (ranges if isinstance(ranges, PendingRanges)
+                        else PendingRanges(ranges))
+
+    def _push_pending_locked(self, s: int, e: int) -> None:
+        """Kuyruga aralik ekler ve park etmis iscileri uyandirir (kilitli:
+        `_lock`/`_cond` ayni RLock'tir)."""
+        self._pending.push(s, e)
+        self._cond.notify_all()
+
     def _take_range(self) -> tuple[int, int] | None:
         with self._lock:
-            if not self._pending:
+            rng = self._pending.pop_largest()
+            if rng is None:
                 return None
-            self._pending.sort(key=lambda r: r[1] - r[0])
-            s, e = self._pending.pop()
+            s, e = rng
             if self.total > 0 and e - s + 1 > 2 * self._min_split:
                 # DINAMIK aralik boyutu: isci basi hiza gore ~8 saniyelik
                 # lokma; hizli sunucuda baglanti israfini azaltir, yavasta
@@ -1197,10 +1307,10 @@ class DownloadJob:
                 if e - s + 1 > 2 * target:
                     cut = max(s, e - int(target))
                     if s < cut:
-                        self._pending.append((s, cut - 1))
+                        self._push_pending_locked(s, cut - 1)
                         return (cut, e)
                 mid = (s + e + 1) // 2
-                self._pending.append((s, mid - 1))
+                self._push_pending_locked(s, mid - 1)
                 return (mid, e)
             return (s, e)
 
@@ -1212,7 +1322,7 @@ class DownloadJob:
         return int(max(floor, min(per * 8.0, 32 << 20)))
 
     def _pending_bytes_locked(self) -> int:
-        return sum(e - s + 1 for s, e in self._pending)
+        return self._pending.total
 
     def _ceiling_locked(self) -> int:
         """Baglanti tavani: sunucu tavani, dis (birlikte yasam) tavani ve
@@ -1297,7 +1407,7 @@ class DownloadJob:
         """
         g = self._gov
         now = time.monotonic()
-        if now - g["t"] < 2.5:
+        if now - g["t"] < GOVERNOR_INTERVAL:
             return
         with self._lock:
             if self.kind != "http" or self.total <= 0 \
@@ -1428,7 +1538,9 @@ class DownloadJob:
                     self.extra.pop("retry_after_until", None)
             if left <= 0:
                 return True
-            if self._stop.wait(min(left, 1.0)):
+            # kapi yalnizca ZAMANLA acilir: tam kalan sure beklenir (yoklama
+            # yok); uzatilirsa dongu yeni _not_before'u yeniden okur
+            if self._stop.wait(left):
                 return False
 
     def _pick_locked(self, now: float) -> tuple[_Src | None, bool]:
@@ -1472,18 +1584,23 @@ class DownloadJob:
 
     def _next_source(self) -> _Src | None:
         """Sonraki baglanti icin kaynak. Canli kaynak var ama hepsi cezaliysa
-        yer acilana kadar bekler (0.5 sn'de bir yeniden bakar). None: is
+        en yakin cooldown bitimine kadar bekler (yoklama yok: kaynak
+        durumunu degistiren her yol `_cond` ile uyandirir). None: is
         durduruldu ya da tum kaynaklar olu."""
         with self._cond:
             while True:
                 if self._stop.is_set():
                     return None
-                pick, wait = self._pick_locked(time.monotonic())
+                now = time.monotonic()
+                pick, wait = self._pick_locked(now)
                 if pick is not None:
                     return pick
                 if not wait:
                     return None
-                self._cond.wait(0.5)
+                left = min((s.cooldown - now for s in self._srcs
+                            if not s.dead and s.cooldown > now),
+                           default=WAKE_FALLBACK)
+                self._cond.wait(min(max(left, 0.01), WAKE_FALLBACK))
 
     def _others_alive(self, src: _Src) -> bool:
         """Baska canli kaynak var mi? Varsa tek kaynakin hatasi isi
@@ -1690,6 +1807,10 @@ class DownloadJob:
         """Slot alir. Fazla iscalar OLMEZ, park edilir: governor buyudugunde
         aninda devreye girerler (baglanti sayisi aktif slotlarla sinirli).
 
+        Park etmis isci YOKLAMAZ: aralik iadesi, slot birakma, izin artisi
+        ve durdurma `_cond.notify_all()` ile uyandirir; uzun zaman asimi
+        yalnizca kacan bir olaya karsi guvenlik agidir.
+
         `gen` verilirse eski kusak isci aralik ALMAZ: kuyruk yeniden
         kuruldugunda (restart/tek akisa dusme) eski isci yeni araligi
         kapip isleyemez (aralik kaybolmaz)."""
@@ -1700,17 +1821,20 @@ class DownloadJob:
                     return None
                 if not self._pending:
                     if self._active == 0:
-                        return None  # her sey bitti
-                    self._cond.wait(0.3)
+                        # her sey bitti: bekleyen monitor'u de uyandir
+                        self._cond.notify_all()
+                        return None
+                    self._cond.wait(WAKE_FALLBACK)
                     continue
                 if self._active < self._allowed:
                     self._active += 1
                     rng = self._take_range()
                     if rng is None:  # yaris sarti
                         self._active -= 1
+                        self._cond.notify_all()
                         return None
                     return rng
-                self._cond.wait(0.3)
+                self._cond.wait(WAKE_FALLBACK)
 
     def _release(self) -> None:
         with self._cond:
@@ -1841,8 +1965,7 @@ class DownloadJob:
             target = self._target_size_locked()
             if e - cursor + 1 > 2 * target:
                 cut = cursor + int(target)
-                self._pending.append((cut, e))
-                self._cond.notify_all()
+                self._push_pending_locked(cut, e)
                 return cut - 1
         return e
 
@@ -1867,7 +1990,7 @@ class DownloadJob:
                 with self._lock:
                     left = self._inflight.pop(wid, None)
                     if left and gen == self._gen:
-                        self._pending.append(left)
+                        self._push_pending_locked(*left)
                 raise
             finally:
                 self._release()
@@ -1999,8 +2122,8 @@ class DownloadJob:
 
         def requeue():
             with self._lock:
-                self._pending.append((cursor, e))
                 self._inflight.pop(wid, None)      # artik kuyrukta, elde degil
+                self._push_pending_locked(cursor, e)
 
         def backoff():
             nonlocal attempt
@@ -2024,7 +2147,7 @@ class DownloadJob:
                     # parca siniri): gelen baytlar yazilir, KALAN aralik
                     # yeniden kuyruga girer. Hata degildir.
                     with self._lock:
-                        self._pending.append((served + 1, e))
+                        self._push_pending_locked(served + 1, e)
                         self._inflight[wid] = (cursor, served)
                     e = served
                 # TTFB: baglanti + basliklara kadar gecen sure. Ek istek
@@ -2163,8 +2286,23 @@ class DownloadJob:
                         if gen == self._gen:
                             requeue()
                         return (0.0, True)
+                    try:
+                        # KILIT DISINDA, yalniz yazma nobeti altinda: yavas
+                        # disk iscileri/monitor'u kilitlemez. Baytlar ONCE
+                        # yazilir, muhasebe SONRA _lock altinda yapilir:
+                        # nokta yazilmamis bayti 'bitti' saymaz.
+                        n = self._pwrite(chunk, cursor)
+                    except OSError as ex:
+                        if ex.errno == errno.EBADF:
+                            # fd bizden once kapatildi (iptal): sayma,
+                            # aralik cursor'dan kuyruga doner
+                            if gen == self._gen:
+                                requeue()
+                            return (0.0, True)
+                        raise
+                    if n != len(chunk):
+                        raise IOError("kisa yazim")
                     with self._lock:
-                        os.pwrite(self._fd, chunk, cursor)
                         cursor += len(chunk)
                         self.done += len(chunk)
                         self._wrote += len(chunk)      # nokta fsync'i buna bakar
@@ -2343,11 +2481,15 @@ class DownloadJob:
 
         def write(off: int, data: bytes) -> bool:
             with self._lock:
-                if halted() or self._fd is None:
+                if halted():
                     return False
-                try:
-                    os.pwrite(self._fd, data, off)
-                except OSError:
+            try:
+                # KILIT DISINDA: yazma nobeti fd'nin kapanmasini engeller
+                self._pwrite(data, off)
+            except OSError:
+                return False
+            with self._lock:
+                if halted():
                     return False
                 self._wrote += len(data)    # esbaz baytlari da diske inmeli
             return True
@@ -2482,23 +2624,34 @@ class DownloadJob:
             self._after_run()
             return
         while True:
-            time.sleep(0.2)
             if self._stop.is_set():
                 self._fold_threads()
                 return
             self._governor_tick()
-            with self._lock:
-                alive = any(t.is_alive() for t in self._threads)
+            with self._cond:
                 empty = not self._pending
                 restart = self._restart_needed
                 ignored = self._ranges_ignored
+                # bitti mi: kuyruk bos ve elde aralik yok (park etmis isci
+                # bitisi geciktirmez). Tum isciler olmusse de bitistir:
+                # muhasebe kacagi isi sonsuza dek asili birakmasin.
+                finished = empty and (
+                    self._active == 0
+                    or not any(t.is_alive() for t in self._threads))
+                # YOKLAMA YOK: sonraki governor anina kadar bekle; isci
+                # birakma/iade ve durdurma `_cond.notify_all()` ile uyandirir.
+                if not restart and not ignored and not finished:
+                    left = self._gov["t"] + GOVERNOR_INTERVAL \
+                        - time.monotonic()
+                    self._cond.wait(min(max(left, 0.005), WAKE_FALLBACK))
+                    continue
             if ignored:
                 self._degrade_ranges()
                 return
             if restart:
                 self._do_restart()
                 return
-            if not alive and empty:
+            if finished:
                 if self._finish():
                     continue        # onarim araliklari kuyruga girdi
                 if self._stop.is_set():
@@ -2887,6 +3040,10 @@ class DownloadJob:
         try:
             with self._lock:
                 self._finalized.clear()   # bu deneme henuz yayinlanmadi
+                # yer tutucu yayinlanana kadar BIZDE: cancel()/hata yolu
+                # `_drop_reservation` adi bu arada birakmaz (baska is ayni
+                # adi kapip iki yayin birbirini ezmez)
+                self._publishing = True
             if self._fd is not None:
                 try:
                     # os.replace oncesi: dosya diske inmeli (.part -> son ad)
@@ -2915,7 +3072,10 @@ class DownloadJob:
                 finally:
                     os.close(fd)
             with self._lock:
-                self._reserved = None          # ad artik dosyanin kendisi
+                # replace BASARILI: ad artik dosyanin kendisi. Yer tutucu
+                # kaydi ancak simdi birakilir (yayin penceresi kapandi).
+                self._reserved = None
+                self._publishing = False
             # ad degisikligi diske insin; sonra nokta dosyasi kaldirilir
             fsync_dir(self.target_dir)
             self.final_filename = dest.name
@@ -2951,6 +3111,8 @@ class DownloadJob:
                 self.state = JobState.DONE
         except Exception as ex:
             self.extra.pop("verifying", None)
+            with self._lock:
+                self._publishing = False
             self._drop_reservation()      # doldurulmamis ad yer tutucusu
             self._fail(str(ex), _code_for(ex))
         if self.state == JobState.DONE:
