@@ -1,5 +1,6 @@
 {
   "calibration": 33.645367196903855,
+  "cpu_count": 12,
   "generated": "2026-11-25T19:17:48Z",
   "io_calibration": 3.7208944981800567,
   "metrics": {

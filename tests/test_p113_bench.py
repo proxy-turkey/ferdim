@@ -1,10 +1,9 @@
 """1.13 performans kapisi - karsilastirma mantigi (hizli test; olcum YOK).
 
 Gercek benchmark'lar saniyeler surer ve makineye bagimlidir; burada
-yalnizca saf karsilastirma/normalizasyon/floor fonksiyonlari ve depodaki
-baseline dosyasinin gecerliligi dogrulanir (JSON okuma + aritmetik).
-Baseline, 1.13 lane'leri birlestikten sonra integrator tarafindan
-yenilenecegi icin metrik adlarinin birebir eslesmesi beklenmez.
+yalnizca saf karsilastirma/normalizasyon/floor/ortam fonksiyonlari ve
+depodaki baseline dosyasinin gecerliligi dogrulanir (JSON okuma +
+aritmetik).
 """
 from __future__ import annotations
 
@@ -21,10 +20,9 @@ BASELINE = (Path(__file__).resolve().parent.parent
             / "benchmarks" / "baseline.json")
 
 
-def _one(name, actual, base=None, cpu=1.0, io=1.0, absolute_ok=True):
+def _one(name, actual, base=None, cpu=1.0, io=1.0, env=True):
     baseline = {} if base is None else {name: base}
-    return compare.compare(baseline, {name: actual}, cpu, io,
-                           absolute_ok)[0]
+    return compare.compare(baseline, {name: actual}, cpu, io, env)[0]
 
 
 class RateMetricTest(unittest.TestCase):
@@ -67,6 +65,50 @@ class RateMetricTest(unittest.TestCase):
         self.assertIn("floor", v["note"])
         self.assertEqual(_one("engine_mib_s", 160.0, base=100.0)["status"],
                          "ok")
+
+
+class EnvironmentTest(unittest.TestCase):
+    """Ortam kapisi: cekirdege duyarli metriklerde drift atlanir."""
+
+    SAME = {"platform": "linux", "python": "3.14.10", "cpu_count": 12}
+
+    def test_environments_match(self):
+        self.assertTrue(compare.environments_match(self.SAME, dict(self.SAME)))
+        # eski baseline'da cpu_count yok: bilinmeyen alan uyusmazlik degil
+        old = dict(self.SAME)
+        old.pop("cpu_count")
+        self.assertTrue(compare.environments_match(old, dict(self.SAME)))
+
+    def test_cpu_count_mismatch(self):
+        current = dict(self.SAME, cpu_count=2)
+        self.assertFalse(compare.environments_match(self.SAME, current))
+
+    def test_python_minor_mismatch(self):
+        current = dict(self.SAME, python="3.13.7")
+        self.assertFalse(compare.environments_match(self.SAME, current))
+
+    def test_platform_mismatch(self):
+        current = dict(self.SAME, platform="darwin")
+        self.assertFalse(compare.environments_match(self.SAME, current))
+
+    def test_engine_drift_skipped_on_env_mismatch(self):
+        # CI kosucusu: 192 MiB/s, dev baseline 405, io factor 1.19
+        v = _one("engine_mib_s", 192.1, base=405.3, io=1.19, env=False)
+        self.assertEqual(v["status"], "skip")
+        self.assertEqual(v["note"], "different environment")
+        self.assertIsNone(v["limit"])
+        self.assertFalse(compare.failed([v]))
+
+    def test_engine_floor_still_applies_on_env_mismatch(self):
+        v = _one("engine_mib_s", 120.0, base=405.3, io=1.19, env=False)
+        self.assertEqual(v["status"], "fail")
+        self.assertIn("floor", v["note"])
+
+    def test_cpu_rate_drift_survives_env_mismatch(self):
+        # kalibrasyonla olceklenen metrik ortam farkindan bagimsizdir
+        v = _one("cdc_mib_s", 60.0, base=100.0, env=False)
+        self.assertEqual(v["status"], "fail")
+        self.assertEqual(v["note"], "drift")
 
 
 class LatencyMetricTest(unittest.TestCase):
@@ -130,14 +172,48 @@ class AbsoluteMetricTest(unittest.TestCase):
         self.assertEqual(v["status"], "ok")
         self.assertIsNone(v["floor"])
 
-    def test_absolute_metrics_skip_on_other_environment(self):
-        v = _one("idle_loaded_rss_mib", 900.0, base=100.0,
-                 absolute_ok=False)
+    def test_absolute_drift_skipped_on_env_mismatch(self):
+        # farkli ortam: drift yok, floor var (300 MiB tabaninin altinda)
+        v = _one("idle_loaded_rss_mib", 200.0, base=100.0, env=False)
         self.assertEqual(v["status"], "skip")
+        self.assertIsNone(v["limit"])
         self.assertFalse(compare.failed([v]))
-        # floor da atlanir: farkli ortamda mutlak sayi karsilastirilamaz
-        self.assertFalse(compare.failed([_one(
-            "idle_loaded_cpu_pct", 99.0, base=1.0, absolute_ok=False)]))
+        v = _one("idle_loaded_cpu_pct", 3.0, base=0.4, env=False)
+        self.assertEqual(v["status"], "skip")
+
+    def test_absolute_floor_still_applies_on_env_mismatch(self):
+        v = _one("idle_loaded_cpu_pct", 6.0, base=0.4, env=False)
+        self.assertEqual(v["status"], "fail")
+        self.assertEqual(v["note"], "floor")
+        v = _one("idle_loaded_rss_mib", 350.0, base=100.0, env=False)
+        self.assertEqual(v["status"], "fail")
+        self.assertEqual(v["note"], "floor")
+
+
+class FloorsOnlyTest(unittest.TestCase):
+    """Baseline yokken (CI runner baseline'i commit edilmeden) yalniz floor."""
+
+    def test_missing_baseline_marks_new_but_checks_floors(self):
+        metrics = {"engine_mib_s": 200.0, "stats_frame_ms": 100.0,
+                   "cdc_mib_s": 1.0}
+        verdicts = compare.compare({}, metrics)
+        self.assertEqual({v["status"] for v in verdicts}, {"new"})
+        self.assertFalse(compare.failed(verdicts))
+
+    def test_missing_baseline_engine_floor_fails(self):
+        v = compare.compare({}, {"engine_mib_s": 120.0})[0]
+        self.assertEqual(v["status"], "fail")
+        self.assertIn("floor", v["note"])
+
+    def test_missing_baseline_frame_floor_fails(self):
+        v = compare.compare({}, {"stats_frame_ms": 200.0})[0]
+        self.assertEqual(v["status"], "fail")
+        self.assertIn("floor", v["note"])
+
+    def test_missing_baseline_absolute_floor_fails(self):
+        v = compare.compare({}, {"idle_queued_cpu_pct": 6.0})[0]
+        self.assertEqual(v["status"], "fail")
+        self.assertIn("floor", v["note"])
 
 
 class VerdictTest(unittest.TestCase):
@@ -158,6 +234,13 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual(set(compare.FLOOR_METRICS), expected)
         self.assertNotIn("idle_sse_cpu_pct", compare.FLOOR_METRICS)
 
+    def test_env_bound_metrics_are_engine_and_absolute(self):
+        absolute = {name for name, m in compare.METRICS.items()
+                    if m.family == "absolute"}
+        self.assertEqual(set(compare.ENV_BOUND_METRICS),
+                         absolute | {"engine_mib_s"})
+        self.assertNotIn("queue_load_jobs_s", compare.ENV_BOUND_METRICS)
+
     def test_table_shows_fields(self):
         text = compare.format_table([
             _one("engine_mib_s", 140.0, base=100.0),
@@ -169,7 +252,7 @@ class VerdictTest(unittest.TestCase):
 
 
 class BaselineFileTest(unittest.TestCase):
-    """Depodaki baseline gecerli bir belge olmali (adlar eski olabilir)."""
+    """Depodaki gelistirme baseline'i gecerli bir belge olmali."""
 
     @classmethod
     def setUpClass(cls):
@@ -181,10 +264,13 @@ class BaselineFileTest(unittest.TestCase):
         self.assertTrue(self.data.get("generated"))
         self.assertTrue(self.data.get("python"))
         self.assertTrue(self.data.get("platform"))
+        # ortam alani: cekirdek sayisi baseline'da kayitli olmali
+        self.assertIsInstance(self.data.get("cpu_count"), int)
+        self.assertGreater(self.data["cpu_count"], 0)
         self.assertTrue(self.data.get("metrics"))
 
     def test_baseline_compared_with_itself_is_green(self):
-        # ayni degerler + faktor 1: bilinen metrikler icin gerileme yok
+        # ayni degerler + faktor 1 + ayni ortam: gerileme yok
         verdicts = compare.compare(self.data["metrics"],
                                    self.data["metrics"], 1.0, 1.0, True)
         self.assertFalse(compare.failed(verdicts))

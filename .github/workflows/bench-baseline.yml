@@ -1,0 +1,42 @@
+name: Bench baseline
+
+# ROADMAP 1.13 runner baseline'i: `bench` isi (ci.yml) drift
+# karsilastirmasini benchmarks/baseline-ci.json'a gore yapar. Bu dosya
+# GERCEK bir GitHub runner'inda olculmelidir; gelistirme makinesinin
+# baseline.json'u 2 vCPU'lu kosucuya tasinamaz (motor throughput'u
+# cekirdek sayisina duyarli).
+#
+# Kullanim: bu isi elle calistir, `bench-baseline-ci` artigini indir,
+# benchmarks/baseline-ci.json olarak commit et. Dosya commit edilene
+# kadar ci.yml'daki bench isi yalnizca urun tabanlarini (floor) uygular.
+on:
+  workflow_dispatch:
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Measure runner baseline
+        run: |
+          python3 -m benchmarks --update-baseline \
+            --baseline benchmarks/baseline-ci.json --json bench.json
+          python3 - <<'EOF'
+          import json
+          data = json.load(open("benchmarks/baseline-ci.json"))
+          print("runner baseline: python", data.get("python"),
+                "cpus", data.get("cpu_count"),
+                "metrics", len(data.get("metrics", {})))
+          EOF
+      - name: Upload runner baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: warn
+          name: bench-baseline-ci
+          path: |
+            benchmarks/baseline-ci.json
+            bench.json
