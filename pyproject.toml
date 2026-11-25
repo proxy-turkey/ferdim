@@ -26,6 +26,8 @@ classifiers = [
 [project.optional-dependencies]
 # HTTP/3 (QUIC) tasimasi; cekirdek yalnizca stdlib kullanir
 h3 = ["aioquic>=1.0"]
+# sifreli HLS (AES-128); tembel import, yoksa hls_crypto_missing
+hls-aes = ["cryptography"]
 
 [project.urls]
 Homepage = "https://github.com/proxy-turkey/ferdim"
