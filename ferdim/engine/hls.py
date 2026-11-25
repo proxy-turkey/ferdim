@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 import threading
 import time
-import urllib.parse
+import urllib.error
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,10 +21,23 @@ from ..ratelimit import TokenBucket
 from . import httpcli, segments
 
 _ATTR_RE = re.compile(r'([A-Za-z0-9-]+)=("[^"]*"|[^,]*)')
+MAX_SEGMENTS = 20_000     # tek oynatma listesi icin segment ust siniri
+MAX_KEYS = 4_096          # tek oynatma listesi icin farkli anahtar URI siniri
+_MAX_DIGITS = 18          # int() tasmasi/DoS korumasi
 
 
 class HlsError(segments.StreamError):
     pass
+
+
+def _num(text, what: str = "sayi") -> int:
+    """Manifest sayisini guvenle cevirir (uzun rakam dizisi reddedilir)."""
+    s = str(text if text is not None else "").strip()
+    digits = s.lstrip("0") or "0"
+    if not s.isdigit() or len(digits) > _MAX_DIGITS:
+        raise HlsError(f"gecersiz manifest {what}: {s[:32]}",
+                       "manifest_number")
+    return int(s)
 
 
 @dataclass
@@ -74,21 +87,26 @@ def _parse_key(line: str, base_url: str):
     if raw:
         if raw.lower().startswith("0x"):
             raw = raw[2:]
+        if not re.fullmatch(r"[0-9A-Fa-f]{1,32}", raw):
+            raise HlsError("gecersiz EXT-X-KEY IV", "manifest_number")
         try:
             iv = int(raw, 16).to_bytes(16, "big")
         except (ValueError, OverflowError) as e:
-            raise HlsError("gecersiz EXT-X-KEY IV") from e
-    return urllib.parse.urljoin(base_url, uri), iv
+            raise HlsError("gecersiz EXT-X-KEY IV", "manifest_number") from e
+    return segments.resolve_url(base_url, uri, exc=HlsError), iv
 
 
 def _parse_byterange(line: str):
     """EXT-X-BYTERANGE:<n>[@<o>] -> (n, o|None); bozuksa HlsError."""
     raw = line.split(":", 1)[1].strip() if ":" in line else ""
     m = re.match(r"^(\d+)(?:@(\d+))?$", raw)
-    if not m or int(m.group(1)) <= 0:
-        raise HlsError("gecersiz EXT-X-BYTERANGE")
-    return int(m.group(1)), (int(m.group(2))
-                             if m.group(2) is not None else None)
+    if not m:
+        raise HlsError("gecersiz EXT-X-BYTERANGE", "manifest_number")
+    n = _num(m.group(1), "byterange")
+    if n <= 0:
+        raise HlsError("gecersiz EXT-X-BYTERANGE", "manifest_number")
+    off = _num(m.group(2), "byterange") if m.group(2) is not None else None
+    return n, off
 
 
 def parse_media(text: str, base_url: str) -> Playlist:
@@ -101,28 +119,27 @@ def parse_media(text: str, base_url: str) -> Playlist:
     last_end: dict[str, int] = {}  # ayni URI'nin son alt aralik sonu
     for i, line in enumerate(lines):
         if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
-            try:
-                media_seq = int(line.split(":", 1)[1].strip())
-            except ValueError:
-                media_seq = 0
+            raw = line.split(":", 1)[1].strip()
+            media_seq = _num(raw, "medya sirasi") if raw.isdigit() else 0
         elif line.startswith("#EXT-X-STREAM-INF"):
             pl.is_master = True
             bw = re.search(r"BANDWIDTH=(\d+)", line)
             uri = lines[i + 1] if i + 1 < len(lines) \
                 and not lines[i + 1].startswith("#") else ""
             pl.variants.append({
-                "url": urllib.parse.urljoin(base_url, uri),
-                "bandwidth": int(bw.group(1)) if bw else 0})
+                "url": segments.resolve_url(base_url, uri, exc=HlsError),
+                "bandwidth": _num(bw.group(1), "bandwidth") if bw else 0})
         elif line.startswith("#EXT-X-MAP:"):
             m = re.search(r'URI="([^"]+)"', line)
             if m:
-                pl.init_url = urllib.parse.urljoin(base_url, m.group(1))
+                pl.init_url = segments.resolve_url(base_url, m.group(1),
+                                                   exc=HlsError)
         elif line.startswith("#EXT-X-KEY:"):
             cur_key = _parse_key(line, base_url)
         elif line.startswith("#EXT-X-BYTERANGE:"):
             pending_range = _parse_byterange(line)
         elif not line.startswith("#"):
-            url = urllib.parse.urljoin(base_url, line)
+            url = segments.resolve_url(base_url, line, exc=HlsError)
             start = length = None
             if pending_range is not None:
                 n, off = pending_range
@@ -135,6 +152,9 @@ def parse_media(text: str, base_url: str) -> Playlist:
                 start=start, length=length,
                 key_uri=cur_key[0] if cur_key else None,
                 iv=cur_key[1] if cur_key else None))
+            if len(pl.segments) > MAX_SEGMENTS:
+                raise HlsError("segment sayisi ust sinirin uzerinde",
+                               "stream_limit")
     return pl
 
 
@@ -152,10 +172,10 @@ def fetch_text(url: str, opt: httpcli.DlOptions) -> str:
     return segments.fetch_manifest(url, opt)
 
 
-def fetch_key(url: str, opt: httpcli.DlOptions) -> bytes:
-    """AES-128 anahtarini ceker (16 bayt). Anahtar yalnizca bellekte kalir."""
-    opener = httpcli._make_opener(opt)
-    with opener.open(httpcli.request_of(url, opt),
+def _fetch_key_once(url: str, opt: httpcli.DlOptions) -> bytes:
+    scoped = segments.scoped_options(opt, url)
+    opener = httpcli._make_opener(scoped)
+    with opener.open(httpcli.request_of(url, scoped),
                      timeout=opt.timeout) as r:
         data = r.read(17)
     if len(data) != 16:
@@ -163,17 +183,55 @@ def fetch_key(url: str, opt: httpcli.DlOptions) -> bytes:
     return data
 
 
-def _entries(pl: Playlist, opt: httpcli.DlOptions) -> list[segments.Segment]:
+def fetch_key(url: str, opt: httpcli.DlOptions,
+              stop_event: threading.Event | None = None) -> bytes | None:
+    """AES-128 anahtarini ceker (16 bayt), gecici hatalarda geri cekilmeyle.
+
+    Anahtar yalnizca bellekte kalir. `stop_event` verilirse bekleme ve
+    denemeler durdurmayi gorur (durunca None). Kalici hata (404/auth/16
+    bayt degil) hemen yukselir; gecici hata segmentlerle ayni geri cekilmeyi
+    kullanir."""
+    retries = max(0, int(getattr(opt, "retries", 5)))
+    attempt = 0
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return None
+        try:
+            return _fetch_key_once(url, opt)
+        except Exception as e:
+            if isinstance(e, urllib.error.HTTPError):
+                e.close()
+            if stop_event is not None and stop_event.is_set():
+                return None
+            if not segments.is_transient(e) or attempt >= retries:
+                raise
+            delay = segments.retry_delay(attempt, e)
+            attempt += 1
+            if stop_event is not None and stop_event.wait(delay):
+                return None
+
+
+def _entries(pl: Playlist, opt: httpcli.DlOptions,
+             stop_event: threading.Event | None = None) -> list | None:
     """Playlist segmentlerini assembler girdilerine cevirir.
 
     Anahtarlar URI basina BIR kez cekilir (rotasyon olsa da ayni URI tekrar
     inmez). IV yoksa segmentin medya sira numarasi 16 bayt buyuk-endian
-    olarak kullanilir (RFC 8216)."""
+    olarak kullanilir (RFC 8216). Distinct anahtar URI sayisi sinirlidir;
+    durdurma gelirse None doner."""
     uris = sorted({s.key_uri for s in pl.segments if s.key_uri})
+    if len(uris) > MAX_KEYS:
+        raise HlsError("anahtar URI sayisi ust sinirin uzerinde",
+                       "stream_limit")
     if uris and not segments.aes_available():
         raise HlsError("sifreli HLS icin cryptography gerekli",
                        "hls_crypto_missing")
-    keys = {u: fetch_key(u, opt) for u in uris}
+    keys = {}
+    for u in uris:
+        key = fetch_key(u, opt, stop_event)
+        if key is None:                 # duraklat/iptal
+            return None
+        keys[u] = key
     out = []
     for s in pl.segments:
         key = keys.get(s.key_uri) if s.key_uri else None
@@ -198,14 +256,18 @@ def download_hls(url: str, opt: httpcli.DlOptions, fd: int, meta: dict,
         best = max(pl.variants, key=lambda v: v["bandwidth"])
         state["variant_url"] = best["url"]
         t0 = time.monotonic()
-        pl = parse_media(fetch_text(best["url"], opt), best["url"])
+        pl = parse_media(
+            fetch_text(best["url"], segments.scoped_options(opt, best["url"])),
+            best["url"])
         rtt = time.monotonic() - t0  # segment listesini veren istek olculur
     if not pl.segments:
         raise HlsError("segment bulunamadi")
     if not pl.endlist:
         raise HlsError("canli yayin akisi desteklenmiyor")
 
-    entries = _entries(pl, opt)
+    entries = _entries(pl, opt, stop_event)
+    if entries is None:                 # duraklat/iptal
+        return
     meta["kind"] = "hls"
     meta.setdefault("url", url)
     segments.assemble(opt, fd, meta, stop_event, bucket, progress_cb,

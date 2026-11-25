@@ -647,6 +647,32 @@ S = {
         "tr": "şifreli bir HLS segmenti çözülemedi",
         "es": "no se pudo descifrar un segmento HLS cifrado",
         "ru": "не удалось расшифровать зашифрованный сегмент HLS"},
+    # ---- 1.12 akis sertlestirme (URL semasi, sayi/tasima sinirlari)
+    "err_manifest_bad_url": {
+        "en": "the playlist refers to an unsupported address (only http/https is allowed)",
+        "tr": "oynatma listesi desteklenmeyen bir adrese başvuruyor (yalnız http/https)",
+        "es": "la lista apunta a una dirección no compatible (solo http/https)",
+        "ru": "плейлист ссылается на неподдерживаемый адрес (разрешены только http/https)"},
+    "err_manifest_number": {
+        "en": "the playlist contains an invalid or oversized number",
+        "tr": "oynatma listesi geçersiz ya da aşırı büyük bir sayı içeriyor",
+        "es": "la lista contiene un número no válido o demasiado grande",
+        "ru": "плейлист содержит недопустимое или слишком большое число"},
+    "err_stream_limit": {
+        "en": "the stream lists more segments or keys than allowed",
+        "tr": "akış izin verilenden fazla segment ya da anahtar listeliyor",
+        "es": "la transmisión enumera más segmentos o claves de los permitidos",
+        "ru": "поток содержит больше сегментов или ключей, чем разрешено"},
+    "err_stream_too_large": {
+        "en": "a stream segment is larger than the allowed limit",
+        "tr": "bir akış segmenti izin verilen boyuttan büyük",
+        "es": "un segmento de la transmisión supera el límite permitido",
+        "ru": "сегмент потока превышает допустимый размер"},
+    "err_stream_range": {
+        "en": "the server did not serve the requested byte range correctly",
+        "tr": "sunucu istenen bayt aralığını doğru sunmadı",
+        "es": "el servidor no sirvió correctamente el rango de bytes solicitado",
+        "ru": "сервер неверно отдал запрошенный диапазон байтов"},
     # ---- 1.12 pano onayi (eylemli bildirim + geri al)
     "clipboard_confirm_title": {
         "en": "Queued from clipboard",

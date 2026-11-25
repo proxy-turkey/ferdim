@@ -55,6 +55,22 @@ def _attr(el, name, default=None):
     return el.get(name, default) if el is not None else default
 
 
+_MAX_DIGITS = 18          # int() tasmasi/DoS korumasi
+
+
+def _int_attr(el, name, default=0) -> int:
+    """MPD sayisal ozniteligi; uzun/gecersiz rakam dizisi reddedilir."""
+    raw = _attr(el, name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    s = str(raw).strip()
+    if not s.isdigit():
+        raise DashError(f"gecersiz sayisal deger: {name}")
+    if len(s.lstrip("0") or "0") > _MAX_DIGITS:
+        raise DashError("sayisal deger cok buyuk", "manifest_number")
+    return int(s)
+
+
 def fetch_mpd(url: str, opt) -> str:
     """Sinirli boyutta MPD metni (manifest_too_large korumasi)."""
     return segments.fetch_manifest(url, opt)
@@ -87,10 +103,10 @@ def _kind(ad, rep) -> str:
 
 def _score(kind: str, rep):
     if kind == "audio":
-        return (int(_attr(rep, "bandwidth", 0) or 0),)
-    return (int(_attr(rep, "width", 0) or 0),
-            int(_attr(rep, "height", 0) or 0),
-            int(_attr(rep, "bandwidth", 0) or 0))
+        return (_int_attr(rep, "bandwidth", 0),)
+    return (_int_attr(rep, "width", 0),
+            _int_attr(rep, "height", 0),
+            _int_attr(rep, "bandwidth", 0))
 
 
 def _pick(period, kind: str):
@@ -114,8 +130,14 @@ def _seconds(text) -> float | None:
     m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?", text or "")
     if not m:
         return None
-    return (int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60
-            + float(m.group(3) or 0))
+    parts = [g or "" for g in m.groups()]
+    if any(len(p.split(".", 1)[0].lstrip("0")) > _MAX_DIGITS for p in parts):
+        raise DashError("sure degeri cok buyuk", "manifest_number")
+    try:
+        secs = float(parts[2]) if parts[2] else 0.0
+    except ValueError as e:
+        raise DashError("gecersiz sure degeri", "manifest_number") from e
+    return (int(parts[0] or 0) * 3600 + int(parts[1] or 0) * 60 + secs)
 
 
 def _audio_ext(ad, rep, init_url, seg_urls) -> str:
@@ -148,12 +170,12 @@ def _rep_segments(root, base_url: str, period, ad, rep):
         seg_list = _el(ad, "SegmentList")
 
     def u(x):
-        return urllib.parse.urljoin(base_url, x)
+        return segments.resolve_url(base_url, x, exc=DashError)
 
     if tmpl is not None:
         media = _attr(tmpl, "media") or ""
         init_attr = _attr(tmpl, "initialization") or ""
-        start = int(_attr(tmpl, "startNumber", "1") or 1)
+        start = _int_attr(tmpl, "startNumber", 1)
         rep_id = _attr(rep, "id", "")
         init_url = u(init_attr.replace("$RepresentationID$",
                                        rep_id)) if init_attr else None
@@ -164,9 +186,10 @@ def _rep_segments(root, base_url: str, period, ad, rep):
             number = start
             for s in _els(timeline, "S"):
                 # S@r sinirsiz tekrar edebilir: biriktirirken sinirla
-                n = int(_attr(s, "r", "0") or 0) + 1
+                n = _int_attr(s, "r", 0) + 1
                 if len(seg_urls) + n > MAX_SEGMENTS:
-                    raise DashError("segment sayisi ust sinirin uzerinde")
+                    raise DashError("segment sayisi ust sinirin uzerinde",
+                                    "stream_limit")
                 t = _attr(s, "t") or ""
                 for _ in range(n):
                     media_n = media.replace("$RepresentationID$", rep_id)
@@ -176,8 +199,8 @@ def _rep_segments(root, base_url: str, period, ad, rep):
                     seg_urls.append(u(media_n))
                     number += 1
         else:
-            duration = int(_attr(tmpl, "duration", "0") or 0)
-            timescale = int(_attr(tmpl, "timescale", "1") or 1)
+            duration = _int_attr(tmpl, "duration", 0)
+            timescale = _int_attr(tmpl, "timescale", 1) or 1
             total_dur = _seconds(_attr(period, "duration"))
             if total_dur is None and len(_els(root, "Period")) <= 1:
                 # tek Period: MPD toplam suresi de kabul edilir; coklu
@@ -187,10 +210,12 @@ def _rep_segments(root, base_url: str, period, ad, rep):
                 raise DashError("SegmentTemplate duration/Period suresi yok")
             try:
                 count = max(1, int(total_dur * timescale / duration))
-            except OverflowError:
-                raise DashError("segment sayisi ust sinirin uzerinde")
+            except (OverflowError, ValueError):
+                raise DashError("segment sayisi ust sinirin uzerinde",
+                                "stream_limit")
             if count > MAX_SEGMENTS:
-                raise DashError("segment sayisi ust sinirin uzerinde")
+                raise DashError("segment sayisi ust sinirin uzerinde",
+                                "stream_limit")
             for i in range(count):
                 media_n = media.replace("$RepresentationID$", rep_id)
                 media_n = media_n.replace("$Number$", str(start + i))
@@ -205,7 +230,8 @@ def _rep_segments(root, base_url: str, period, ad, rep):
             raise DashError("SegmentList bos")
         # SegmentList de ayni sinirlidir: liste dogrudan MPD'den gelir
         if len(items) > MAX_SEGMENTS:
-            raise DashError("segment sayisi ust sinirin uzerinde")
+            raise DashError("segment sayisi ust sinirin uzerinde",
+                            "stream_limit")
         return init_url, [u(_attr(s, "media")) for s in items]
 
     raise DashError("SegmentTemplate/SegmentList bulunamadi")
@@ -229,8 +255,8 @@ def build_plan(mpd_text: str, mpd_url: str) -> dict:
         raise DashError("canli (dynamic) MPD desteklenmiyor")
 
     base = _el(root, "BaseURL")
-    base_url = urllib.parse.urljoin(
-        mpd_url, (base.text or "").strip() if base is not None else mpd_url)
+    base_ref = (base.text or "").strip() if base is not None else ""
+    base_url = segments.resolve_url(mpd_url, base_ref or mpd_url, exc=DashError)
     periods = _els(root, "Period")
     if not periods:                 # cocuksuz eleman 'or' ile falsy olur
         periods = [root]
@@ -250,7 +276,8 @@ def build_plan(mpd_text: str, mpd_url: str) -> dict:
                 segs.insert(0, init)     # yeni Period'un initialization'i
             video_segs.extend(segs)
             if len(video_segs) > MAX_SEGMENTS:
-                raise DashError("segment sayisi ust sinirin uzerinde")
+                raise DashError("segment sayisi ust sinirin uzerinde",
+                                "stream_limit")
 
         ad, rep = _pick(period, "audio")
         if rep is not None:
@@ -262,7 +289,8 @@ def build_plan(mpd_text: str, mpd_url: str) -> dict:
                 segs.insert(0, init)
             audio["segments"].extend(segs)
             if len(audio["segments"]) > MAX_SEGMENTS:
-                raise DashError("segment sayisi ust sinirin uzerinde")
+                raise DashError("segment sayisi ust sinirin uzerinde",
+                                "stream_limit")
 
     if not video_found:
         raise DashError("MPD icinde temsil (Representation) yok")
