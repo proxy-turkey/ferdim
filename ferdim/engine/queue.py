@@ -123,6 +123,7 @@ class QueueManager:
         self._listeners: list = []       # degisiklik bildirimi (soket push)
         self._running = False
         self._ticker: threading.Thread | None = None
+        self._closed = False
         self.last_nm_ping = 0.0
         self.history = open_history(env)
         self._hist_state: dict[str, str] = {}   # is -> yazilmis son durum
@@ -620,6 +621,10 @@ class QueueManager:
             self._save_locked()
 
     def _save_locked(self):
+        # kapanistaki son kayittan sonra arka plan is parcaciklari (tick,
+        # yoklayici, is geri cagrilari) dosyayi yeniden yazmamali
+        if self._closed:
+            return
         data = []
         for j in self.jobs:
             # onceki dosyadan gelen bilinmeyen alanlar korunur (ileri surum)
@@ -941,7 +946,9 @@ class QueueManager:
         for j in jobs:
             if j.state in STATES_RUNNING or j.id in starting:
                 j.pause()
-        self._save()
+        with self._lock:
+            self._save_locked()
+            self._closed = True
 
 
 def _version():
