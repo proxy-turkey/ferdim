@@ -152,10 +152,12 @@ def main() -> int:
             log.warning("web arayuzu baslatilamadi: %s", e)
 
     # opsiyonel pano izleyici
+    clipboard_watcher = None
     if cfg.get("clipboard_watch"):
         try:
             from .clipboard import ClipboardWatcher
-            ClipboardWatcher(qm, cfg).start()
+            clipboard_watcher = ClipboardWatcher(qm, cfg)
+            clipboard_watcher.start()
         except Exception as e:
             log.warning("pano izleyici baslatilamadi: %s", e)
 
@@ -211,6 +213,8 @@ def main() -> int:
         ctx["web_port"] = 0
         if notifier is not None:
             notifier.stop()
+        if clipboard_watcher is not None:
+            clipboard_watcher.stop()
         qm.shutdown()
         if peer_node is not None:
             peer_node.stop()

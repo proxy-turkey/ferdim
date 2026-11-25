@@ -40,6 +40,21 @@ def category_for(name_or_path: str) -> str:
 
 NAME_MAX_BYTES = 255          # tek dosya adi bileseninin bayt siniri
 
+# Gorsel karisiklik/aldatma ve terminal kacisi: bidi kontrolleri ve
+# kategori Cc/Cf/Cs (kontrol, bicim, vekil) adlarda hicbir zaman yer almaz.
+_BIDI_CHARS = frozenset(
+    list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A))
+    + [0x200E, 0x200F])
+_UNSAFE_CATS = frozenset(("Cc", "Cf", "Cs"))
+
+
+def _strip_unsafe(name: str) -> str:
+    """Kontrol/bicim/vekil karakterleri ve bidi kontrollerini atar."""
+    return "".join(
+        ch for ch in name
+        if ord(ch) not in _BIDI_CHARS and unicodedata.category(ch)
+        not in _UNSAFE_CATS)
+
 
 def _clip_utf8(text: str, budget: int) -> str:
     """UTF-8 bayt butcesine kirpar; cok baytli karakteri ASLA bolmez."""
@@ -69,9 +84,28 @@ def _truncate_filename(name: str, limit: int = NAME_MAX_BYTES) -> str:
     return (stem + ext_part) if stem else _clip_utf8(name, limit).strip(" .")
 
 
+def _suffixed_name(name: str, i: int,
+                   limit: int = NAME_MAX_BYTES) -> str:
+    """'(i)' eki eklendikten sonra da sinirda kalan ad (govde kirpilir).
+
+    Uzanti korunur; ek ve uzanti icin yer yoksa ad butun olarak kirpilir."""
+    stem, dot, ext = name.partition(".")
+    if not dot:
+        stem, ext = name, ""
+    ext_part = ("." + ext) if ext else ""
+    tag = f" ({i})"
+    room = limit - len((tag + ext_part).encode("utf-8"))
+    if room < 1:
+        return _clip_utf8(stem + tag + ext_part, limit).strip(" .") \
+            or "download.bin"
+    stem = _clip_utf8(stem, room).strip(" .") or "f"
+    return stem + tag + ext_part
+
+
 def sanitize_filename(name: str) -> str:
     name = unicodedata.normalize("NFKC", name).strip()
-    name = name.replace("\x00", "")
+    # Kontrol/bicim/vekil ve bidi karakterleri: kirpmadan ONCE atilir.
+    name = _strip_unsafe(name.replace("\x00", ""))
     # Bolum ayracilari ve dosya sistemlerine aykiri karakterleri temizle
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
     name = re.sub(r"\s+", " ", name).strip(" .")
@@ -146,18 +180,24 @@ def unique_path(directory: Path, name: str) -> Path:
     da sembolik bag dahil) EEXIST verir. Dondurulen yol cagirana aittir:
     cagiran onu kendi icerigiyle doldurur (os.replace) ya da vazgecince
     siler. Hedef dizin onceden var olmalidir."""
-    stem, dot, ext = name.partition(".")
-    if not dot:
-        stem, ext = name, ""
     i = 0
     while True:
         cand = directory / name if i == 0 else \
-            directory / f"{stem} ({i}){('.' + ext) if ext else ''}"
+            directory / _suffixed_name(name, i)
         try:
             fd = os.open(cand, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
             i += 1
             continue
+        except OSError as e:
+            if e.errno == errno.ENAMETOOLONG:
+                # sanitize edilmemis cagri: adi sinirda kirp ve yeniden dene
+                shorter = _truncate_filename(name)
+                if shorter == name:
+                    raise
+                name = shorter
+                continue
+            raise
         os.close(fd)
         return cand
 
@@ -422,6 +462,68 @@ _SIZE_TEXT_RE = re.compile(
     r"^\d+(?:\.\d+)?(?:kib|mib|gib|kb|mb|gb|k|m|g|b)?$", re.IGNORECASE)
 
 
+_ZONE_CACHE: dict = {}
+
+
+def _zone_from_key(key):
+    """IANA anahtari ya da TZif dosya yolu -> ZoneInfo (yoksa None)."""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    key = str(key or "").strip()
+    if key.startswith(":"):
+        key = key[1:]
+    if not key:
+        return None
+    if key in _ZONE_CACHE:
+        return _ZONE_CACHE[key]
+    try:
+        if os.path.isfile(key):
+            with open(key, "rb") as f:
+                zone = ZoneInfo.from_file(f)
+        else:
+            zone = ZoneInfo(key)
+    except (OSError, ValueError, KeyError, ZoneInfoNotFoundError):
+        return None
+    _ZONE_CACHE[key] = zone
+    return zone
+
+
+def local_zone():
+    """Yerel saat dilimi: DST gecislerini modelleyen IANA bolgesi.
+
+    Once TZ ortam degiskeni (IANA anahtari ya da TZif yolu), sonra
+    /etc/localtime sembolik bag hedefi denenir; ikisi de cozulemezse
+    sabit ofsetli yerel saat dilimine dusulur (gecis yok, eski davranis)."""
+    import datetime as _dt
+    raw_tz = (os.environ.get("TZ") or "").strip()
+    if raw_tz:
+        zone = _zone_from_key(raw_tz)
+        if zone is not None:
+            return zone
+        # TZ gecerli bir IANA anahtari degil (POSIX kurali olabilir):
+        # libc'nin cozdugu sabit ofsete dus, /etc/localtime'a DONME.
+        return _dt.datetime.now().astimezone().tzinfo
+    try:
+        target = os.path.realpath("/etc/localtime")
+        marker = os.sep + "zoneinfo" + os.sep
+        if marker in target:
+            zone = _zone_from_key(target.split(marker, 1)[1])
+            if zone is not None:
+                return zone
+        if os.path.isfile("/etc/localtime"):
+            zone = _zone_from_key("/etc/localtime")
+            if zone is not None:
+                return zone
+    except OSError:
+        pass
+    return _dt.datetime.now().astimezone().tzinfo
+
+
+def _now_local(zone=None):
+    """Su an, yerel (tercihen DST'li) saat diliminde bilincli datetime."""
+    import datetime as _dt
+    return _dt.datetime.now(zone or local_zone())
+
+
 def _resolve_wall(day, minutes: int, zone):
     """Duvarsaati -> bilincli (aware) an; DST POLITIKASI burada uygulanir.
 
@@ -485,16 +587,24 @@ def window_open(start, stop, now=None, days=None, tz=None) -> bool:
     yarisini asan pencerede gun, pencerenin BASLADIGI gundur: 'cuma
     22:00-02:00' cumartesi 01:00'de de aciktir.
 
-    DST POLITIKASI (bilincli `now` ya da `tz` verildiginde; naive `now`
-    eski duvarsaati davranisini korur):
+    DST POLITIKASI:
+    - `now` verilmezse (uretim yolu) yerel IANA bolgesi (`local_zone()`)
+      cozulur ve bilincli an karsilastirmasi kullanilir; boylece gecisler
+      gercekten modellenir.
     - ileri sicrama: o gun VAR OLMAYAN bir pencere siniri, bosluktan
       sonraki ilk gecerli ana kayar (02:30 -> 03:00). Iki sinir da
       bosluktaysa pencere o gun bostur.
     - geri alma: belirsiz duvarsaati ILK olusumuyla (fold=0) cozulur ve
       pencere ikinci tekrarda yeniden ACILMAZ.
+    - acikca NAIVE `now` verilirse eski duvarsaati davranisi korunur
+      (testler/geriye uyumluluk).
     """
-    import datetime as _dt
-    now = now or _dt.datetime.now()
+    if now is None:
+        zone = tz or local_zone()
+        now = _now_local(zone)
+    else:
+        zone = tz or (now.tzinfo if getattr(now, "tzinfo", None) is not None
+                      else None)
     if days is not None:
         days = frozenset(days)
         if not days:
@@ -503,8 +613,6 @@ def window_open(start, stop, now=None, days=None, tz=None) -> bool:
         s, e = _hm(start), _hm(stop)
     except Exception:
         return days is None or now.weekday() in days
-    zone = tz or (now.tzinfo if getattr(now, "tzinfo", None) is not None
-                  else None)
     if zone is not None:
         return _window_open_tz(s, e, now, days, zone)
     cur = now.hour * 60 + now.minute
@@ -548,9 +656,10 @@ def parse_days(spec) -> frozenset[int]:
 
 
 def speed_plan_rule(plan, now=None):
-    """Ilk eslesen speed_plan kurali (ilk eslesen kazanir); yoksa None."""
-    import datetime as _dt
-    now = now or _dt.datetime.now()
+    """Ilk eslesen speed_plan kurali (ilk eslesen kazanir); yoksa None.
+
+    `now` verilmezse yerel DST'li an kullanilir (uretim yolu)."""
+    now = now if now is not None else _now_local()
     for rule in plan or ():
         if not isinstance(rule, dict):
             continue
