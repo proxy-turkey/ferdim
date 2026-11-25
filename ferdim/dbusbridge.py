@@ -30,6 +30,58 @@ OBJECT_PATH = "/org/ferdim/Daemon"
 INTERFACE = "org.ferdim.Daemon1"
 XML_FILE = "org.ferdim.Daemon1.xml"
 
+# 10 000 islik kuyrukta tam istatistik govdesi ~6-7 MB: ne D-Bus yontemi
+# ne de Changed sinyali bunu tasimali. Iki sinir da burada:
+#  - Stats: D-Bus imzasi DEGISMEZ (arguman yok; eski cagiranlar calisir),
+#    varsayilan pencere uygulanir. Toplamlar (total_speed/active/
+#    total_jobs) sunucuda TUM kuyruk uzerinden hesaplandigi icin yalniz
+#    toplam isteyen istemci bir sey kaybetmez.
+#  - Changed: her karede yalniz toplamlar + etkin isler gider (biten/
+#    iptal isler ve govdenin geri kalani kirpilir).
+STATS_JOBS_DEFAULT = 200
+CHANGED_JOBS_MAX = 50
+_DONE_STATES = ("done", "canceled")
+_CHANGED_FIELDS = ("total_speed", "active", "total_jobs", "max_concurrent",
+                   "speed_limit", "turbo", "nm_connected", "warning",
+                   "version")
+
+
+def stats_params(limit=None) -> dict:
+    """`stats` komut parametreleri: pencere varsayilanla sinirli.
+
+    Gecersiz/sifir limit varsayilana doner; sunucu da kendi ust sinirini
+    uygular (`STATS_LIMIT_MAX`)."""
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        n = STATS_JOBS_DEFAULT
+    if n <= 0:
+        n = STATS_JOBS_DEFAULT
+    return {"limit": n}
+
+
+def compact_frame(text: str) -> str:
+    """watch karesini Changed icin kucultur: toplamlar + etkin isler.
+
+    Panel toplam hizi/etkin is sayisini, menu de duraklatilabilir isleri
+    gosterir: 10 000 islik kuyrukta tam kare (~6-7 MB) her karede D-Bus
+    sinyalinden ve kabuk JS'inden gecmemeli. Bozuk/JSON olmayan satir bos
+    dize doner (sinyal uretilmez). Biten/iptal isler listeye girmez;
+    `jobs_total` kirpilmadan onceki etkin is sayisidir."""
+    try:
+        frame = json.loads(text)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(frame, dict):
+        return ""
+    jobs = [j for j in (frame.get("jobs") or ())
+            if isinstance(j, dict) and j.get("state") not in _DONE_STATES]
+    out = {key: frame[key] for key in _CHANGED_FIELDS if key in frame}
+    out["jobs"] = jobs[:CHANGED_JOBS_MAX]
+    out["jobs_total"] = len(jobs)
+    return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+
+
 # Dosya kurulu olmasa da kopru calissin: data/ ile ayni arayuz.
 _FALLBACK_XML = """<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
@@ -86,7 +138,8 @@ def client_command(method: str, args=()) -> tuple[str, dict]:
     if method == "List":
         return "list", {}
     if method == "Stats":
-        return "stats", {}
+        # D-Bus'ta arguman yok (imza degismez); pencere koprude sinirlanir.
+        return "stats", stats_params(args[0] if args else None)
     if method == "WebUrl":
         return "web-session", {}
     raise BridgeError("bilinmeyen yontem: %s" % method)
@@ -185,7 +238,11 @@ if Gio is not None:
 
         # ------------------------------------------------------------ signal
         def _watch(self):
-            """Daemon'un 'watch' akisini Changed(json) sinyaline cevirir."""
+            """Daemon'un 'watch' akisini Changed(json) sinyaline cevirir.
+
+            Kare burada KUCULTULUR (`compact_frame`): kaynak tam kareyi
+            10 000 ise kadar tasiyabilir, kabuga yalniz toplamlar + etkin
+            isler gitmeli."""
             while True:
                 try:
                     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -195,8 +252,11 @@ if Gio is not None:
                     stream = sock.makefile("rb")
                     for line in stream:
                         text = line.decode("utf-8", "replace").strip()
-                        if text:
-                            GLib.idle_add(self._emit, text)
+                        if not text:
+                            continue
+                        compact = compact_frame(text)
+                        if compact:
+                            GLib.idle_add(self._emit, compact)
                     sock.close()
                 except Exception:
                     pass

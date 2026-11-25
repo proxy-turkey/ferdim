@@ -604,12 +604,23 @@ class SettingsWindow(Gtk.Window):
 
 
 class FerdimApp(Gtk.Application):
+    # Kuyruk penceresi: 10 000 islik kuyrukta her is icin bir Gtk widget
+    # tutmak (ve tam kareyi her karede cekmek) arayuzu kilitlerdi. Pencere
+    # ilk `ROW_LIMIT` isi gosterir; durum satirinda "gosterilen/toplam"
+    # yazar. Delta protokolu (`since=rev`, `removed`, `full`) ve tavan
+    # mantigi `present.StatsWindow` icindedir (GTK'siz test edilir).
+    ROW_LIMIT = 500
+    REFRESH_MS = 1000       # >= 1 sn: kare basina is yuku sinirli kalsin
+
     def __init__(self):
         super().__init__(application_id="io.github.proxy_turkey.FerDim")
         self.rows: dict[str, JobRow] = {}
         self.client: FerdimClient | None = None
         self.env = AppEnv()
         self.failures = 0
+        self.queue = present.StatsWindow(self.ROW_LIMIT)
+        self.turbo = False       # son karenin turbo durumu (ek istek yok)
+        self.total_jobs = 0      # kuyrugun tamami (pencere disi dahil)
         self.win: Gtk.Window | None = None
         self.add_win: AddWindow | None = None
         self.settings_win: SettingsWindow | None = None
@@ -679,7 +690,7 @@ class FerdimApp(Gtk.Application):
 
         if ensure_daemon(self.env):
             self.connect_client()
-            GLib.timeout_add(500, self.refresh)
+            GLib.timeout_add(self.REFRESH_MS, self.refresh)
             self.refresh()
         else:
             self.status.set_text(gtr("daemon_down"))
@@ -694,10 +705,17 @@ class FerdimApp(Gtk.Application):
 
     # ------------------------------------------------------------- handlers
     def refresh(self):
+        """Kuyruk gorunumunu tazeler (GLib zamanlayicisi `REFRESH_MS`).
+
+        Iletim sozlesmesi `present.StatsWindow` icinde: ilk kare tam;
+        sonrasinda `since=rev` ile yalniz degisen isler (`jobs`) ve silinen
+        kimlikler (`removed`) gelir. Sunucu `full` dondururse (bayat since,
+        kararsiz kuyruk, daemon yeniden basladi) pencere bastan kurulur.
+        Satirlar kimlige gore YERINDE guncellenir: klavye odagi kaymaz."""
         if not self.client:
             return True
         try:
-            st = self.client.request("stats")
+            st = self.client.request("stats", **self.queue.params)
         except Exception:
             # baglanti kopmus olabilir: sonraki taramada yeniden baglanilir;
             # daemon yoksa (kapanmissa) bir kez yeniden baslatilmaya calisilir
@@ -708,37 +726,51 @@ class FerdimApp(Gtk.Application):
             self.status.set_text(gtr("daemon_lost"))
             return True
         self.failures = 0
-        jobs = st["jobs"]
-        seen = set()
-        for j in jobs:
-            seen.add(j["id"])
-            row = self.rows.get(j["id"])
-            if row is None:
-                row = JobRow(self, j)
-                self.rows[j["id"]] = row
-                self.listbox.append(row)
-            else:
-                row.update(j)
-        for jid in list(self.rows):
-            if jid not in seen:
-                self.listbox.remove(self.rows[jid])
-                del self.rows[jid]
+        self._apply_stats(st)
         nm = gtr("nm_ok") if st.get("nm_connected") else gtr("nm_off")
+        shown = len(self.rows)
+        more = (f"   {shown}/{self.total_jobs}"
+                if self.total_jobs > shown else "")
         self.status.set_text(
             f"{gtr('total_speed')}: "
             f"{util.human_size(st['total_speed'])}{gtr('per_sec')}   "
-            f"{gtr('active_jobs')}: {st['active']}/{st['max_concurrent']}   "
+            f"{gtr('active_jobs')}: {st['active']}/{st['max_concurrent']}"
+            f"{more}   "
             f"{gtr('ext_state')}: {nm}")
         self._show_coexist(st.get("coexist") or {})
-        turbo = bool(st.get("turbo"))
+        self.turbo = bool(st.get("turbo"))
         self.turbo_btn.set_label(
-            "⚡ " + (gtr("turbo_on") if turbo else gtr("turbo")))
+            "⚡ " + (gtr("turbo_on") if self.turbo else gtr("turbo")))
         ctx = self.turbo_btn.get_style_context()
-        if turbo:
+        if self.turbo:
             ctx.add_class("destructive-action")
         else:
             ctx.remove_class("destructive-action")
         return True
+
+    def _apply_stats(self, st: dict) -> None:
+        """Kareyi uygular: yalniz degisen satirlar dokunulur."""
+        out = self.queue.apply(st)
+        for jid in out["removed"]:
+            self._drop_row(jid)
+        for job in out["upsert"]:
+            self._upsert_row(job)
+        self.total_jobs = out["total"]
+
+    def _upsert_row(self, job: dict) -> None:
+        """Satiri kimligine gore yerinde gunceller (odak korunur)."""
+        row = self.rows.get(job["id"])
+        if row is None:
+            row = JobRow(self, job)
+            self.rows[job["id"]] = row
+            self.listbox.append(row)
+        else:
+            row.update(job)
+
+    def _drop_row(self, jid: str) -> None:
+        row = self.rows.pop(jid, None)
+        if row is not None:
+            self.listbox.remove(row)
 
     def _show_coexist(self, co: dict) -> None:
         """stats.coexist: mod acik mi, hat mesgulse baglanti kisildi mi."""
@@ -758,9 +790,9 @@ class FerdimApp(Gtk.Application):
     def on_turbo(self, _btn):
         if not self.client:
             return
+        # turbo durumu son kareden bilinir: ek bir (tam) stats istegi yok
         try:
-            self.client.request("turbo", on=not bool(
-                self.client.request("stats").get("turbo")))
+            self.client.request("turbo", on=not self.turbo)
         except Exception:
             pass
         self.refresh()

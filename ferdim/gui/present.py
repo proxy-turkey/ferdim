@@ -111,3 +111,73 @@ def host_line(h: dict, lang: str) -> str:
              links=h.get("links", 0), rtt=band,
              speed=util.human_size(h.get("per_link_bps") or 0),
              samples=h.get("samples", 0), seen=seen)
+
+
+class StatsWindow:
+    """Kuyruk karelerini pencereli gorunume indirger (Gtk'dan bagimsiz).
+
+    Sozlesme (`qm.stats`): tam kare `full=True` (jobs = ilk `limit` is),
+    delta `full=False` (jobs = yalniz degisenler, `removed` = o revizyondan
+    sonra silinen kimlikler). 10 000 islik kuyrukta her saniye tam kare
+    cekmek ~6-7 MB demek: burada delta birlestirilir, pencere `limit` isi
+    asmaz, tasarsa `full_pending` isareti verilir (cagiran tam kare ister).
+
+    `params` dogrudan `stats` komutunun parametreleridir; `apply` yalniz
+    DEGISEN satirlari (`upsert`) ve dusen kimlikleri (`removed`) dondurur:
+    cagiran widget'lari kimlige gore yerinde gunceller (odak korunur)."""
+
+    def __init__(self, limit: int = 500):
+        self.limit = max(1, int(limit))
+        self.jobs: dict[str, dict] = {}     # kimlik -> is
+        self.rev = 0
+        self.full_pending = True            # sonraki kare tam istensin
+        self.total = 0                  # kuyrugun tamami (pencere dahil)
+
+    @property
+    def params(self) -> dict:
+        """`stats` komut parametreleri: ilk kare tam, sonrasi delta."""
+        out: dict = {"limit": self.limit}
+        if self.rev and not self.full_pending:
+            out["since"] = self.rev
+        return out
+
+    def apply(self, st: dict) -> dict:
+        """Kareyi uygular; `upsert`/`removed`/`total` dondurur."""
+        incoming = [j for j in (st.get("jobs") or ())
+                    if isinstance(j, dict) and j.get("id")]
+        rev = st.get("rev")
+        full = bool(st.get("full")) or not isinstance(rev, int)
+        if full:
+            # tam kare: pencere sunucunun sayfasi olur, fazlasi duser
+            keep = {j["id"] for j in incoming}
+            removed = [jid for jid in self.jobs if jid not in keep]
+            upsert = incoming
+        else:
+            gone = set(st.get("removed") or ())
+            removed = [jid for jid in self.jobs if jid in gone]
+            upsert = []
+        # once dusenler (yer acilir), sonra gelenler
+        for jid in removed:
+            del self.jobs[jid]
+        if not full:
+            upsert = [j for j in incoming if self._fits(j["id"])]
+        for job in upsert:
+            self.jobs[job["id"]] = job
+        self.rev = rev if isinstance(rev, int) else 0
+        self.full_pending = False
+        total = st.get("total_jobs")
+        self.total = total if isinstance(total, int) else len(self.jobs)
+        if len(self.jobs) > self.limit or self.total < len(self.jobs):
+            # pencere tasti ya da sayim tutmuyor (kacan kare): kendini duzelt
+            self.rev = 0
+            self.full_pending = True
+        elif removed and self.total > len(self.jobs):
+            # pencerede yer bosaldi: siradaki is ancak TAM karede gelir
+            # (delta yalniz degisenleri tasir), bir sonraki kare tam olsun
+            self.rev = 0
+            self.full_pending = True
+        return {"upsert": upsert, "removed": removed, "total": self.total}
+
+    def _fits(self, jid: str) -> bool:
+        """Deltada pencere disi is: yalniz bilinen ya da yer varsa."""
+        return jid in self.jobs or len(self.jobs) < self.limit
