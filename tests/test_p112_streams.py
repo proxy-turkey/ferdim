@@ -64,12 +64,22 @@ class _Handler(BaseHTTPRequestHandler):
         with st["lock"]:
             st["counts"][p] = st["counts"].get(p, 0) + 1
             st["ranges"].append((p, self.headers.get("Range", "")))
+            st["headers"].append(
+                (p, {k.lower(): v for k, v in self.headers.items()}))
             n = st["flaky"].get(p, 0)
             if n:
                 st["flaky"][p] = n - 1
         ctype = st["types"].get(p, "application/octet-stream")
         if n:
             self._send(503, b"", ctype, [("Retry-After", "0")])
+            return
+        if p in st["overlong"]:
+            data = st["overlong"][p]
+            rng = self.headers.get("Range") or ""
+            a = int(rng[6:].split("-", 1)[0]) if rng.startswith("bytes=") else 0
+            body = data[a:]          # istenen bitisi yok sayar (fazla govde)
+            self._send(206, body, ctype, [
+                ("Content-Range", f"bytes {a}-{len(data) - 1}/{len(data)}")])
             return
         if p in st["range_files"]:
             data = st["range_files"][p]
@@ -96,7 +106,8 @@ class _Handler(BaseHTTPRequestHandler):
 
 def start_stream_server() -> tuple[ThreadingHTTPServer, str, dict]:
     st = {"files": {}, "range_files": {}, "no_range": {}, "types": {},
-          "flaky": {}, "counts": {}, "ranges": [], "lock": threading.Lock()}
+          "flaky": {}, "counts": {}, "ranges": [], "headers": [],
+          "overlong": {}, "lock": threading.Lock()}
     ThreadingHTTPServer.request_queue_size = 128
     srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     srv.daemon_threads = True
@@ -128,6 +139,12 @@ class _Base(unittest.TestCase):
         self.addCleanup(self.srv.server_close)
         self.addCleanup(self.srv.shutdown)
         self.opt = httpcli.DlOptions(user_agent="test", timeout=10, retries=3)
+
+    def add_server(self):
+        srv, base, st = start_stream_server()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return base, st
 
     def assemble(self, entries, stop=None):
         out = self.root / "out.bin"
@@ -234,6 +251,7 @@ class HlsByteRangeTests(_Base):
             with self.assertRaises(segments.StreamError) as ctx:
                 self.assemble([segments.Segment(self.base + "/tam.bin", 0, 10)])
         self.assertIn("Range", str(ctx.exception))
+        self.assertEqual(ctx.exception.code, "stream_range")
         self.assertEqual(self.st["counts"]["/tam.bin"], 1,
                          "Range yok sayan sunucu tekrar denenmemeli")
 
@@ -507,6 +525,234 @@ class ManifestLimitTests(_Base):
                             f"{job.state} {job.error}")
         self.assertEqual(job.state, JobState.ERROR)
         self.assertEqual(job.error_code, "manifest_too_large")
+
+
+# ------------------------------------------------ 6) manifest URL schemes
+class ManifestUrlTests(_Base):
+    """Referanslar yalniz http/https olabilir (file:/data: yerel dosya sizdirir)."""
+
+    def _assert_bad(self, text, exc_type):
+        with self.assertRaises(exc_type) as ctx:
+            hls.parse_media(text, self.base + "/")
+        self.assertEqual(ctx.exception.code, "manifest_bad_url")
+
+    def test_hls_rejects_file_segment(self):
+        self._assert_bad(
+            "#EXTM3U\n#EXTINF:1,\nfile:///etc/passwd\n#EXT-X-ENDLIST\n",
+            hls.HlsError)
+
+    def test_hls_rejects_data_segment(self):
+        self._assert_bad(
+            "#EXTM3U\n#EXTINF:1,\ndata:text/plain,gizli\n#EXT-X-ENDLIST\n",
+            hls.HlsError)
+
+    def test_hls_rejects_map_and_key_schemes(self):
+        self._assert_bad(
+            '#EXTM3U\n#EXT-X-MAP:URI="file:///etc/passwd"\n'
+            '#EXTINF:1,\nseg.ts\n#EXT-X-ENDLIST\n', hls.HlsError)
+        self._assert_bad(
+            '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="file:///etc/passwd"\n'
+            '#EXTINF:1,\nseg.ts\n#EXT-X-ENDLIST\n', hls.HlsError)
+
+    def test_hls_master_variant_scheme_is_rejected(self):
+        self._assert_bad(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"
+            "file:///etc/passwd\n#EXT-X-ENDLIST\n", hls.HlsError)
+
+    def test_dash_rejects_baseurl_file(self):
+        mpd = ('<?xml version="1.0"?><MPD type="static">'
+               '<BaseURL>file:///etc/</BaseURL>'
+               '<Period duration="PT1S">'
+               '<AdaptationSet mimeType="video/mp4">'
+               '<Representation id="v" width="1" height="1" bandwidth="1">'
+               '<SegmentTemplate duration="1" timescale="1" startNumber="1" '
+               'media="v-$Number$.m4s"/></Representation>'
+               '</AdaptationSet></Period></MPD>')
+        with self.assertRaises(dash.DashError) as ctx:
+            dash.build_plan(mpd, "https://cdn.test/v.mpd")
+        self.assertEqual(ctx.exception.code, "manifest_bad_url")
+
+    def test_dash_rejects_template_and_segmentlist_schemes(self):
+        tmpl = _mpd_periods(
+            '<Period duration="PT1S"><AdaptationSet mimeType="video/mp4">'
+            '<Representation id="v" width="1" height="1" bandwidth="1">'
+            '<SegmentTemplate duration="1" timescale="1" startNumber="1" '
+            'media="data:text/plain,gizli"/></Representation>'
+            '</AdaptationSet></Period>')
+        with self.assertRaises(dash.DashError) as ctx:
+            dash.build_plan(tmpl, "https://cdn.test/v.mpd")
+        self.assertEqual(ctx.exception.code, "manifest_bad_url")
+        seglist = _mpd_periods(
+            '<Period duration="PT1S"><AdaptationSet mimeType="video/mp4">'
+            '<Representation id="v" width="1" height="1" bandwidth="1">'
+            '<SegmentList><SegmentURL media="file:///etc/passwd"/>'
+            '</SegmentList></Representation></AdaptationSet></Period>')
+        with self.assertRaises(dash.DashError) as ctx:
+            dash.build_plan(seglist, "https://cdn.test/v.mpd")
+        self.assertEqual(ctx.exception.code, "manifest_bad_url")
+
+
+# ------------------------------------------------- 7) key fetch hardening
+class KeyHardeningTests(_Base):
+    def test_key_fetch_is_stop_aware(self):
+        stop = threading.Event()
+        stop.set()
+        self.assertIsNone(hls.fetch_key(self.base + "/key.bin", self.opt, stop))
+        self.assertEqual(self.st["counts"].get("/key.bin", 0), 0,
+                         "duran kosu anahtar istememeli")
+
+    @unittest.skipUnless(AES_OK, "cryptography kurulu degil")
+    def test_transient_key_error_is_retried(self):
+        key = os.urandom(16)
+        plain = os.urandom(80)
+        self.st["files"]["/key.bin"] = key
+        self.st["flaky"]["/key.bin"] = 1
+        self.st["files"]["/e0.ts"] = aes_encrypt(plain, key,
+                                                 (0).to_bytes(16, "big"))
+        playlist = "\n".join([
+            "#EXTM3U", '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"',
+            "#EXTINF:1,", "e0.ts", "#EXT-X-ENDLIST", ""])
+        with mock.patch.object(segments, "retry_delay", return_value=0):
+            out, _, _ = self.download_hls(playlist)
+        self.assertEqual(out, plain)
+        self.assertEqual(self.st["counts"]["/key.bin"], 2,
+                         "gecici anahtar hatasi yeniden denenmeliydi")
+
+    def test_distinct_key_cap(self):
+        playlist = ["#EXTM3U"]
+        for i in range(3):
+            playlist += [f'#EXT-X-KEY:METHOD=AES-128,URI="k{i}.bin"',
+                         "#EXTINF:1,", f"s{i}.ts"]
+        playlist.append("#EXT-X-ENDLIST")
+        with mock.patch.object(hls, "MAX_KEYS", 2):
+            with self.assertRaises(hls.HlsError) as ctx:
+                self.download_hls("\n".join(playlist) + "\n")
+        self.assertEqual(ctx.exception.code, "stream_limit")
+        self.assertFalse([p for p in self.st["counts"] if p.startswith("/k")],
+                         "sinir asilinca anahtar inmemeli")
+
+    def test_segment_cap_in_parser(self):
+        playlist = "#EXTM3U\n" + "".join(
+            f"#EXTINF:1,\ns{i}.ts\n" for i in range(3)) + "#EXT-X-ENDLIST\n"
+        with mock.patch.object(hls, "MAX_SEGMENTS", 2):
+            with self.assertRaises(hls.HlsError) as ctx:
+                hls.parse_media(playlist, self.base + "/")
+        self.assertEqual(ctx.exception.code, "stream_limit")
+
+
+# ------------------------------------------------------- 8) body limits
+class BodyLimitTests(_Base):
+    def test_plain_segment_body_over_limit(self):
+        self.st["files"]["/buyuk.bin"] = b"x" * 4096
+        with mock.patch.object(segments, "BODY_MAX", 1024), \
+                mock.patch.object(segments, "retry_delay", return_value=0):
+            with self.assertRaises(segments.StreamError) as ctx:
+                self.assemble([segments.Segment(self.base + "/buyuk.bin")])
+        self.assertEqual(ctx.exception.code, "stream_too_large")
+        self.assertEqual(self.st["counts"]["/buyuk.bin"], 1,
+                         "govde siniri kalici: yeniden denenmemeli")
+
+    def test_range_body_longer_than_declared_is_rejected(self):
+        self.st["overlong"]["/uzun.bin"] = b"x" * 4096
+        with mock.patch.object(segments, "retry_delay", return_value=0):
+            with self.assertRaises(segments.StreamError) as ctx:
+                self.assemble([segments.Segment(self.base + "/uzun.bin", 0, 10)])
+        self.assertEqual(ctx.exception.code, "stream_too_large")
+        self.assertEqual(self.st["counts"]["/uzun.bin"], 1)
+
+    def test_range_length_is_capped_by_body_limit(self):
+        self.st["range_files"]["/sub2.bin"] = b"y" * 4096
+        with mock.patch.object(segments, "BODY_MAX", 8), \
+                mock.patch.object(segments, "retry_delay", return_value=0):
+            with self.assertRaises(segments.StreamError) as ctx:
+                self.assemble([
+                    segments.Segment(self.base + "/sub2.bin", 0, 100)])
+        self.assertEqual(ctx.exception.code, "stream_too_large")
+
+
+# ------------------------------------------------ 9) manifest number guards
+class ManifestNumberTests(_Base):
+    def test_hls_oversized_numbers(self):
+        huge = "9" * 21
+        for line in (f"#EXT-X-STREAM-INF:BANDWIDTH={huge}\nseg.ts",
+                     f"#EXT-X-BYTERANGE:{huge}\nseg.ts",
+                     f"#EXT-X-MEDIA-SEQUENCE:{huge}\nseg.ts"):
+            playlist = "#EXTM3U\n" + line + "\n#EXT-X-ENDLIST\n"
+            with self.assertRaises(hls.HlsError) as ctx:
+                hls.parse_media(playlist, self.base + "/")
+            self.assertEqual(ctx.exception.code, "manifest_number", line[:20])
+
+    def test_hls_leading_zero_bandwidth_is_accepted(self):
+        playlist = ("#EXTM3U\n"
+                    "#EXT-X-STREAM-INF:BANDWIDTH=" + "0" * 26 + "1\n"
+                    "seg.ts\n#EXT-X-ENDLIST\n")
+        pl = hls.parse_media(playlist, self.base + "/")
+        self.assertEqual(pl.variants[0]["bandwidth"], 1)
+
+    def test_dash_oversized_numbers(self):
+        huge = "9" * 21
+        width = _mpd_periods(
+            '<Period duration="PT1S"><AdaptationSet mimeType="video/mp4">'
+            f'<Representation id="v" width="{huge}" height="1" '
+            'bandwidth="1"></Representation></AdaptationSet></Period>')
+        with self.assertRaises(dash.DashError) as ctx:
+            dash.build_plan(width, "https://cdn.test/v.mpd")
+        self.assertEqual(ctx.exception.code, "manifest_number")
+        start = _mpd_periods(
+            '<Period duration="PT1S"><AdaptationSet mimeType="video/mp4">'
+            '<Representation id="v" width="1" height="1" bandwidth="1">'
+            f'<SegmentTemplate duration="1" timescale="1" '
+            f'startNumber="{huge}" media="v-$Number$.m4s"/>'
+            '</Representation></AdaptationSet></Period>')
+        with self.assertRaises(dash.DashError) as ctx:
+            dash.build_plan(start, "https://cdn.test/v.mpd")
+        self.assertEqual(ctx.exception.code, "manifest_number")
+
+
+# ----------------------------------------------------- 10) Referer scoping
+class RefererScopingTests(_Base):
+    def _opt(self):
+        return httpcli.DlOptions(
+            user_agent="test", timeout=10, retries=3,
+            headers={"Referer": "https://sayfa.test/x?jeton=gizli"},
+            origin=httpcli.origin_of(self.base))
+
+    def _headers(self, st, path):
+        for p, h in st["headers"]:
+            if p == path:
+                return h
+        return {}
+
+    def test_cross_origin_segment_drops_referer(self):
+        base2, st2 = self.add_server()
+        self.st["files"]["/a.ts"] = b"a"
+        st2["files"]["/b.ts"] = b"b"
+        self.opt = self._opt()
+        out, _ = self.assemble([segments.Segment(self.base + "/a.ts"),
+                                segments.Segment(base2 + "/b.ts")])
+        self.assertEqual(out, b"ab")
+        self.assertIn("referer", self._headers(self.st, "/a.ts"),
+                      "ayni koken Referer'i korumali")
+        self.assertNotIn("referer", self._headers(st2, "/b.ts"),
+                         "yabanci kokenli segment Referer almamali")
+
+    @unittest.skipUnless(AES_OK, "cryptography kurulu degil")
+    def test_cross_origin_key_drops_referer(self):
+        base2, st2 = self.add_server()
+        key = os.urandom(16)
+        plain = os.urandom(64)
+        st2["files"]["/key.bin"] = key
+        self.st["files"]["/e0.ts"] = aes_encrypt(plain, key,
+                                                 (0).to_bytes(16, "big"))
+        playlist = "\n".join([
+            "#EXTM3U",
+            f'#EXT-X-KEY:METHOD=AES-128,URI="{base2}/key.bin"',
+            "#EXTINF:1,", "e0.ts", "#EXT-X-ENDLIST", ""])
+        self.opt = self._opt()
+        out, _, _ = self.download_hls(playlist)
+        self.assertEqual(out, plain)
+        self.assertNotIn("referer", self._headers(st2, "/key.bin"),
+                         "yabanci kokenli anahtar Referer almamali")
 
 
 if __name__ == "__main__":

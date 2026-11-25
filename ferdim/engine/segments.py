@@ -17,7 +17,8 @@ import ssl
 import threading
 import time
 import urllib.error
-from dataclasses import dataclass
+import urllib.parse
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .. import util
@@ -27,6 +28,8 @@ from . import httpcli
 SEG_MAX = 8               # segment havuzu tavani (aralik islerinden bagimsiz)
 SEG_LEARN_MIN = 4         # ogrenmek icin en az bu kadar segment inmeli
 MANIFEST_MAX = 8 << 20    # HLS/DASH manifest ust siniri (bellek korumasi)
+BODY_MAX = 64 << 20       # tek segment/init govdesi ust siniri (bellek)
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
 
 
 class StreamError(Exception):
@@ -35,6 +38,43 @@ class StreamError(Exception):
     def __init__(self, msg: str, code: str = ""):
         super().__init__(msg)
         self.code = code
+
+
+def resolve_url(base: str, ref: str, *, exc=StreamError,
+                code: str = "manifest_bad_url") -> str:
+    """Manifest referansini cozer ve YALNIZ http/https kabul eder.
+
+    HLS/DASH dosyalari guvenilmezdir: `file:`, `data:`, `ftp:` gibi semalar
+    yerel dosya okuma ya da baska tasiyicilar acabilir. Tum manifest
+    referanslari (varyant, MAP, KEY, segment, BaseURL) bu TEK kapidan gecer.
+    """
+    try:
+        url = urllib.parse.urljoin(base, ref)
+        scheme = urllib.parse.urlsplit(url).scheme.lower()
+    except ValueError as e:
+        raise exc("manifest adresi cozulemedi", code) from e
+    if scheme not in _ALLOWED_SCHEMES:
+        raise exc(f"manifest adresi desteklenmiyor ({scheme or 'yok'})", code)
+    return url
+
+
+def scoped_options(opt: httpcli.DlOptions, url: str):
+    """Hedef koken manifest/isin kokeninden farkliysa Referer'i atar.
+
+    `httpcli.headers_for` kimlik basliklarini koken disina gonderirken
+    Referer'i (hotlink denetimi icin) korur. Manifest'ten turetilen yabanci
+    kokenli segmentler/anahtarlar icin Referer'in sorgu dizesi sizmasin:
+    ayni kurallarla (http->https yukseltmesi ayni koken) Referer dusurulur.
+    """
+    origin = getattr(opt, "origin", ())
+    if not origin or httpcli.same_origin(origin, url):
+        return opt
+    headers = opt.headers or {}
+    clean = {k: v for k, v in headers.items()
+             if str(k).strip().lower() != "referer"}
+    if len(clean) == len(headers):
+        return opt                      # Referer yok: kopya gerekmez
+    return replace(opt, headers=clean)
 
 
 @dataclass(frozen=True)
@@ -149,19 +189,29 @@ def pool_size(n_segments: int, seed: int = 0, cap: int = SEG_MAX) -> int:
     return max(1, min(want or max(1, n // 2), cap, n))
 
 
-def _read_body(r, bucket: TokenBucket,
-               stop: threading.Event | None) -> bytes | None:
-    """Yanit govdesini hiz kovasindan gecirerek okur; durunca None."""
+def _read_body(r, bucket: TokenBucket, stop: threading.Event | None,
+               limit: int | None = None) -> bytes | None:
+    """Yanit govdesini hiz kovasindan gecirerek okur; durunca None.
+
+    `limit` verilirse govde bu bayt sayisini asarsa `stream_too_large`
+    koduyla StreamError: sunucu Content-Length'i yalan soylese de bellek
+    sinirsiz buyumez (en fazla limit+1 bayt okunur)."""
     buf = bytearray()
-    while True:
+    while limit is None or len(buf) <= limit:
         if stop is not None and stop.is_set():
             return None
-        chunk = r.read(65536)
+        n = 65536 if limit is None else min(65536, limit + 1 - len(buf))
+        if n <= 0:
+            break
+        chunk = r.read(n)
         if not chunk:
             break
         if not bucket.take(len(chunk), stop):
             return None
         buf += chunk
+    if limit is not None and len(buf) > limit:
+        raise StreamError("segment govdesi ust sinirin uzerinde",
+                          "stream_too_large")
     return bytes(buf)
 
 
@@ -172,7 +222,7 @@ def fetch_all(url: str, opt: httpcli.DlOptions, bucket: TokenBucket,
     veriyi YAZMAZ; boylece duraklatma hiz limiti altinda da senkron olur)."""
     opener = httpcli._make_opener(opt)
     with opener.open(httpcli.request_of(url, opt), timeout=opt.timeout) as r:
-        return _read_body(r, bucket, stop)
+        return _read_body(r, bucket, stop, BODY_MAX)
 
 
 _CR_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)")
@@ -184,11 +234,13 @@ def fetch_range(url: str, opt: httpcli.DlOptions, bucket: TokenBucket,
     """`url` uzerinden YALNIZ [start, start+length) alt araligini ceker.
 
     HLS EXT-X-BYTERANGE icin: sunucu Range'i yok sayip 200 dondururse ya da
-    baska bir bolumu verirse StreamError'dur - tam dosya yazmak akisi
-    kopyalarla sisirirdi. Eksik govde (kesilen okuma) yeniden denenebilir
-    oldugu icin ConnectionError'dur.
+    baska bir bolumu verirse StreamError'dur (`stream_range`) - tam dosya
+    yazmak akisi kopyalarla sisirirdi. Govde en fazla `length+1` bayt okunur;
+    fazlasi yine `stream_too_large`/`stream_range` ile reddedilir. Eksik govde
+    (kesilen okuma) yeniden denenebilir oldugu icin ConnectionError'dur.
     """
     end = start + length - 1
+    cap = min(length, BODY_MAX)
     opener = httpcli._make_opener(opt)
     req = httpcli.request_of(url, opt)
     req.add_header("Range", f"bytes={start}-{end}")
@@ -199,8 +251,8 @@ def fetch_range(url: str, opt: httpcli.DlOptions, bucket: TokenBucket,
         if status != 206 or m is None or int(m.group(1)) != start:
             raise StreamError(
                 f"segment {start}-{end} icin gecersiz Range yaniti "
-                f"(HTTP {status}, Content-Range {cr or '-'})")
-        data = _read_body(r, bucket, stop)
+                f"(HTTP {status}, Content-Range {cr or '-'})", "stream_range")
+        data = _read_body(r, bucket, stop, cap)
     if data is None:
         return None
     if len(data) != length:
@@ -333,14 +385,15 @@ def assemble(opt: httpcli.DlOptions, fd: int, meta: dict,
         f = seg_file(idx)
         if not f.exists():
             seg = entries[idx]
+            seg_opt = scoped_options(opt, seg.url)
             attempt = 0
             while True:
                 try:
                     if seg.start is not None:
-                        data = fetch_range(seg.url, opt, bucket, seg.start,
+                        data = fetch_range(seg.url, seg_opt, bucket, seg.start,
                                            seg.length, stop_event)
                     else:
-                        data = fetch_all(seg.url, opt, bucket, stop_event)
+                        data = fetch_all(seg.url, seg_opt, bucket, stop_event)
                     if data is not None and seg.key is not None:
                         data = _decrypt_aes128(data, seg.key, seg.iv)
                     break
@@ -395,7 +448,8 @@ def assemble(opt: httpcli.DlOptions, fd: int, meta: dict,
 
     cursor = int(meta.get("cursor", 0))
     if init_url is not None and not meta.get("init_done"):
-        data = fetch_all(init_url, opt, bucket, stop_event)
+        data = fetch_all(init_url, scoped_options(opt, init_url), bucket,
+                         stop_event)
         if data is None:              # duraklat/iptal
             persist(force=True)
             return
