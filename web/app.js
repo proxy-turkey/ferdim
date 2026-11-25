@@ -728,8 +728,6 @@ async function poll() {
   polling = false;
   if (fresh) sampleHistory(Date.now());
   render(); renderStatus(); announce(); updateGraphs();
-  // profil paneli acikken ~2 sn'de bir tazelenir (her karede degil)
-  maybeHosts();
 }
 
 /* ------------------------------------------------------------ canli akis
@@ -826,7 +824,6 @@ function handleFrame(block) {
   if (!applyStats(s)) return;
   sampleHistory(Date.now());
   render(); renderStatus(); announce(); updateGraphs();
-  maybeHosts();
 }
 
 /* token dondurulmus/gecersiz: sekmedeki kopyayi at, sayfa yeniden yuklenir */
@@ -942,13 +939,18 @@ $("#zipRepair").onclick = zipRepair;
 const hostsDlg = $("#hostsDlg");
 const hostRows = new Map();      // ana makine -> {root, text, forget, sig}
 let hostsGen = 0;                // eski yanit yeni listeyi ezmesin
-let hostsAt = 0;            // son profil tazelemesi (ms)
+let hostsTimer = 0;              // panelin kendi tazelenme zamanlayicisi
 
-/* profil paneli acikken ~2 sn'de bir tazelenir (her karede degil) */
-function maybeHosts() {
-  if (!hostsDlg.open || Date.now() - hostsAt < 2000) return;
-  hostsAt = Date.now();
+/* Profil paneli ~2 sn'de bir tazelenir. Bu, istatistik karelerine
+ * BAGLANMAZ: sunucu degisiklik yokken kare gondermez (bosta trafik yok),
+ * panel yine de taze kalmali. Zamanlayici panel kapaninca/sekme gizlenince
+ * durur (bosta istek yok). */
+function hostsPoll() {
+  clearTimeout(hostsTimer);
+  hostsTimer = 0;
+  if (!hostsDlg.open || document.hidden) return;
   loadHosts();
+  hostsTimer = setTimeout(hostsPoll, 2000);
 }
 
 function buildHostRow(host) {
@@ -1032,8 +1034,13 @@ async function forgetHost(host) {
   loadHosts();
 }
 
-$("#hostsBtn").onclick = () => { hostsDlg.showModal(); loadHosts(); };
+$("#hostsBtn").onclick = () => { hostsDlg.showModal(); hostsPoll(); };
 $("#hostsClose").onclick = () => hostsDlg.close();
+/* kapanis (dugme ya da Escape): tazeleme zamanlayicisi da dursun */
+hostsDlg.addEventListener("close", () => {
+  clearTimeout(hostsTimer);
+  hostsTimer = 0;
+});
 $("#hostsForgetAll").onclick = async () => {
   const n = hostRows.size;
   if (!n) return;
@@ -1391,11 +1398,13 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     streamClose();
     clearTimeout(retryTimer); retryTimer = 0;
+    clearTimeout(hostsTimer); hostsTimer = 0;   // panel tazelemesi de dursun
     return;
   }
   if (!TOKEN) return;
   poll();               // hemen bir kare (sekme arkada kalmis olabilir)
   streamLoop();         // akis yeniden acilir
+  if (hostsDlg.open) hostsPoll();            // panel acikti: tazeleme doner
 });
 
 /* ---- baslangic ---- */
