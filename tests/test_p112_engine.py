@@ -39,6 +39,7 @@ from ferdim.engine import job as job_mod
 from ferdim.engine.job import DownloadJob, JobSpec, JobState, _retry_after
 from ferdim.engine.queue import QueueManager
 from ferdim.paths import AppEnv
+from ferdim import ratelimit as ratelimit_mod
 from ferdim.ratelimit import CombinedBucket, TokenBucket
 from tests.helpers import tmp_root
 
@@ -47,6 +48,7 @@ SHORT_SHA = hashlib.sha256(SHORT_DATA).hexdigest()
 SHORT_ETAG = '"p112-short"'
 BIG_DATA = os.urandom(3 * 1024 * 1024 + 1234)
 BIG_SHA = hashlib.sha256(BIG_DATA).hexdigest()
+SMALL_DATA = SHORT_DATA[:192 * 1024]     # 256KB'lik okumadan kucuk, > 128KB
 SERVE_CAP = 64 * 1024
 
 
@@ -72,6 +74,8 @@ class _Srv(ThreadingHTTPServer):
         self.payload = payload
         self.requests = 0
         self.ignored = 0        # aralik istegine 200 donen sayac
+        self.bad = 0            # bozuk Content-Range donen sayac
+        self.cap = SERVE_CAP    # 206 basina en cok servis edilen bayt
 
     @property
     def base(self) -> str:
@@ -116,7 +120,7 @@ class _Handler(BaseHTTPRequestHandler):
         rng = self._range()
         if rng is not None:
             a, b = rng
-            b = min(b, a + SERVE_CAP - 1)      # KISA 206: kendi parca siniri
+            b = min(b, a + self.server.cap - 1)      # KISA 206: kendi parca siniri
             body = self.server.payload[a:b + 1]
             self._body(206, body, [
                 ("Content-Range", f"bytes {a}-{b}/{len(self.server.payload)}"),
@@ -191,6 +195,127 @@ class _429Handler(BaseHTTPRequestHandler):
         self._send(429, b"", [("Retry-After", "100")])
 
 
+class _BadRangeHandler(BaseHTTPRequestHandler):
+    """Bozuk Content-Range: start>0 isteklerinde end < start (bitis once).
+
+    a=0 istegi 1 baytlik gecerli kisa 206 doner (ilerleme var); a>0 istegi
+    `bytes A-(A-1)/N` doner. `_open` bunu protokol hatasi saymali; kisa 206
+    sanip ayni araligi sonsuza dek kuyruga koymamali."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, extra=()):
+        self.server.requests += 1
+        self.send_response(code)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in extra:
+            self.send_header(k, v)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+    def do_GET(self):
+        total = len(self.server.payload)
+        rng = self.headers.get("Range") or ""
+        if rng.strip() == "bytes=0-0":
+            self._send(206, self.server.payload[:1], [
+                ("Content-Range", f"bytes 0-0/{total}"),
+                ("Accept-Ranges", "bytes"), ("ETag", SHORT_ETAG)])
+            return
+        try:
+            a = int(rng[6:].split("-", 1)[0])
+        except (ValueError, IndexError):
+            a = 0
+        if a <= 0:
+            self._send(206, self.server.payload[:1], [
+                ("Content-Range", f"bytes 0-0/{total}"),
+                ("Accept-Ranges", "bytes"), ("ETag", SHORT_ETAG)])
+            return
+        self.server.bad += 1
+        self._send(206, b"", [
+            ("Content-Range", f"bytes {a}-{a - 1}/{total}"),
+            ("Accept-Ranges", "bytes"), ("ETag", SHORT_ETAG)])
+
+
+DASH_MPD = (
+    '<?xml version="1.0"?>'
+    '<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"'
+    ' mediaPresentationDuration="PT2S">'
+    '<Period duration="PT2S">'
+    '<AdaptationSet mimeType="video/mp4">'
+    '<Representation id="v" bandwidth="100000" width="640" height="360">'
+    '<SegmentTemplate timescale="1" duration="1" startNumber="1"'
+    ' initialization="v-init.mp4" media="v-$Number$.m4s"/>'
+    '</Representation></AdaptationSet>'
+    '<AdaptationSet mimeType="audio/mp4">'
+    '<Representation id="a" bandwidth="64000">'
+    '<SegmentTemplate timescale="1" duration="1" startNumber="1"'
+    ' initialization="a-init.mp4" media="a-$Number$.m4s"/>'
+    '</Representation></AdaptationSet>'
+    '</Period></MPD>').encode()
+DASH_VIDEO_INIT = b"VINIT" * 100
+DASH_VIDEO_SEGS = [b"V1" * 500, b"V2" * 500]
+DASH_AUDIO_INIT = b"AINIT" * 64
+DASH_AUDIO_SEGS = [b"A1" * 300, b"A2" * 300]
+
+
+class _DashHandler(BaseHTTPRequestHandler):
+    """Video + ses temsilli kucuk DASH kaynagi (ses kardes dosyaya iner)."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, body, ctype="application/octet-stream"):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+    def do_GET(self):
+        p = self.path.split("?", 1)[0]
+        if p.endswith(".mpd"):
+            self._send(DASH_MPD, "application/dash+xml")
+        elif p.endswith("v-init.mp4"):
+            self._send(DASH_VIDEO_INIT, "video/mp4")
+        elif p.endswith("v-1.m4s"):
+            self._send(DASH_VIDEO_SEGS[0], "video/mp4")
+        elif p.endswith("v-2.m4s"):
+            self._send(DASH_VIDEO_SEGS[1], "video/mp4")
+        elif p.endswith("a-init.mp4"):
+            self._send(DASH_AUDIO_INIT, "audio/mp4")
+        elif p.endswith("a-1.m4s"):
+            self._send(DASH_AUDIO_SEGS[0], "audio/mp4")
+        elif p.endswith("a-2.m4s"):
+            self._send(DASH_AUDIO_SEGS[1], "audio/mp4")
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+
+class _FakeClock:
+    """ratelimit.time yerine: sleep ilerletir, gercek bekleme yok."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
 class _Base(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -246,7 +371,7 @@ class SharedSpeedLimitTests(_Base):
         self.assertEqual(job._gbucket.rate, 55_555)
         self.assertEqual(job._bucket.rate, 55_555)
 
-    def test_03_combined_bucket_requires_all(self):
+    def test_03_combined_bucket_requires_all_and_set_rate_global_only(self):
         g = TokenBucket(0)
         p = TokenBucket(1000)
         cb = CombinedBucket(g, p)
@@ -255,11 +380,56 @@ class SharedSpeedLimitTests(_Base):
         stop = threading.Event()
         stop.set()
         self.assertFalse(cb.take(10 ** 9, stop))   # is basina kova engeller
-        g.set_rate(2000)
+        cb.set_rate(2000)
+        self.assertEqual(g.rate, 2000)             # yalniz kuyruk geneli
+        self.assertEqual(p.rate, 1000)             # is basina limit korunur
         self.assertEqual(cb.rate, 2000)
         cb.set_rate(0)
-        self.assertEqual(cb.rate, 0)
-        self.assertTrue(cb.take(10 ** 9, stop))
+        self.assertEqual(g.rate, 0)
+        self.assertEqual(p.rate, 1000)             # set_rate p'yi EZMEZ
+        self.assertEqual(cb.rate, 1000)
+
+    def test_04_large_take_satisfiable_with_fake_clock(self):
+        """C1: 256 KB take, 128 KB/s kovada kilitlenmemeli (burst >= n)."""
+        clock = _FakeClock()
+        with mock.patch.object(ratelimit_mod, "time", clock):
+            b = ratelimit_mod.TokenBucket(128 * 1024)
+            self.assertTrue(b.take(256 * 1024))
+        self.assertGreaterEqual(clock.now, 1000.0 + 0.9)
+
+    def test_05_stop_leaks_no_tokens_from_faster_bucket(self):
+        """L1: yavas kova once alinir; stop gelince hizli kovadan sizmaz."""
+        fast = TokenBucket(10 ** 9)
+        slow = TokenBucket(1000)
+        cb = CombinedBucket(fast, slow)
+        before = fast._tokens
+        stop = threading.Event()
+        out = []
+        t = threading.Thread(target=lambda: out.append(cb.take(10 ** 6, stop)))
+        t.start()
+        try:
+            time.sleep(0.05)
+            stop.set()
+        finally:
+            t.join(2.0)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(out, [False])
+        self.assertEqual(fast._tokens, before)
+
+    def test_06_end_to_end_speed_limit_progresses(self):
+        """C1: speed_limit=131072 olan is (turbo 256 KB okuma) ilerler."""
+        srv = serve(_Handler, SMALL_DATA)
+        self.addCleanup(srv.shutdown)
+        srv.cap = 1 << 30            # kisa 206 yok: tek buyuk okuma
+        cfg = self._cfg(turbo_mode=True, speed_limit=131_072)
+        job = DownloadJob(self.env, cfg, JobSpec(url=f"{srv.base}/small.bin",
+                                                 segments=2))
+        self.addCleanup(job.cancel)
+        job.start()
+        self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR)),
+                        f"{job.state} {job.error}")
+        self.assertEqual(job.state, JobState.DONE, job.error)
+        self.assertEqual(job.final_path.read_bytes(), SMALL_DATA)
 
 
 # ----------------------------------------------------------- 2) kisa 206 / 200
@@ -300,6 +470,79 @@ class RangeBehaviourTests(_Base):
         self.assertTrue(job.extra.get("no_ranges"))
         self.assertEqual(job.spec.segments, 1)
         self.assertGreaterEqual(self.ignore.ignored, 1)
+
+
+class MalformedRangeTests(_Base):
+    """M4: end < start Content-Range kisa 206 sanilmamali (sonsuz dongu yok)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.srv = serve(_BadRangeHandler, BIG_DATA)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        super().tearDownClass()
+
+    def test_01_malformed_range_fails_instead_of_looping(self):
+        job = self._job(f"{self.srv.base}/big.bin", segments=4)
+        job.start()
+        self.assertTrue(wait_until(
+            lambda: job.state in (JobState.ERROR, JobState.DONE), 40),
+            f"bozuk aralik isi bitirmedi: {job.state} {job.error}")
+        # bozuk aralik kisa 206 gibi kuyruga donup isi DONE yapmamali
+        self.assertEqual(job.state, JobState.ERROR, job.error)
+        self.assertGreaterEqual(self.srv.bad, 1)
+        # kuyruk sismedi / yanlis ilerleme sayilmadi
+        self.assertLess(job.done, 1 << 20, "bozuk aralik ilerleme gibi sayildi")
+
+
+class DashAudioCleanupTests(_Base):
+    """M1: DASH ses gecici dosyalari/noktasi temizlikte silinmeli."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.srv = serve(_DashHandler, b"")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        super().tearDownClass()
+
+    def test_01_successful_run_leaves_no_audio_temp(self):
+        job = self._job(f"{self.srv.base}/test.mpd")
+        job.start()
+        self.assertTrue(wait_state(job, (JobState.DONE, JobState.ERROR)),
+                        f"{job.state} {job.error}")
+        self.assertEqual(job.state, JobState.DONE, job.error)
+        self.assertEqual(
+            job.final_path.read_bytes(),
+            DASH_VIDEO_INIT + b"".join(DASH_VIDEO_SEGS))
+        audio = Path(job.extra["audio"])
+        self.assertEqual(audio.read_bytes(),
+                         DASH_AUDIO_INIT + b"".join(DASH_AUDIO_SEGS))
+        self.assertFalse(job.audio_part_path.exists())
+        self.assertFalse(job.audio_meta_path.exists())
+        self.assertFalse(
+            Path(str(job.audio_meta_path) + ".segs").exists())
+
+    def test_02_restart_drops_audio_temp(self):
+        env = AppEnv(root=tmp_root(self, "p112-dashq-"))
+        qm = QueueManager(env, env.load_config())
+        self.addCleanup(qm.shutdown)
+        job = qm.add(JobSpec(url="http://127.0.0.1:1/x.mpd"), paused=True)
+        job.target_dir.mkdir(parents=True, exist_ok=True)
+        job.audio_part_path.write_bytes(b"x")
+        job.audio_meta_path.write_bytes(b"{}")
+        segs = Path(str(job.audio_meta_path) + ".segs")
+        segs.mkdir()
+        (segs / "000000.seg").write_bytes(b"s")
+        qm.control(job.id, "restart")     # cancel + yeniden kuyruk
+        self.assertFalse(job.audio_part_path.exists())
+        self.assertFalse(job.audio_meta_path.exists())
+        self.assertFalse(segs.exists())
 
 
 # ------------------------------------------------------------- 3) Retry-After
@@ -359,6 +602,19 @@ class RetryAfterTests(_Base):
         self.assertNotEqual(job.state, JobState.ERROR, job.error)
         job.pause()
         self.assertEqual(job.state, JobState.PAUSED, job.state)
+
+    def test_05_gate_is_exposed_and_cleared(self):
+        """L4: kapi acikken snapshot'ta duvar saati gorunur, gecince temizlenir."""
+        job = self._raw_job()
+        job._retry_gate(30.0)
+        until = job.snapshot()["retry_after_until"]
+        self.assertGreater(until, time.time() + 20)
+        self.assertGreater(job.extra["retry_after_until"], time.time())
+        # kapi gecti: bekleme temizler
+        job._not_before = time.monotonic() - 1.0
+        self.assertTrue(job._wait_not_before())
+        self.assertEqual(job.snapshot()["retry_after_until"], 0.0)
+        self.assertNotIn("retry_after_until", job.extra)
 
 
 # ------------------------------------------------------- 4) fd tukenmesi/butce
