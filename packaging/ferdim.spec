@@ -1,7 +1,7 @@
 %global srcname ferdim
 
 Name:           %{srcname}
-Version:        1.8.1
+Version:        1.9.0
 Release:        1%{?dist}
 Summary:        Dynamic self-tuning download manager with Firefox integration
 
@@ -157,6 +157,9 @@ python3 -m unittest discover -s tests -v
 # end of user-unit preun scriptlet
 
 %changelog
+* Wed Nov 25 2026 Enes Aksu <eaksu@pm.me> - 1.9.0-1
+- global speed limit, HLS byterange/AES-128, multi-period DASH + audio
+- TLS CA/mTLS/min version, IDNA hosts, DST-safe schedules
 * Wed Nov 25 2026 Enes Aksu <eaksu@pm.me> - 1.8.1-1
 - tests: pause before the transfer ends (fast builders)
 * Wed Nov 25 2026 Enes Aksu <eaksu@pm.me> - 1.8.0-1

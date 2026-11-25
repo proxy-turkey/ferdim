@@ -46,6 +46,11 @@
   </screenshots>
 
   <releases>
+    <release version="1.9.0" date="2026-11-25">
+      <description>
+        <p>Protocol completeness: a shared global speed limit, encrypted and byte-range HLS, multi-period DASH with audio, TLS client certificates and custom CAs, and daylight-saving-safe schedules.</p>
+      </description>
+    </release>
     <release version="1.8.1" date="2026-11-25">
       <description>
         <p>Build fix for fast builders; no functional changes.</p>

@@ -4,6 +4,53 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [1.9.0] — 2026-11-25
+
+Protocol completeness and edge cases.
+
+### Changed
+- `speed_limit` is now one queue-wide limit shared by every download, as
+  documented; `--limit` caps a single job on top of it. Before, each job
+  got the full limit.
+- Schedules and speed plans follow the system time zone through daylight
+  saving changes: a start time that falls in the spring-forward gap
+  starts right after it, and the repeated autumn hour opens a window once.
+- Coexistence mode watches the interface that carries the default route,
+  including VPN and tunnel links (`wg*`, `tun*`); `coexist_interfaces`
+  picks the interfaces by hand.
+- A URL copied to the clipboard is queued paused and a notification
+  offers **Undo** for 10 seconds (`clipboard_confirm`, on by default).
+  Desktops without notification actions keep the old behaviour.
+
+### Added
+- HLS: per-segment retries with backoff, `#EXT-X-BYTERANGE`, and
+  `METHOD=AES-128` decryption with key rotation (optional `cryptography`;
+  without it `hls_crypto_missing`, DRM methods fail with `hls_drm`).
+- DASH: every period of a static MPD, plus the best audio track saved as
+  `<name>.audio.<ext>`.
+- TLS settings for HTTP, HTTP/3 and FTPS: extra CA bundle, client
+  certificate (mTLS) and minimum TLS version. The client certificate is
+  offered to every server that asks for one.
+- Running out of file handles pauses the job with `fd_exhausted` instead
+  of burning retries; links are kept within the descriptor limit.
+- `.part` space is reserved with `posix_fallocate` where the file system
+  supports it.
+- A job waiting out a long `Retry-After` shows when it continues.
+
+### Fixed
+- A server that returns a shorter byte range than asked is used as is;
+  one that advertises ranges but ignores them drops to a single stream;
+  a server that rejects the initial range check gets a plain request.
+- A long `Retry-After` pauses the whole job once instead of every link
+  napping on its own, and dates are measured against the server's clock.
+- Host names match however they are written (`Bücher.example` and
+  `xn--bcher-kva.example` share profiles, limits and credentials).
+- File names are cut at 255 bytes keeping the extension, `filename*=`
+  in any charset is read, and control or text-direction characters are
+  removed.
+- Playlists and manifests are capped at 8 MiB and segments at 64 MiB; a
+  playlist can no longer point at local files or non-web addresses.
+
 ## [1.8.1] — 2026-11-25
 
 ### Fixed

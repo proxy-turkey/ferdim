@@ -288,14 +288,14 @@ silently lose the queue.
 
 ## 1.12 — protocol completeness and edge cases
 
-- [ ] Make `speed_limit` global as documented: one queue-wide token
+- [x] Make `speed_limit` global as documented: one queue-wide token
       bucket shared by all workers, with `--limit` as the per-job cap
       (today 8 jobs × 2 MB/s = 16 MB/s).
-- [ ] HLS/DASH per-segment retries with backoff; one transient error
+- [x] HLS/DASH per-segment retries with backoff; one transient error
       should not abort a 2000-segment stream (`segments.py:127`).
-- [ ] HLS: support `#EXT-X-BYTERANGE` (fetch the declared sub-ranges in
+- [x] HLS: support `#EXT-X-BYTERANGE` (fetch the declared sub-ranges in
       order instead of whole, duplicated files).
-- [ ] HLS: decrypt `#EXT-X-KEY` `METHOD=AES-128` segments (AES-128-CBC
+- [x] HLS: decrypt `#EXT-X-KEY` `METHOD=AES-128` segments (AES-128-CBC
       with the playlist's IV or the media-sequence IV, key rotation
       mid-playlist, keys fetched once per URI with the job's cookies and
       headers, never written to disk or logs). Uses the `cryptography`
@@ -304,33 +304,33 @@ silently lose the queue.
       with a clear `hls_crypto_missing` code. Other methods and key
       formats (`SAMPLE-AES`, non-`identity` `KEYFORMAT`) are DRM and fail
       with `hls_drm` (see "Explicitly not planned").
-- [ ] DASH: concatenate every period of a static MPD and add the best
+- [x] DASH: concatenate every period of a static MPD and add the best
       audio representation instead of dropping it.
-- [ ] Bounded manifest reads (HLS / DASH size limit like `fetch_small`).
-- [ ] Ranges: honour a shorter `206` end the server chooses; degrade to a
+- [x] Bounded manifest reads (HLS / DASH size limit like `fetch_small`).
+- [x] Ranges: honour a shorter `206` end the server chooses; degrade to a
       single stream when a server advertises ranges but ignores them;
       fall back to a plain GET when the `bytes=0-0` probe itself is
       rejected.
-- [ ] Respect a long `Retry-After` with a job-level "not before" gate
+- [x] Respect a long `Retry-After` with a job-level "not before" gate
       instead of 30-second naps per worker.
-- [ ] TLS options: custom CA bundle, client certificates (mTLS) and a
+- [x] TLS options: custom CA bundle, client certificates (mTLS) and a
       minimum TLS version, shared by HTTP, h3 and FTPS.
-- [ ] Normalise hosts to IDNA once, so profiles, cookies and limits
+- [x] Normalise hosts to IDNA once, so profiles, cookies and limits
       match whichever spelling the user pasted.
-- [ ] File names: truncate to 255 **bytes** keeping the extension; parse
+- [x] File names: truncate to 255 **bytes** keeping the extension; parse
       `Content-Disposition` with `email.message` (RFC 6266 / 5987, all
       charsets) and keep the regex as a fallback.
-- [ ] Running out of file descriptors (`EMFILE`) gets its own code and
+- [x] Running out of file descriptors (`EMFILE`) gets its own code and
       pauses instead of retrying; links are clamped to
       `RLIMIT_NOFILE`.
-- [ ] Schedules and speed plans: a defined policy for DST transitions
+- [x] Schedules and speed plans: a defined policy for DST transitions
       (spring-forward and fall-back) with tests in a synthetic time zone;
       `Retry-After` dates checked against the response `Date`.
-- [ ] Coexistence on VPN and tunnel links: follow the default-route
+- [x] Coexistence on VPN and tunnel links: follow the default-route
       interface or a configured interface list instead of skipping
       `wg*` / `tun*`.
-- [ ] Best-effort `posix_fallocate` with a sparse fallback.
-- [ ] Clipboard: show a notification with undo (or ask) before queuing a
+- [x] Best-effort `posix_fallocate` with a sparse fallback.
+- [x] Clipboard: show a notification with undo (or ask) before queuing a
       copied URL.
 
 ## 1.13 — performance and scale
