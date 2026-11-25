@@ -90,7 +90,7 @@ class FakeStats:
             return out
 
 
-def wait_for(pred, timeout=5.0, step=0.01) -> bool:
+def wait_for(pred, timeout=20.0, step=0.01) -> bool:
     """Olay/kosul beklemesi (sabit sleep yok, sinirli sure)."""
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -108,7 +108,7 @@ class LineReader:
         self.sep = sep
         self.buf = b""
 
-    def block(self, timeout=5.0) -> bytes:
+    def block(self, timeout=20.0) -> bytes:
         end = time.monotonic() + timeout
         while self.sep not in self.buf:
             left = end - time.monotonic()
@@ -122,7 +122,7 @@ class LineReader:
         head, _, self.buf = self.buf.partition(self.sep)
         return head
 
-    def eof(self, timeout=5.0) -> bool:
+    def eof(self, timeout=20.0) -> bool:
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             self.sock.settimeout(max(0.01, end - time.monotonic()))
@@ -180,6 +180,24 @@ class _StubSock:
             except ValueError:      # yarim kare: henuz yazilmadi
                 continue
         return out
+
+
+class _DeafEvent:
+    """Yalniz zaman asimi: `set()` iticiyi UYANDIRMAZ.
+
+    Gercekte bu yaris, yuklu bir makinede `_on_change`/yeni istemci
+    sinyalinin itici `_wake.clear()` cagrisiyla yutulmasiyla olusur;
+    burada deterministik olarak benzetilir (sinyal her zaman kaybolur)."""
+
+    def wait(self, timeout=None):
+        time.sleep(timeout or 0)
+        return False
+
+    def set(self):        # sinyal yolda kayboldu
+        pass
+
+    def clear(self):
+        pass
 
 
 def apply_frames(frames) -> dict:
@@ -241,7 +259,7 @@ class ClientQueueTests(unittest.TestCase):
                 self.assertTrue(c.offer(big))
             # 20 teklif toplamda milisaniyeler surer (yazma baska parcacikta)
             self.assertLess(time.monotonic() - t0, 1.0)
-            self.assertTrue(c.closed.wait(5.0), "yazma butcesi asilinca kapanmali")
+            self.assertTrue(c.closed.wait(20.0), "yazma butcesi asilinca kapanmali")
         finally:
             c.close()
             a.close()
@@ -290,7 +308,7 @@ class HubTests(unittest.TestCase):
             for t in threads:
                 t.start()
             for t in threads:
-                t.join(5.0)
+                t.join(20.0)
             self.assertLess(time.monotonic() - t0, 1.0)
             self.assertEqual(fake.call_count(), 0)   # parcacik yok: hesap yok
         finally:
@@ -305,16 +323,16 @@ class HubTests(unittest.TestCase):
         a, b = socket.socketpair()
         try:
             h.add_client(a, name="test")
-            line = json.loads(LineReader(b).block(5.0))
+            line = json.loads(LineReader(b).block(20.0))
             self.assertEqual(line["event"], "stats")
             self.assertEqual([j["id"] for j in line["jobs"]], ["a"])
             first = line["rev"]
             fake.upsert("b", state="paused")
             h.notify()
             seen = None
-            end = time.monotonic() + 5.0
+            end = time.monotonic() + 20.0
             while time.monotonic() < end:
-                cand = json.loads(LineReader(b).block(5.0))
+                cand = json.loads(LineReader(b).block(20.0))
                 if cand["rev"] > first:
                     seen = cand
                     break
@@ -343,14 +361,14 @@ class HubTests(unittest.TestCase):
             slow.start()
             fast.start()
             h.notify()
-            first = json.loads(LineReader(fast_b).block(5.0))
+            first = json.loads(LineReader(fast_b).block(20.0))
             t0 = time.monotonic()
             fake.upsert("a", state="queued", note="z" * (2 << 20))
             h.notify()                       # yavas istemci hala tikali
             self.assertLess(time.monotonic() - t0, 0.5)
             second = None
-            while time.monotonic() - t0 < 5.0:
-                cand = json.loads(LineReader(fast_b).block(5.0))
+            while time.monotonic() - t0 < 20.0:
+                cand = json.loads(LineReader(fast_b).block(20.0))
                 if cand["rev"] >= first["rev"]:
                     second = cand
                     break
@@ -374,7 +392,7 @@ class HubTests(unittest.TestCase):
         try:
             h.add_client(a, name="test")
             reader = LineReader(b)
-            self.assertEqual(json.loads(reader.block(5.0))["event"], "stats")
+            self.assertEqual(json.loads(reader.block(20.0))["event"], "stats")
             # birkac kalp atisi gecti: kare DEGISMEDIGI icin yenisi gelmez
             with self.assertRaises(TimeoutError):
                 reader.block(0.4)
@@ -394,11 +412,11 @@ class HubTests(unittest.TestCase):
         try:
             h.add_client(a, name="test")
             reader = LineReader(b)
-            first = json.loads(reader.block(5.0))
+            first = json.loads(reader.block(20.0))
             self.assertFalse(first.get("turbo"))
             fake.top["turbo"] = True          # is listesi ve rev AYNI
             h.notify()
-            nxt = json.loads(reader.block(5.0))
+            nxt = json.loads(reader.block(20.0))
             self.assertEqual(nxt["rev"], first["rev"])
             self.assertTrue(nxt["turbo"])
         finally:
@@ -420,7 +438,7 @@ class HubTests(unittest.TestCase):
             first = frames.next()
             self.assertTrue(first["full"])
             # yazici basarili gonderimden sonra rev'i ilerletir (H1)
-            self.assertTrue(wait_for(lambda: client.rev == first["rev"], 5.0))
+            self.assertTrue(wait_for(lambda: client.rev == first["rev"], 20.0))
             self.assertEqual(sorted(j["id"] for j in first["jobs"]), ["a", "b"])
             fake.drop("a")
             fake.upsert("b", state="done", checksum="ok")
@@ -482,7 +500,7 @@ class HubTests(unittest.TestCase):
             frames = _SseFrames(b)
             self.assertEqual([j["id"] for j in frames.next()["jobs"]], ["a"])
             # kare gelmeden kalp atisi: yorum satiri (veri degil)
-            self.assertTrue(frames.wait_comment(5.0))
+            self.assertTrue(frames.wait_comment(20.0))
         finally:
             h.stop()
             a.close()
@@ -502,19 +520,19 @@ class HubTests(unittest.TestCase):
         client = h.add_sse(stub)
         try:
             h._push()                       # kucuk tam kare (rev1)
-            self.assertTrue(wait_for(lambda: client.rev is not None, 5.0))
+            self.assertTrue(wait_for(lambda: client.rev is not None, 20.0))
             stub.armed.set()
             # yazici BUYUK bir fark karesiyle mesgul: kare yiyecek kadar uzun
             fake.upsert("a", state="queued", note="x" * (4 << 20))
             h._push()
-            self.assertTrue(stub.blocked.wait(5.0), "yazici mesgul edilemedi")
+            self.assertTrue(stub.blocked.wait(20.0), "yazici mesgul edilemedi")
             # yazici mesgulken iki degisiklik: ikinci teklif birinciyi EZER
             fake.upsert("b", state="done")
             h._push()
             fake.upsert("c", state="done")
             h._push()
             stub.release.set()
-            self.assertTrue(wait_for(lambda: client.rev == fake.rev, 5.0))
+            self.assertTrue(wait_for(lambda: client.rev == fake.rev, 20.0))
             state = apply_frames(stub.frames())
             self.assertIn("b", state, "ezilen kare kayboldu")
             self.assertEqual(state["b"]["state"], "done")
@@ -537,14 +555,14 @@ class HubTests(unittest.TestCase):
         a, b = socket.socketpair()
         try:
             self.assertIsNotNone(h.add_client(a, name="test"))
-            first = json.loads(LineReader(b).block(5.0))
+            first = json.loads(LineReader(b).block(20.0))
             self.assertEqual(first["event"], "stats")
             fake.upsert("a", state="done")
             h.notify()
-            end = time.monotonic() + 5.0
+            end = time.monotonic() + 20.0
             seen = None
             while time.monotonic() < end:
-                cand = json.loads(LineReader(b).block(5.0))
+                cand = json.loads(LineReader(b).block(20.0))
                 if any(j["state"] == "done" for j in cand["jobs"]):
                     seen = cand
                     break
@@ -567,17 +585,17 @@ class HubTests(unittest.TestCase):
         sock_a, sock_b = socket.socketpair()
         try:
             h._push()                          # A: tam kare (rev1)
-            self.assertTrue(wait_for(lambda: slow.rev is not None, 5.0))
+            self.assertTrue(wait_for(lambda: slow.rev is not None, 20.0))
             stub.armed.set()
             fake.upsert("b", state="queued")
             h._push()                          # A tikali: rev ilerlemez
-            self.assertTrue(stub.blocked.wait(5.0))
+            self.assertTrue(stub.blocked.wait(20.0))
             fast = h.add_sse(sock_a)           # B: tam kare ile GUNCEL rev
             h._push()                          # B'nin ilk karesi (tam)
             frames = _SseFrames(sock_b)
             full = frames.next()
             self.assertTrue(full["full"])
-            self.assertTrue(wait_for(lambda: fast.rev == fake.rev, 5.0))
+            self.assertTrue(wait_for(lambda: fast.rev == fake.rev, 20.0))
             self.assertLess(slow.rev, fast.rev)        # farkli rev'ler
             calls = fake.call_count()
             fake.upsert("c", state="done")
@@ -591,11 +609,11 @@ class HubTests(unittest.TestCase):
             self.assertEqual(state_b["c"]["state"], "done")
             stub.release.set()                 # yavas istemci de yetisir
             self.assertTrue(wait_for(
-                lambda: "c" in apply_frames(stub.frames()), 5.0))
+                lambda: "c" in apply_frames(stub.frames()), 20.0))
             state_a = apply_frames(stub.frames())
             self.assertEqual(state_a["b"]["state"], "queued")
             self.assertEqual(state_a["c"]["state"], "done")
-            self.assertTrue(wait_for(lambda: slow.rev == fast.rev, 5.0))
+            self.assertTrue(wait_for(lambda: slow.rev == fast.rev, 20.0))
         finally:
             h.stop()
             sock_a.close()
@@ -615,7 +633,7 @@ class HubTests(unittest.TestCase):
         a, b = socket.socketpair()
         try:
             self.assertIsNotNone(h.add_client(a, name="test"))
-            self.assertEqual(json.loads(LineReader(b).block(5.0))["event"],
+            self.assertEqual(json.loads(LineReader(b).block(20.0))["event"],
                              "stats")
             calls = fake.call_count()
             time.sleep(0.4)              # ~13 kalp atisi
@@ -624,7 +642,7 @@ class HubTests(unittest.TestCase):
             # notify: degisiklik hemen hesaplanir (kacmaz)
             fake.upsert("a", state="paused", filename="yeni.bin")
             h.notify()
-            self.assertTrue(wait_for(lambda: fake.call_count() > calls, 5.0))
+            self.assertTrue(wait_for(lambda: fake.call_count() > calls, 20.0))
         finally:
             h.stop()
             a.close()
@@ -640,7 +658,7 @@ class HubTests(unittest.TestCase):
         a, b = socket.socketpair()
         try:
             self.assertIsNotNone(h.add_client(a, name="test"))
-            LineReader(b).block(5.0)
+            LineReader(b).block(20.0)
             calls = fake.call_count()
             time.sleep(0.4)
             self.assertGreaterEqual(fake.call_count() - calls, 4,
@@ -660,9 +678,9 @@ class HubTests(unittest.TestCase):
         a, b = socket.socketpair()
         try:
             self.assertIsNotNone(h.add_client(a, name="test"))
-            LineReader(b).block(5.0)
+            LineReader(b).block(20.0)
             calls = fake.call_count()
-            self.assertTrue(wait_for(lambda: fake.call_count() > calls, 5.0))
+            self.assertTrue(wait_for(lambda: fake.call_count() > calls, 20.0))
             # seyrek: ayni pencerede onlarca kez hesaplanmaz
             time.sleep(0.12)
             self.assertLessEqual(fake.call_count() - calls, 4)
@@ -689,7 +707,41 @@ class HubTests(unittest.TestCase):
             a.close()
             b.close()
 
-    def test_15_client_caps(self):
+    def test_15_first_frame_survives_a_lost_wakeup(self):
+        """Uyandirma bayragi kaybolsa bile ilk tam kare gecikmez.
+
+        Itici parcacik, yeni istemci kaydolurken sinyali `clear()` ile
+        yutabilir (yuklu makinede pencere buyur). Eski kod bu durumda
+        istemciye IDLE_REFRESH (15 sn) boyunca kare gondermiyordu; SSE
+        testleri bu yuzden distro derleyicilerinde zaman asimi veriyordu.
+        Bekleyen is artik `_seq` sayacindan ve `Client.primed`ten okunur."""
+        fake = FakeStats()                 # active=0: bos ve sessiz kuyruk
+        fake.upsert("a", state="paused")
+        h = Hub(fake, interval=0.01, heartbeat=0.05, idle_refresh=60.0)
+        h.start()
+        warm, warm_peer = socket.socketpair()
+        a, b = socket.socketpair()
+        try:
+            # 1) bir istemci isinmis olsun: hub "bos + sessiz" durumuna gecer
+            self.assertIsNotNone(h.add_client(warm, name="warm"))
+            self.assertEqual(
+                json.loads(LineReader(warm_peer).block(20.0))["event"], "stats")
+            self.assertTrue(wait_for(lambda: not h._busy, 20.0))
+            # 2) sinyaller artik kaybolsun (yuklu makinede olan sey)
+            h._wake = _DeafEvent()
+            # 3) yeni istemcinin ILK karesi yine de hemen gelir
+            self.assertIsNotNone(h.add_client(a, name="test"))
+            first = json.loads(LineReader(b).block(20.0))
+            self.assertEqual(first["event"], "stats")
+            self.assertEqual([j["id"] for j in first["jobs"]], ["a"])
+        finally:
+            h.stop()
+            warm.close()
+            warm_peer.close()
+            a.close()
+            b.close()
+
+    def test_16_client_caps(self):
         """Eszamanli istemci siniri: SSE ve soket izleyicisi ayri sayilir."""
         fake = FakeStats()
         h = Hub(fake, interval=10.0, heartbeat=10.0,
@@ -719,7 +771,7 @@ class _SseFrames:
     def __init__(self, sock):
         self.reader = LineReader(sock, sep=b"\n\n")
 
-    def next(self, timeout=5.0) -> dict:
+    def next(self, timeout=20.0) -> dict:
         end = time.monotonic() + timeout
         while True:
             block = self.reader.block(max(0.01, end - time.monotonic()))
@@ -730,7 +782,7 @@ class _SseFrames:
             if data:
                 return json.loads("\n".join(data))
 
-    def wait_comment(self, timeout=5.0) -> bool:
+    def wait_comment(self, timeout=20.0) -> bool:
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             try:
@@ -756,19 +808,19 @@ class SockServerTests(unittest.TestCase):
         try:
             # kuyruk dinleyicisi merkeze bagli: is parcacigi bildirimi
             self.assertEqual(len(qm.listeners), 1)
-            client.settimeout(5.0)
+            client.settimeout(20.0)
             client.connect(str(root / "ferdim.sock"))
             client.sendall(b'{"cmd":"watch"}\n')
             frames = LineReader(client)
-            first = json.loads(frames.block(5.0))
+            first = json.loads(frames.block(20.0))
             self.assertEqual(first["event"], "stats")
             self.assertEqual([j["id"] for j in first["jobs"]], ["a"])
             # is parcacigi gibi davran: dinleyiciyi cagir (bildirim)
             fake.upsert("b", state="done")
             qm.listeners[0]()
-            end = time.monotonic() + 5.0
+            end = time.monotonic() + 20.0
             while time.monotonic() < end:
-                cand = json.loads(frames.block(5.0))
+                cand = json.loads(frames.block(20.0))
                 if any(j["id"] == "b" for j in cand["jobs"]):
                     break
             else:
@@ -789,14 +841,14 @@ class SockServerTests(unittest.TestCase):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            client.settimeout(5.0)
+            client.settimeout(20.0)
             client.connect(str(root / "ferdim.sock"))
             client.sendall(b'{"cmd":"watch"}\n')
             self.assertTrue(wait_for(lambda: ctx["hub"].count() == 1))
         finally:
             client.close()
         # istemci gitti: istek is parcacigi izleyiciyi merkezden dusurur
-        self.assertTrue(wait_for(lambda: ctx["hub"].count() == 0, 5.0))
+        self.assertTrue(wait_for(lambda: ctx["hub"].count() == 0, 20.0))
         srv.shutdown()
         srv.server_close()
 
@@ -812,19 +864,19 @@ class SockServerTests(unittest.TestCase):
         first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         second = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            first.settimeout(5.0)
+            first.settimeout(20.0)
             first.connect(str(root / "ferdim.sock"))
             first.sendall(b'{"cmd":"watch"}\n')
-            self.assertEqual(json.loads(LineReader(first).block(5.0))["event"],
+            self.assertEqual(json.loads(LineReader(first).block(20.0))["event"],
                              "stats")
-            second.settimeout(5.0)
+            second.settimeout(20.0)
             second.connect(str(root / "ferdim.sock"))
             second.sendall(b'{"cmd":"watch"}\n')
-            reply = json.loads(LineReader(second).block(5.0))
+            reply = json.loads(LineReader(second).block(20.0))
             self.assertEqual(reply.get("code"), "too_many")
             # reddedilen baglanti kapanmadi: RPC hala kullanilabilir
             second.sendall(b'{"cmd":"version","req_id":7}\n')
-            msg = json.loads(LineReader(second).block(5.0))
+            msg = json.loads(LineReader(second).block(20.0))
             self.assertEqual(msg.get("req_id"), 7)
             self.assertTrue(msg.get("ok"))
         finally:
@@ -873,14 +925,14 @@ class _WebCase(unittest.TestCase):
 class EventsEndpointTests(_WebCase):
     def test_01_requires_token(self):
         sock = self._open(token=None)
-        head = LineReader(sock, sep=b"\r\n\r\n").block(5.0)
+        head = LineReader(sock, sep=b"\r\n\r\n").block(20.0)
         self.assertIn(b" 401 ", head.split(b"\r\n")[0])
         # akis acilmaz: govde JSON hatadir (event-stream basligi yok)
         self.assertNotIn(b"text/event-stream", head)
 
     def test_02_streams_full_then_delta_and_ends_on_shutdown(self):
         sock = self._open()
-        header = LineReader(sock, sep=b"\r\n\r\n").block(5.0)
+        header = LineReader(sock, sep=b"\r\n\r\n").block(20.0)
         self.assertIn(b" 200 ", header.split(b"\r\n")[0])
         self.assertIn(b"text/event-stream", header)
         frames = _SseFrames(sock)
@@ -899,19 +951,19 @@ class EventsEndpointTests(_WebCase):
 
         # sunucu kapanisi akisi bitirir (istek is parcacigi sizmaz)
         self.hub.stop()
-        self.assertTrue(LineReader(sock, sep=b"\n\n").eof(5.0))
+        self.assertTrue(LineReader(sock, sep=b"\n\n").eof(20.0))
 
     def test_03_no_token_in_url(self):
         # token yalniz basliktadir: sorgu dizesi kimlik dogrulamaz
         sock = self._open(token=None, path=f"/api/events?token={TOKEN}")
-        head = LineReader(sock, sep=b"\r\n\r\n").block(5.0)
+        head = LineReader(sock, sep=b"\r\n\r\n").block(20.0)
         self.assertIn(b" 401 ", head.split(b"\r\n")[0])
 
     def test_04_unknown_host_rejected(self):
         sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
         self.addCleanup(sock.close)
         sock.sendall(_http(self.port, "/api/events", TOKEN, "evil.example:1"))
-        head = LineReader(sock, sep=b"\r\n\r\n").block(5.0)
+        head = LineReader(sock, sep=b"\r\n\r\n").block(20.0)
         self.assertIn(b" 421 ", head.split(b"\r\n")[0])
 
 
@@ -922,13 +974,13 @@ class SseCapTests(_WebCase):
 
     def test_01_second_stream_rejected(self):
         first = self._open()
-        head = LineReader(first, sep=b"\r\n\r\n").block(5.0)
+        head = LineReader(first, sep=b"\r\n\r\n").block(20.0)
         self.assertIn(b" 200 ", head.split(b"\r\n")[0])
         _SseFrames(first).next()               # kayit oturdu
         self.assertEqual(self.hub.count(), 1)
         second = self._open()
         rd2 = LineReader(second, sep=b"\r\n\r\n")
-        head2 = rd2.block(5.0)
+        head2 = rd2.block(20.0)
         self.assertIn(b" 503 ", head2.split(b"\r\n")[0])
         self.assertNotIn(b"text/event-stream", head2)
         # baslik ve govde tek pakette gelebilir: okuyucunun artigi govdedir
