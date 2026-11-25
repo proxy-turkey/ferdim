@@ -683,6 +683,16 @@ class WebUiStaticTests(unittest.TestCase):
             self.assertIn(key, S, key)
             self.assertEqual(set(S[key]), set(LANGS), key)
 
+    def test_05_hosts_panel_refreshes_on_its_own_timer(self):
+        """Panel tazelemesi istatistik karelerine BAGLANMAZ.
+
+        Sunucu degisiklik yokken kare gondermez (bosta trafik yok); panel
+        yine tazelenmeli. 1.13 tumlesmesinde tazeleme kare akisina
+        baglanmisti: bos kuyrukta panel donuyordu."""
+        self.assertNotIn("maybeHosts", self.js)
+        self.assertIn("hostsTimer", self.js)
+        self.assertIn("setTimeout(hostsPoll, 2000)", self.js)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
