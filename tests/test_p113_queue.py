@@ -31,6 +31,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ferdim import api, util
+from ferdim.engine import httpcli
 from ferdim.engine import queue as queue_mod
 from ferdim.engine.job import DownloadJob, JobSpec, JobState
 from ferdim.engine.queue import QUEUE_FILE, QueueManager
@@ -748,6 +749,98 @@ class ProberTests(QueueCase):
         self.assertLess(elapsed, 0.05, f"200 claim {elapsed * 1000:.0f} ms")
         self.assertEqual(len(qm._probe_q), 9800)
         self.assertEqual(len(qm._probing), 200)
+
+
+    def test_probe_size_change_notifies_listeners(self):
+        """Yoklama boyutu ogrenince dinleyiciler uyarilir (hub taze kare)."""
+        qm = self._queue()
+        job = self._add(qm, "http://127.0.0.1:1/boyut.bin", paused=False)
+        seen = []
+        qm.add_listener(lambda snap: seen.append(snap))
+
+        class Probe:
+            def __init__(self, total):
+                self.total = total
+
+        with mock.patch.object(httpcli, "probe",
+                               lambda *a, **k: Probe(4242)):
+            qm._probe_job(job)
+        self.assertEqual(job.total, 4242)
+        self.assertEqual(len(seen), 1, "boyut degisimi bildirilmeli")
+        self.assertEqual(seen[0]["size"], 4242)
+        # ayni boyut: yeni bildirim yok (yagmur olmasin)
+        with mock.patch.object(httpcli, "probe",
+                               lambda *a, **k: Probe(4242)):
+            qm._probe_job(job)
+        self.assertEqual(len(seen), 1, "degismeyen boyut bildirilmemeli")
+        # is artik KUYRUK'ta degil: yoklama sonucu yazilmaz/bildirilmez
+        job.state = JobState.PAUSED
+        with mock.patch.object(httpcli, "probe",
+                               lambda *a, **k: Probe(9999)):
+            qm._probe_job(job)
+        self.assertEqual(job.total, 4242)
+        self.assertEqual(len(seen), 1)
+
+    def test_nm_ping_notifies_only_on_the_connection_transition(self):
+        """nm-ping her cagrida degil, baglanti DEGISINCE bildirir."""
+        qm = self._queue()
+        seen = []
+        qm.add_listener(lambda snap: seen.append(snap))
+        ctx = self._ctx(qm)
+        self.assertTrue(api.handle(ctx, "nm-ping", {}).get("ok"))
+        self.assertEqual(len(seen), 1, "ilk ping baglanti gecisi olmali")
+        self.assertTrue(qm.stats()["nm_connected"])
+        api.handle(ctx, "nm-ping", {})
+        api.handle(ctx, "nm-ping", {})
+        self.assertEqual(len(seen), 1, "ayni oturumda bildirim yagmuru olmaz")
+        # 120 sn sessizlik: durum kopuk, sonraki ping yeniden gecis
+        qm.last_nm_ping = time.time() - 200
+        self.assertFalse(qm.stats()["nm_connected"])
+        api.handle(ctx, "nm-ping", {})
+        self.assertEqual(len(seen), 2, "yeniden baglanma bildirilmeli")
+        self.assertTrue(qm.stats()["nm_connected"])
+
+    def test_closed_category_window_parks_the_prober(self):
+        """Kapali kategori penceresi yoklamayi bekletir, acilinca besler.
+
+        10 000 KUYRUK isinde kapali pencerede yoklama yapilmamali (bos
+        ag trafigi); pencere acilinca adaylar yeniden kuyruga girer."""
+        qm = self._queue(schedule={
+            "enabled": False, "start": "00:00", "stop": "00:00",
+            "categories": {"program": {"start": "00:00", "stop": "00:00"}}})
+        job = qm.add(JobSpec(url="http://127.0.0.1:1/pencere.bin"))  # program
+        self.assertEqual(len(qm._probe_q), 0, "kapali pencerede aday olmamali")
+        self.assertFalse(qm._probe_ready(job))
+        qm._tick()                      # kapi senkronu: degisiklik yok
+        self.assertEqual(len(qm._probe_q), 0)
+        with mock.patch.object(util, "window_open", lambda *a, **k: True):
+            qm._tick()                  # pencere acildi
+        self.assertEqual(len(qm._probe_q), 1, "pencere acilinca aday gelmeli")
+        self.assertTrue(qm._probe_ready(job))
+
+    def test_prober_supervisor_does_not_spin_during_a_probe_burst(self):
+        """Gozetmen `_probe_evt` BAYRAGINI beklemez: dalgada bos donmez.
+
+        Olculen regresyon: bayrak set kaldikca Event.wait() hemen donuyordu
+        ve gozetmen ~%100 cekirdek ceviriyordu."""
+        release = threading.Event()
+        entered = threading.Semaphore(0)
+
+        def slow_probe(self_, job):
+            entered.release()
+            release.wait(5)
+
+        with mock.patch.object(QueueManager, "_probe_job", slow_probe):
+            qm = self._queue(prober=True)
+            for i in range(60):
+                qm.add(JobSpec(url=f"http://127.0.0.1:1/dalga{i}.bin"))
+            self.assertTrue(entered.acquire(timeout=5), "yoklama baslamadi")
+            t0 = time.process_time()
+            time.sleep(0.3)
+            used = time.process_time() - t0
+            release.set()
+        self.assertLess(used, 0.15,
+                        f"yoklama gozetmeni bos donuyor ({used:.2f} sn CPU)")
 
 
 class DispatchTests(QueueCase):

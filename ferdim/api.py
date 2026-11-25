@@ -938,8 +938,8 @@ def handle(ctx, cmd: str, params: dict) -> dict:
             out["warning"] = warning
         return out
     if cmd == "nm-ping":
-        import time as _t
-        qm.last_nm_ping = _t.time()
+        # zaman damgasi + gecis bildirimi QueueManager'da (NM_TIMEOUT)
+        qm.nm_ping()
         return {"ok": True}
     return {"ok": False, "error": f"bilinmeyen komut: {cmd}"}
 

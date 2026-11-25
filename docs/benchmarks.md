@@ -45,7 +45,7 @@ blocks: a run leaves no directories, sockets or processes behind.
 | `stats_frame_ms` | full frame on the 10 000-job queue: `qm.stats()` + `hub.sock_frame(...)` JSON encoding (the socket watcher payload) | median of 9 |
 | `idle_cpu_pct`, `idle_rss_mib` | daemon, empty queue, sampled from `/proc/<pid>` for 8 s | mean CPU over the window / max RSS |
 | `idle_loaded_*` | same daemon on 10 000 **paused** jobs | same |
-| `idle_queued_*` | 10 000 jobs, the first 500 **queued** (the rest paused): the busy tick scans the whole queue and the size prober works | same |
+| `idle_queued_*` | `QUEUED_FULL` (10 000) **queued** jobs — the whole queue is queued: the tick scans it and the category window keeps every job from starting, so nothing is probed | same |
 | `idle_sse_*` | the queued layout plus one HTTP client on `/api/events` (token read from the state dir); the client drains frames and the run fails if no frame arrives | same |
 
 Paused jobs are used for the bulk/persistence benchmarks: the size prober
@@ -53,11 +53,12 @@ only touches `queued` jobs and the scheduler only starts `queued` jobs, so
 no network probe or download runs during them. In the queued daemon
 layouts the URLs point at `127.0.0.1:1` (connection refused) and a
 category window (`video`, `00:00–00:00`, always closed) prevents any job
-from starting, so the prober can run without external traffic while the
-queue stays loaded. 500 queued jobs (rather than all 10 000) are enough to
-exercise the tick and prober paths: the prober scans the job list per
-claim, and an all-queued queue would spend minutes in that O(n²) startup
-scan, measuring startup rather than idle behaviour.
+from starting. A closed category window also parks the size prober (a job
+that cannot start does not need its size), so the whole 10 000-job queue
+can be `queued` without a startup probe burst — that is the layout the
+ROADMAP target ("10 000 queued jobs, idle CPU < 5 %") is measured in. When
+a window opens the candidates are re-queued on the next tick and probing
+resumes.
 
 `--quick` shrinks the payloads (128 MiB engine, 16 MiB chunker) and the
 job counts (2 000 jobs, 100 bulk adds, 100 queued).
@@ -108,6 +109,8 @@ Two independent gates are applied to every metric:
    baseline:
    - `engine_mib_s` ≥ 150 MiB/s
    - `idle_loaded_cpu_pct` and `idle_queued_cpu_pct` ≤ 5 % of a core
+     (the 10 000-queued layout; the tick must not do per-queued-job work
+     while a closed category window parks the queue)
    - loaded `idle_*_rss_mib` ≤ 300 MiB
    - `stats_frame_ms` ≤ 150 ms (CPU-normalised: divided by the CPU factor,
      so a slower host is allowed proportionally longer)

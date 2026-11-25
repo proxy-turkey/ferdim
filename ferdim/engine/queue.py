@@ -36,6 +36,7 @@ TICK_IDLE = 2.0                    # tick araligi: is yok (olay hemen uyandirir)
 # + pay). Ikisi de sinirli: kapanis asla sinirsiz beklemez.
 QUEUE_CTL_FIRST_WAIT = 2.0
 QUEUE_CTL_TAIL_WAIT = 8.0
+NM_TIMEOUT = 120.0                 # sn: bu kadar sessizlik = kopuk kopru
 STATES_RUNNING = (JobState.CONNECTING, JobState.DOWNLOADING)
 # ilk goruste orneklenmesi gereken durumlar (metrik sayaci tasiyanlar)
 _METRIC_TERMINAL = (JobState.DONE, JobState.ERROR, JobState.CANCELED)
@@ -153,6 +154,18 @@ def _dispatch_key(job):
     return (job.total if job.total > 0 else float("inf"), job.created)
 
 
+def _job_category(job) -> str:
+    """Is kategorisi: KILIT ALMADAN (onbellekten, yoksa turet).
+
+    Yoklama adaylari kuyruk kilidi altinda dogrulanir; orada is kilidini
+    almak kilit sirasini ters cevirirdi (is -> kuyruk yonu zaten var)."""
+    cached = job._derived_cache
+    if cached is not None:
+        return cached["category"]
+    return util.category_for(job.final_filename or
+                             util.filename_from_url(job.url))
+
+
 class QueueManager:
     def __init__(self, env: AppEnv, cfg: dict):
         self.env = env
@@ -179,6 +192,12 @@ class QueueManager:
         self._probing: set[str] = set()   # su an yoklanan isler
         self._probe_q: deque = deque()
         self._probe_set: set[str] = set()
+        self._probe_stop = threading.Event()   # yoklama gozetmeni kapanisi
+        # pencere KAPALI kategoriler: bu isler baslayamaz, boyutlari da
+        # gerekmez. Yoklama bu kategorilerde bekletilir (10 000 KUYRUK
+        # isinde bos yere 10 000 yoklama yapilmasin); pencere degisince
+        # adaylar yeniden beslenir.
+        self._probe_gate: frozenset = frozenset(util.category_windows(cfg))
         self._have_file = False           # queue.json diskte var mi
 
         self._lock = threading.RLock()
@@ -675,14 +694,17 @@ class QueueManager:
         limit = int(self.cfg.get("max_concurrent", 3))
         # kapanistan sonra yeni is dagitilmaz: baslatma parcaciklari
         # beklemedeyken _tick elle cagrilirsa is baslamamali
-        if self._running and self._schedule_active():
+        dispatching = self._running and self._schedule_active()
+        if dispatching:
             slots = max(0, limit - len(running))
             # kategori penceresi kapali olan isler siralarini bekler;
-            # pencere kumesi tick basina BIR kez hesaplanir
+            # pencere kumesi tick basina BIR kez hesaplanir. Yoklama da
+            # bu kategorilerde bekletilir (boyut simdi gerekmez).
             closed = util.category_windows(self.cfg)
+            self._sync_probe_gate(closed)
             if closed:
                 queued = [j for j in queued if j.category not in closed]
-            if self.cfg.get("smart_queue", True) and slots:
+            if self.cfg.get("smart_queue", True) and slots and queued:
                 # kucuk dosya once: boyutu bilinmeyenleri yoklayici
                 # isaretleyene kadar beklet, sonra kucukten buyuge basla
                 # yoklamalar paralel: once biten (buyuk) is, kisa sure once
@@ -702,9 +724,13 @@ class QueueManager:
                         key=_dispatch_key)
                 for job in ready:
                     self._start_async(job)
-            elif slots:
+            elif slots and queued:
                 for job in queued[:slots]:
                     self._start_async(job)
+        # Bosta sayimi: pencere kapali/no eligible is varsa is baslayamaz,
+        # tick uzun araliga (TICK_IDLE) gecebilir.
+        self._idle = not (running or self._starting
+                          or (queued if dispatching else ()))
         # hiz yalniz calisan islerde degisir; duraklatilmis/bitmis isler
         # her tick'te kilit ve aritmetik odemez
         for j in running:
@@ -1403,7 +1429,7 @@ class QueueManager:
             # dizin acilamiyorsa (kaldirilmis disk) istatistik kirilmasin
             "download_dir": self._download_dir_text(),
             "schedule_active": self._schedule_active(),
-            "nm_connected": (time.time() - self.last_nm_ping) < 120,
+            "nm_connected": (time.time() - self.last_nm_ping) < NM_TIMEOUT,
             "turbo": bool(self.cfg.get("turbo_mode")),
             "coexist": self.coexist_status(),
             "language": self.cfg.get("language", "auto"),
@@ -1411,6 +1437,18 @@ class QueueManager:
             "warning": self.state_warning,
             "version": _version(),
         }
+
+    def nm_ping(self) -> None:
+        """Yerel kopru pingi: baglanti durumu DEGISIRSE dinleyicileri uyarir.
+
+        `nm_connected` = son ping NM_TIMEOUT icinde (bkz. stats). Her
+        ping'de bildirim yagmuru olmasin: yalniz kopuk -> bagli gecisinde
+        uyarilir (hub istatistigi bildirimle tazelenir)."""
+        now = time.time()
+        was_on = (now - self.last_nm_ping) < NM_TIMEOUT
+        self.last_nm_ping = now
+        if not was_on:
+            self._notify()
 
     def _download_dir_text(self) -> str:
         try:
@@ -1433,8 +1471,10 @@ class QueueManager:
         for worker in workers:
             worker.start()
         while self._running:
-            # kapanma _running ile bildirilir; bos kuyrukta tarama yok
-            self._probe_evt.wait(1.0)
+            # KENDI kapanis olayini bekler: `_probe_evt` bir BAYRAKTIR ve
+            # is parcaciklari onu tuketir; bayrak set kaldikca wait() hemen
+            # doner ve bu dongu bosuna 100% CPU cevirirdi (olculen hata).
+            self._probe_stop.wait(1.0)
         self._probe_evt.set()          # is parcaciklari uyansin
         for worker in workers:
             worker.join(5.0)
@@ -1467,6 +1507,26 @@ class QueueManager:
         self._probe_q.append(job)
         self._probe_evt.set()
 
+    def _probe_gated(self, job) -> bool:
+        """Isin kategori penceresi kapali mi (boyutu simdi gerekmez)."""
+        return bool(self._probe_gate) and \
+            _job_category(job) in self._probe_gate
+
+    def _sync_probe_gate(self, closed) -> None:
+        """Kapali kategori penceresi yoklamayi bekletir (kilit disinda).
+
+        Pencere kapaliyken is baslayamaz: boyutunu ogrenmek bosuna ag
+        trafigi olur. Pencere durumu degisince (gunde birkac kez) kuyruk
+        isleri yeniden aday olur."""
+        cats = frozenset(closed)
+        if cats == self._probe_gate:
+            return
+        self._probe_gate = cats
+        with self._lock:
+            for job in self.jobs:
+                if job._state == JobState.QUEUED and job.total < 0:
+                    self._probe_seed_locked(job)
+
     def _probe_pending(self) -> bool:
         """Yoklanacak aday var mi (kilit altinda, ayirma yapmaz)."""
         with self._lock:
@@ -1490,7 +1550,8 @@ class QueueManager:
         """Boyutu bilinmeyen, yoklanmamis ve su an yoklanmayan kuyruk isi."""
         return (job.state == JobState.QUEUED and job.total < 0
                 and job.id not in self._size_probed
-                and job.id not in self._probing)
+                and job.id not in self._probing
+                and not self._probe_gated(job))
 
     def _probe_release(self, job) -> None:
         """Yoklamayi bitirir: kimligi unutur, is hala kuyruktaysa isaretler."""
@@ -1499,6 +1560,19 @@ class QueueManager:
             # kaldirilan isin kimligi _size_probed'de kalmasin (sizinti)
             if self._job_index.get(job.id) is job:
                 self._size_probed.add(job.id)
+
+    def _probe_set_total(self, job, size: int) -> None:
+        """Yoklama sonucunu yazar; DEGISTIYSE dinleyicileri uyarir.
+
+        Hub istatistigi artik yalniz bildirimde (ya da mesgulken) yeniden
+        hesaplaniyor: boyut ogrenildiginde haber verilmezse arayuz 15 sn'lik
+        guvenlik yenilemesini beklerdi. Bildirim is kilidi DISINDA yapilir
+        (`_notify` snapshot alir)."""
+        with job._lock:
+            if job.state != JobState.QUEUED or job.total == size:
+                return
+            job.total = size
+        self._notify(job)
 
     def _probe_job(self, job) -> None:
         """Tek isin boyutunu yoklar (ag erisimi; kuyruk kilidi tutulmaz)."""
@@ -1513,22 +1587,16 @@ class QueueManager:
                     insecure=opt.insecure, user=job.spec.user,
                     password=job.spec.password, proxy=opt.proxy, tls=opt)
                 if size > 0:
-                    with job._lock:
-                        if job.state == JobState.QUEUED:
-                            job.total = size
+                    self._probe_set_total(job, size)
             except Exception:
                 pass
         elif httpcli.is_hls(url, "") or dash.is_dash(url, ""):
-            with job._lock:
-                if job.state == JobState.QUEUED:
-                    job.total = -1  # manifest; boyut anlamsiz
+            self._probe_set_total(job, -1)   # manifest; boyut anlamsiz
         else:
             try:
                 p = httpcli.probe(url, job.spec.options(self.cfg))
                 if p.total > 0:
-                    with job._lock:
-                        if job.state == JobState.QUEUED:
-                            job.total = p.total
+                    self._probe_set_total(job, p.total)
             except Exception:
                 pass
 
@@ -1538,6 +1606,7 @@ class QueueManager:
         self._ctl_stop = True
         with self._ctl_cond:
             self._ctl_cond.notify_all()
+        self._probe_stop.set()
         self._probe_evt.set()
         self._tick_evt.set()
         # CALISAN denetim komutu (iptal join'i, silme) bitsin: aksi halde
