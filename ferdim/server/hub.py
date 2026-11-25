@@ -88,6 +88,9 @@ class Client:
         self.delta = False
         self.rev = None           # gonderilmis (gorulen) rev; yazici yazar
         self.mark = None          # son teklif edilen karenin ust alan ozeti
+        # Ilk kare sozu: bu istemciye HIC kare teklif edilmedi. Itici
+        # parcacik boyle bir istemci varken uykuya dalamaz (bkz. Hub._run).
+        self.primed = False
         self.keepalive = float(keepalive)
         self._send_timeout = float(send_timeout)
         self._frame_timeout = float(frame_timeout)
@@ -152,6 +155,7 @@ class Client:
                 return False
             self._frame = frame
             self._frame_rev = rev
+            self.primed = True        # ilk kare teklif edildi
             self._event.set()
         return True
 
@@ -236,6 +240,12 @@ class Hub:
         self._pushed = 0.0        # son GERCEK istatistik hesabi
         self._busy = True         # calisan is var mi (bilinmiyorsa: var)
         self._idle_refresh = float(idle_refresh)
+        # Bekleyen is sayaci: `notify()` ve yeni istemci kaydi artirir,
+        # itici her itmeden once gordugu degeri `_served`e yazar. Boylece
+        # uyandirma bayragi (Event) kaybolsa bile is KAYBOLMAZ: bayrak
+        # yalnizca uyandirma ipucudur, dogruluk sayactan gelir.
+        self._seq = 0
+        self._served = 0
 
     # -------------------------------------------------------------- yasam
     def start(self, qm=None) -> "Hub":
@@ -299,6 +309,9 @@ class Hub:
             client = Client(sock, name=name, keepalive=keepalive)
             client.delta = bool(delta)
             self._clients.append(client)
+            # Yeni istemci: ilk tam kare sozu verilir -> bekleyen is var
+            # (bayragin kaybolmasina karsi sayac da artar)
+            self._seq += 1
         if start:
             client.start()
         self._wake.set()                # ilk kare beklemesin
@@ -324,34 +337,57 @@ class Hub:
 
     # ------------------------------------------------------------ bildirim
     def notify(self, _job=None) -> None:
-        """Degisiklik isareti: YALNIZ bayrak (istatistik/IO yok).
+        """Degisiklik isareti: sayac + bayrak (istatistik/IO yok).
 
-        Is parcaciklari bu cagriya takilmaz; yavas bir istemci kuyrugu
-        doldursa bile burada bekleme olmaz."""
+        Is parcaciklari bu cagriya takilmaz: kilit yalnizca bir tamsayi
+        artirmak icin tutulur, yavas bir istemci kuyrugu doldursa bile
+        burada bekleme olmaz. Sayac kayipsizdir: bayrak (Event) silinse
+        de bekleyen is sonraki turda gorulur."""
+        with self._lock:
+            self._seq += 1
         self._wake.set()
 
     # -------------------------------------------------------------- itici
+    def _needs_frame(self) -> bool:
+        """Hic kare teklif edilmemis istemci var mi (ilk kare sozu)."""
+        return any(not c.primed for c in self._snapshot())
+
     def _run(self) -> None:
         while not self._stop.is_set():
-            signalled = self._wake.wait(self._heartbeat)
-            if self._stop.is_set():
-                break
-            self._wake.clear()
-            now = time.monotonic()
-            if signalled:
+            pending = self._seq != self._served
+            first = self._needs_frame()
+            if pending or first:
+                # Bekleyen is var: uyumadan it (bayrak kaybolmus olsa da).
+                now = time.monotonic()
+            else:
+                # Bekleyen is yok: uyandirma bayragini bekle. Bayrak yalniz
+                # bir IPUCUdur; `clear()` ile kaybolsa bile `_seq`/`primed`
+                # sonraki turda isi gosterir (ilk kare 15 sn gecikmez).
+                self._wake.wait(self._heartbeat)
+                if self._stop.is_set():
+                    break
+                self._wake.clear()
+                now = time.monotonic()
+                pending = self._seq != self._served
+                first = self._needs_frame()
+            if not pending and not first and not self._busy \
+                    and now - self._pushed < self._idle_refresh:
+                # Sessiz kuyruk + calisan is yok: kalp atisi HESAP YAPMAZ
+                # (10 000 iste ~50 ms). Istemciler `: ping` yorumu alir;
+                # zamana bagli alanlar icin `_idle_refresh`de tazeleme.
+                continue
+            if pending and not first:
                 gap = self._last + self._interval - now
                 if gap > 0:
                     # hiz siniri: erken uyanmalar tek karede birlestirilir
                     self._stop.wait(gap)
                     if self._stop.is_set():
                         break
-                    self._wake.clear()
-            elif not self._busy and now - self._pushed < self._idle_refresh:
-                # Sessiz kuyruk + calisan is yok: kalp atisi HESAP YAPMAZ
-                # (10 000 iste ~50 ms). Istemciler `: ping` yorumu alir;
-                # zamana bagli alanlar icin `_idle_refresh`de bir tazeleme.
-                continue
+            # Ilk karesini bekleyen istemci varsa hiz siniri uygulanmaz:
+            # yeni istemcinin ilk karesi asla geciktirilmez.
+            seq = self._seq
             self._push()
+            self._served = seq
             self._last = time.monotonic()
 
     def _push(self) -> None:
