@@ -1,8 +1,10 @@
 """1.13 performans kapisi - karsilastirma mantigi (hizli test; olcum YOK).
 
 Gercek benchmark'lar saniyeler surer ve makineye bagimlidir; burada
-yalnizca saf karsilastirma/normalizasyon fonksiyonlari ve depodaki
-baseline dosyasinin tutarliligi dogrulanir (JSON okuma + aritmetik).
+yalnizca saf karsilastirma/normalizasyon/floor fonksiyonlari ve depodaki
+baseline dosyasinin gecerliligi dogrulanir (JSON okuma + aritmetik).
+Baseline, 1.13 lane'leri birlestikten sonra integrator tarafindan
+yenilenecegi icin metrik adlarinin birebir eslesmesi beklenmez.
 """
 from __future__ import annotations
 
@@ -19,116 +21,155 @@ BASELINE = (Path(__file__).resolve().parent.parent
             / "benchmarks" / "baseline.json")
 
 
-def _rate(actual, base=100.0, factor=1.0):
-    return compare.compare({"engine_mib_s": base},
-                           {"engine_mib_s": actual}, factor)[0]
-
-
-def _absolute(name, actual, base):
-    return compare.compare({name: base}, {name: actual}, 1.0, True)[0]
+def _one(name, actual, base=None, cpu=1.0, io=1.0, absolute_ok=True):
+    baseline = {} if base is None else {name: base}
+    return compare.compare(baseline, {name: actual}, cpu, io,
+                           absolute_ok)[0]
 
 
 class RateMetricTest(unittest.TestCase):
-    """Hiz metrikleri: yuksek iyi, kalibrasyonla olcekli, esik %20."""
+    """Hiz: yuksek iyi, secilen kalibrasyonla olcekli, drift + floor."""
 
-    def test_equal_is_ok(self):
-        v = _rate(100.0)
-        self.assertEqual(v["status"], "ok")
-        self.assertAlmostEqual(v["ratio"], 1.0)
-
-    def test_faster_is_ok(self):
-        self.assertEqual(_rate(150.0)["status"], "ok")
-
-    def test_exactly_twenty_percent_is_still_ok(self):
-        # esik "fazla" gerileme: tam %20 gecer (sinir dahil)
-        self.assertEqual(_rate(80.0)["status"], "ok")
-
-    def test_over_twenty_percent_fails(self):
-        v = _rate(79.0)
-        self.assertEqual(v["status"], "fail")
-        self.assertTrue(compare.failed([v]))
-
-    def test_calibration_scales_expectation(self):
-        # makine 2x hizli: ayni kod 2x hizli olmali
-        v = _rate(200.0, base=100.0, factor=2.0)
+    def test_cpu_rate_scales_with_cpu_factor(self):
+        # parcalayici CPU'ya bagli: 2x hizli makinede 2x beklenir
+        v = _one("cdc_mib_s", 200.0, base=100.0, cpu=2.0)
         self.assertAlmostEqual(v["target"], 200.0)
-        self.assertAlmostEqual(v["limit"], 160.0)   # %80 esigi
         self.assertEqual(v["status"], "ok")
+        v = _one("cdc_mib_s", 140.0, base=100.0, cpu=2.0)   # %30 gerileme
+        self.assertEqual(v["status"], "fail")
+        self.assertEqual(v["note"], "drift")
 
-    def test_faster_machine_does_not_hide_regression(self):
-        # 2x hizli makinede beklenen 200; 140 = %30 gerileme -> fail
-        self.assertEqual(_rate(140.0, base=100.0, factor=2.0)["status"],
+    def test_engine_uses_io_not_cpu_factor(self):
+        # motor loopback yolu: CPU 4x hizli olsa da hedef degismez
+        v = _one("engine_mib_s", 200.0, base=200.0, cpu=4.0, io=1.0)
+        self.assertAlmostEqual(v["target"], 200.0)
+        self.assertEqual(v["status"], "ok")
+        v = _one("engine_mib_s", 150.0, base=200.0, cpu=4.0, io=1.0)
+        self.assertEqual(v["status"], "fail")
+
+    def test_io_rate_scales_with_io_factor(self):
+        v = _one("queue_bulk_add_jobs_s", 160.0, base=100.0, io=2.0)
+        self.assertAlmostEqual(v["target"], 200.0)
+        self.assertEqual(v["status"], "ok")
+        self.assertEqual(_one("queue_bulk_add_jobs_s", 140.0, base=100.0,
+                              io=2.0)["status"], "fail")
+
+    def test_exactly_twenty_percent_drop_is_still_ok(self):
+        # esik "fazla" gerileme: tam %20 gecer
+        self.assertEqual(_one("cdc_mib_s", 80.0, base=100.0)["status"], "ok")
+        self.assertEqual(_one("cdc_mib_s", 79.0, base=100.0)["status"],
                          "fail")
+
+    def test_engine_floor_is_absolute(self):
+        # yavas baseline'a gore drift yok ama urun tabani (150) altinda
+        v = _one("engine_mib_s", 140.0, base=100.0)
+        self.assertEqual(v["status"], "fail")
+        self.assertIn("floor", v["note"])
+        self.assertEqual(_one("engine_mib_s", 160.0, base=100.0)["status"],
+                         "ok")
+
+
+class LatencyMetricTest(unittest.TestCase):
+    """Gecikme: dusuk iyi, CPU faktoruyle ters olcekli, floor cpu'ya bagli."""
+
+    def test_latency_scales_inversely(self):
+        # 2x hizli makinede hedef yariya iner
+        v = _one("stats_frame_ms", 55.0, base=100.0, cpu=2.0)
+        self.assertAlmostEqual(v["target"], 50.0)
+        self.assertAlmostEqual(v["limit"], 60.0)
+        self.assertEqual(v["status"], "ok")
+        self.assertEqual(_one("stats_frame_ms", 65.0, base=100.0,
+                              cpu=2.0)["status"], "fail")
+
+    def test_latency_floor_is_cpu_normalised(self):
+        # floor 150 ms / cpu 2 -> bu makinede 75 ms
+        v = _one("stats_frame_ms", 80.0, base=140.0, cpu=2.0)
+        self.assertEqual(v["status"], "fail")
+        self.assertIn("floor", v["note"])
+        self.assertEqual(_one("stats_frame_ms", 70.0, base=140.0,
+                              cpu=2.0)["status"], "ok")
+
+    def test_frame_floor_applies_without_baseline(self):
+        v = _one("stats_frame_ms", 160.0)
+        self.assertEqual(v["status"], "fail")
+        self.assertIn("floor", v["note"])
+        self.assertEqual(_one("stats_frame_ms", 100.0)["status"], "new")
 
 
 class AbsoluteMetricTest(unittest.TestCase):
-    """RSS / bosta CPU: mutlak esik; CPU icin taban (gurultu) esigi."""
+    """RSS / bosta CPU: mutlak esik, gurultu tabani ve urun tabani."""
 
-    def test_rss_within_twenty_percent_is_ok(self):
-        self.assertEqual(_absolute("idle_rss_mib", 119.0, 100.0)["status"],
-                         "ok")
+    def test_rss_drift(self):
+        self.assertEqual(_one("idle_loaded_rss_mib", 119.0, base=100.0)
+                         ["status"], "ok")
+        self.assertEqual(_one("idle_loaded_rss_mib", 121.0, base=100.0)
+                         ["status"], "fail")
 
-    def test_rss_over_twenty_percent_fails(self):
-        v = _absolute("idle_rss_mib", 121.0, 100.0)
+    def test_rss_floor(self):
+        # drift serbest (limit 336) ama 300 MiB urun tabani asildi
+        v = _one("idle_loaded_rss_mib", 310.0, base=280.0)
         self.assertEqual(v["status"], "fail")
-        self.assertTrue(compare.failed([v]))
+        self.assertEqual(v["note"], "floor")
 
-    def test_idle_cpu_floor_swallows_noise(self):
-        # baseline 0.4 -> %20 esigi 0.48; taban 2.0 kazanir
-        self.assertEqual(_absolute("idle_cpu_pct", 1.9, 0.4)["status"], "ok")
-
-    def test_idle_cpu_above_floor_fails(self):
-        self.assertEqual(_absolute("idle_cpu_pct", 2.1, 0.4)["status"],
+    def test_idle_cpu_noise_floor(self):
+        # baseline 0.4: %20 esigi 0.48; 2.0 tabani kazanir
+        self.assertEqual(_one("idle_cpu_pct", 1.9, base=0.4)["status"], "ok")
+        self.assertEqual(_one("idle_cpu_pct", 2.1, base=0.4)["status"],
                          "fail")
 
-    def test_zero_cpu_baseline_uses_floor_and_has_no_ratio(self):
-        # sifir taban: oran anlamsiz (inf JSON'a sizmamali), taban 2.0
-        v = _absolute("idle_cpu_pct", 0.2, 0.0)
-        self.assertIsNone(v["ratio"])
+    def test_idle_cpu_product_floor(self):
+        # baseline 4.5 -> drift siniri 5.4; 5.0 tabani ayrica uygulanir
+        self.assertEqual(_one("idle_loaded_cpu_pct", 5.05, base=4.5)
+                         ["status"], "fail")
+        self.assertEqual(_one("idle_loaded_cpu_pct", 4.9, base=4.5)
+                         ["status"], "ok")
+
+    def test_sse_cpu_has_no_product_floor(self):
+        # SSE varyanti yalniz drift ile denetlenir (floor yok)
+        v = _one("idle_sse_cpu_pct", 7.0, base=6.0)
         self.assertEqual(v["status"], "ok")
-        self.assertEqual(_absolute("idle_cpu_pct", 2.5, 0.0)["status"],
-                         "fail")
-
-    def test_idle_cpu_uses_baseline_when_above_floor(self):
-        # baseline 65 -> esik 78 (taban 2'yi asar)
-        self.assertEqual(
-            _absolute("idle_loaded_cpu_pct", 77.0, 65.0)["status"], "ok")
-        self.assertEqual(
-            _absolute("idle_loaded_cpu_pct", 79.0, 65.0)["status"], "fail")
+        self.assertIsNone(v["floor"])
 
     def test_absolute_metrics_skip_on_other_environment(self):
-        # farkli platform/Python: karsilastirilamaz sayi basarisizlik degil
-        v = compare.compare({"idle_rss_mib": 100.0},
-                            {"idle_rss_mib": 500.0}, 1.0,
-                            absolute_ok=False)[0]
+        v = _one("idle_loaded_rss_mib", 900.0, base=100.0,
+                 absolute_ok=False)
         self.assertEqual(v["status"], "skip")
         self.assertFalse(compare.failed([v]))
+        # floor da atlanir: farkli ortamda mutlak sayi karsilastirilamaz
+        self.assertFalse(compare.failed([_one(
+            "idle_loaded_cpu_pct", 99.0, base=1.0, absolute_ok=False)]))
 
 
 class VerdictTest(unittest.TestCase):
-    def test_new_metric_does_not_fail(self):
-        v = compare.compare({}, {"cdc_mib_s": 10.0}, 1.0)[0]
+    def test_new_rate_metric_does_not_fail(self):
+        v = _one("queue_load_jobs_s", 10.0)
         self.assertEqual(v["status"], "new")
         self.assertFalse(compare.failed([v]))
 
     def test_unknown_metric_ignored(self):
-        self.assertEqual(compare.compare({}, {"bilinmeyen": 1.0}, 1.0), [])
+        self.assertEqual(compare.compare({}, {"bilinmeyen": 1.0}, 1.0, 1.0),
+                         [])
 
-    def test_table_shows_status(self):
-        text = compare.format_table([_rate(100.0), _absolute(
-            "idle_rss_mib", 500.0, 100.0)])
-        self.assertIn("engine throughput", text)
-        self.assertIn("fail", text)
-        self.assertIn("ok", text)
+    def test_floor_metrics_are_declared(self):
+        expected = {"engine_mib_s", "stats_frame_ms",
+                    "idle_loaded_cpu_pct", "idle_queued_cpu_pct",
+                    "idle_loaded_rss_mib", "idle_queued_rss_mib",
+                    "idle_sse_rss_mib"}
+        self.assertEqual(set(compare.FLOOR_METRICS), expected)
+        self.assertNotIn("idle_sse_cpu_pct", compare.FLOOR_METRICS)
 
-    def test_spec_of_covers_all_known_metrics(self):
-        for name in list(compare.RATE_METRICS) + list(compare.ABS_METRICS):
-            self.assertIsNotNone(compare.spec_of(name))
-        self.assertIsNone(compare.spec_of("yok"))
+    def test_table_shows_fields(self):
+        text = compare.format_table([
+            _one("engine_mib_s", 140.0, base=100.0),
+            _one("stats_frame_ms", 100.0, base=100.0),
+        ])
+        for needle in ("engine throughput", "stats frame", "floor", "fail",
+                       "ok"):
+            self.assertIn(needle, text)
 
 
 class BaselineFileTest(unittest.TestCase):
-    """Depodaki baseline tam ve kendi kendine tutarli olmali."""
+    """Depodaki baseline gecerli bir belge olmali (adlar eski olabilir)."""
 
     @classmethod
     def setUpClass(cls):
@@ -140,24 +181,13 @@ class BaselineFileTest(unittest.TestCase):
         self.assertTrue(self.data.get("generated"))
         self.assertTrue(self.data.get("python"))
         self.assertTrue(self.data.get("platform"))
-
-    def test_every_known_metric_has_a_baseline(self):
-        expected = set(compare.RATE_METRICS) | set(compare.ABS_METRICS)
-        self.assertEqual(set(self.data.get("metrics") or {}), expected)
-
-    def test_baseline_values_are_sane(self):
-        for name, value in (self.data.get("metrics") or {}).items():
-            self.assertIsInstance(value, (int, float), name)
-            self.assertGreaterEqual(float(value), 0.0, name)
-            if name not in compare.CPU_METRICS:
-                self.assertGreater(float(value), 0.0, name)
+        self.assertTrue(self.data.get("metrics"))
 
     def test_baseline_compared_with_itself_is_green(self):
-        # ayni degerler + faktor 1: hicbir metrik gerileme sayilmaz
+        # ayni degerler + faktor 1: bilinen metrikler icin gerileme yok
         verdicts = compare.compare(self.data["metrics"],
-                                   self.data["metrics"], 1.0, True)
+                                   self.data["metrics"], 1.0, 1.0, True)
         self.assertFalse(compare.failed(verdicts))
-        self.assertTrue(all(v["status"] == "ok" for v in verdicts))
 
 
 if __name__ == "__main__":

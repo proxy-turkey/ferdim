@@ -7,13 +7,15 @@ Kullanim:
     python3 -m benchmarks --json bench.json   # makine okunur ciktisi
     python3 -m benchmarks --update-baseline   # baseline.json'u yeniden yaz
 
-Cikis kodu 1: baseline'a gore %20'den fazla gerileme (quick/update haric).
+Cikis kodu 1: baseline'a gore %20'den fazla gerileme ya da mutlak urun
+tabaninin (floor) ihlali (quick/update haric).
 """
 from __future__ import annotations
 
 import argparse
 import json
 import platform
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -40,6 +42,23 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _spread(samples: dict) -> dict:
+    """Metrik basina sacilim ozeti: min / medyan / max / goreli genislik."""
+    out = {}
+    for name, values in samples.items():
+        vals = [float(v) for v in values if v is not None]
+        if not vals:
+            continue
+        med = statistics.median(vals)
+        out[name] = {
+            "min": min(vals),
+            "median": med,
+            "max": max(vals),
+            "rel": ((max(vals) - min(vals)) / med) if med else None,
+        }
+    return out
+
+
 def _write_baseline(path: Path, record: dict) -> None:
     data = {
         "version": compare.BASELINE_VERSION,
@@ -47,6 +66,7 @@ def _write_baseline(path: Path, record: dict) -> None:
         "python": record["python"],
         "platform": record["platform"],
         "calibration": record["calibration"],
+        "io_calibration": record["io_calibration"],
         "metrics": record["metrics"],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,7 +82,7 @@ def main(argv=None) -> int:
     ap.add_argument("--update-baseline", action="store_true",
                     help="baseline.json'u bu kosunun olcumleriyle yenile")
     ap.add_argument("--json", metavar="PATH",
-                    help="sonuclari + kararlari JSON olarak yaz")
+                    help="sonuclari, sacilimi ve kararlari JSON olarak yaz")
     ap.add_argument("--only", action="append", choices=sorted(SUITES),
                     metavar="NAME",
                     help="yalniz bu paketi calistir (%s)" % ", ".join(SUITES))
@@ -78,17 +98,22 @@ def main(argv=None) -> int:
     print("FerDim benchmarks  python %s  %s"
           % (platform.python_version(), platform.system().lower()))
     t_start = time.perf_counter()
-    calib = suites.calibration()
-    print("calibration: %.1f units/s" % calib)
+    cpu_calib = suites.calibration()
+    io_calib = suites.io_calibration()
+    print("calibration: cpu %.1f units/s  io %.1f units/s"
+          % (cpu_calib, io_calib))
     metrics = {}
+    samples = {}
     for name in names:
         t0 = time.perf_counter()
         print("[%s] ..." % name, end="", flush=True)
         try:
-            metrics.update(SUITES[name](args.quick))
+            m, s = SUITES[name](args.quick)
         except Exception as exc:
             print("\n[%s] HATA: %s" % (name, exc))
             return 1
+        metrics.update(m)
+        samples.update(s)
         print(" %.1f sn" % (time.perf_counter() - t0), flush=True)
     elapsed = time.perf_counter() - t_start
 
@@ -96,7 +121,8 @@ def main(argv=None) -> int:
         "generated": _now(),
         "python": platform.python_version(),
         "platform": platform.system().lower(),
-        "calibration": calib,
+        "calibration": cpu_calib,
+        "io_calibration": io_calib,
         "metrics": metrics,
     }
     verdicts: list = []
@@ -118,23 +144,34 @@ def main(argv=None) -> int:
                   "yenile" % (baseline.get("version"),
                               compare.BASELINE_VERSION))
             return 1
-        bcalib = float(baseline.get("calibration") or 0.0)
-        factor = (calib / bcalib) if bcalib > 0 else 1.0
+        b_cpu = float(baseline.get("calibration") or 0.0)
+        b_io = float(baseline.get("io_calibration") or 0.0)
+        cpu_factor = (cpu_calib / b_cpu) if b_cpu > 0 else 1.0
+        io_factor = (io_calib / b_io) if b_io > 0 else 1.0
+        if b_io <= 0:
+            print("not: baseline'da I/O kalibrasyonu yok (io factor 1.0); "
+                  "--update-baseline ile yenile")
         absolute_ok = (str(baseline.get("platform")) == record["platform"]
                        and _minor(baseline.get("python"))
                        == _minor(record["python"]))
         verdicts = compare.compare(baseline.get("metrics") or {}, metrics,
-                                   factor, absolute_ok)
+                                   cpu_factor, io_factor, absolute_ok)
         print()
         print(compare.format_table(verdicts))
         if not absolute_ok:
             print("\nnot: RSS/bosta CPU farkli ortamda karsilastirilmaz "
                   "(ayni platform + Python minor surumu gerekir)")
+        new = [v for v in verdicts if v["status"] == "new"]
+        if new:
+            print("not: %d metrik baseline'da yok (floor'lar yine uygulandi); "
+                  "baseline guncel degil - --update-baseline"
+                  % len(new))
         failed = compare.failed(verdicts)
 
     if args.json:
-        out = dict(record, elapsed_s=round(elapsed, 1), verdicts=verdicts,
-                   failed=failed)
+        out = dict(record, elapsed_s=round(elapsed, 1),
+                   samples=samples, spread=_spread(samples),
+                   verdicts=verdicts, failed=failed)
         Path(args.json).write_text(json.dumps(out, indent=2) + "\n", "utf-8")
         print("\njson: %s" % args.json)
 
@@ -143,9 +180,10 @@ def main(argv=None) -> int:
         return 0
     bad = [v for v in verdicts if v["status"] == "fail"]
     if failed:
-        print("GERILEME: %s" % ", ".join(v["label"] for v in bad))
+        print("GERILEME: %s" % ", ".join(
+            "%s (%s)" % (v["label"], v["note"]) for v in bad))
         return 1
-    print("tamam: metrikler baseline sinirlari icinde")
+    print("tamam: metrikler baseline ve urun tabanlari icinde")
     return 0
 
 
