@@ -350,6 +350,20 @@ def _socks_auth_error(e: BaseException) -> bool:
     return isinstance(e, socks.SocksError) and e.code in ("auth", "forbidden")
 
 
+def _snap_copy(snap: dict) -> dict:
+    """snapshot kopyasi: ic listeler paylasilmaz.
+
+    Onbellekten donen gorunumun ic listeleri (uyari kodlari, dogrulanan
+    saglamalar, ayna sagligi) cagirana kopyalanir; bir cagiranin listeyi
+    degistirmesi onbellegi ya da baska cagiranlari bozmaz (bos listeler de
+    kopyalanir: paylasilan bos liste .append ile onbellegi bozardi)."""
+    out = snap.copy()
+    out["warning_codes"] = list(snap["warning_codes"])
+    out["verified"] = list(snap["verified"])
+    out["mirror_health"] = [dict(m) for m in snap["mirror_health"]]
+    return out
+
+
 class _Src:
     """Bir indirme kaynaginin (birincil ya da ayna) saglik kaydi.
 
@@ -640,6 +654,10 @@ class DownloadJob:
         self._finalized = threading.Event()
         self._publishing = False   # _finalize_file yer tutucuyu yayinliyor
         self._dir: Path | None = None    # hedef klasor: ilk erisimde sabitlenir
+        # snapshot onbellegi: turetilmis adlar + son gorunum (kilit altinda)
+        self._derived_cache: dict | None = None
+        self._snap_cache: tuple | None = None    # (anahtar, gorunum)
+        self._snap_gen = 0               # her yeniden kurulumda artar (stats)
         self._retries = 5
         self._stall = 20           # sn: bu kadar sure bayt gelmezse akis durdu
         self._restarts = 0
@@ -729,14 +747,44 @@ class DownloadJob:
         name = self.final_filename or util.filename_from_url(self.url)
         return self.target_dir / name
 
+    def _derived(self) -> dict:
+        """Ad/kategori/dizin/yol: ad ya da hedef degismedikce yeniden kurulmaz.
+
+        10 000 islik kuyrukta `filename_from_url`+`sanitize_filename`+
+        `category_for`+Path islemleri is basina onlarca mikrosaniye ediyordu;
+        bu degerler yalniz `final_filename`, `url` ya da hedef klasor
+        degisince yeniden hesaplanir. Cagiran is kilidini tutar."""
+        key = (self.final_filename, self.url, self.spec.directory, self._dir)
+        cached = self._derived_cache
+        if cached is not None and cached["key"] == key:
+            return cached
+        tdir = self.target_dir            # ilk erisimde sabitlenir (_dir)
+        name = self.final_filename or util.filename_from_url(self.url)
+        cached = {
+            "key": (self.final_filename, self.url, self.spec.directory,
+                    self._dir),
+            "name": name,
+            "category": util.category_for(name),
+            "url": util.redact_url(self.url),
+            "dir": str(tdir),
+            "fullpath": str(tdir / name),
+        }
+        self._derived_cache = cached
+        return cached
+
     @property
     def category(self) -> str:
-        return util.category_for(
-            self.final_filename or util.filename_from_url(self.url))
+        with self._lock:
+            return self._derived()["category"]
 
-    def _window_wait(self) -> str:
+    def _window_wait(self, windows=None) -> str:
         """Bu isin kategorisine zamanlama penceresi tanimlanmissa ve pencere
-        su an kapaliysa 'HH:MM-HH:MM' dondurur; yoksa bos."""
+        su an kapaliysa 'HH:MM-HH:MM' dondurur; yoksa bos.
+
+        `windows` verilirse (stats: kategori -> kapali pencere) is basina
+        `window_open` cagrilmaz; sozluk bir kez hesaplanir."""
+        if windows is not None:
+            return windows.get(self.category, "")
         try:
             cats = (self.cfg.get("schedule") or {}).get("categories") or {}
             w = cats.get(self.category) if isinstance(cats, dict) else None
@@ -747,47 +795,93 @@ class DownloadJob:
             return ""
 
     # -------------------------------------------------------------- snapshot
-    def snapshot(self) -> dict:
+    def snapshot(self, windows=None, copy=True) -> dict:
+        """Kuyruk gorunumu (sozluk). Sonuc, girdi anahtari degismedikce
+        onbellekten kopyalanir: 10 000 duraklatilmis isde her stats/tick
+        cagrisi ayni sozlukleri bastan kurmaz.
+
+        Anahtar gorunume giren TUM degisken alanlari kapsar (durum, boyut,
+        ilerleme, hiz, hata, extra alanlari, kaynak sagligi); turetilmis
+        adlar `_derived()` onbelleginden gelir. `windows` verilirse
+        (stats: kategori -> kapali pencere) pencere is basina hesaplanmaz.
+
+        copy=False: onbellekteki sozluk KOPYALANMADAN doner (10 000 islik
+        stats cagrisinda 10 000 kopya ~15 ms ediyordu). Cagiran onu
+        DEGISTIRMEMELIDIR; kuyruk `stats()` bunu yalniz disariya okuma
+        amaciyla kullanir.
+        """
         with self._lock:
-            window = self._window_wait()
-            retry_until = float(self.extra.get("retry_after_until") or 0)
+            extra = self.extra
+            get = extra.get
+            retry_until = float(get("retry_after_until") or 0)
             if retry_until and retry_until <= time.time():
                 # kapi gecti: bayat rozet kalmasin (ui neden bekledigini sorsun)
-                self.extra.pop("retry_after_until", None)
+                extra.pop("retry_after_until", None)
                 retry_until = 0.0
+            # pencere: stats cagrisi kategori->kapali pencere sozlugunu
+            # paylasir; sozluk bossa kategori hic hesaplanmaz
+            if windows:
+                window = windows.get(self._derived()["category"], "")
+            elif windows is None:
+                window = self._window_wait()
+            else:
+                window = ""
+            srcs = self._srcs
+            if len(srcs) == 1:            # yaygin durum: tek birincil kaynak
+                one = srcs[0]
+                src_key = (one.primary, one.dead, one.code)
+            else:
+                src_key = tuple((s.primary, s.dead, s.code) for s in srcs)
+            key = (
+                self._state, self.total, self.done, self.speed, self._active,
+                self._allowed, self.error, self.error_code, self.kind,
+                self.final_filename, self.url, self.spec.directory, self._dir,
+                self.created, self.spec.segments,
+                len(self.spec.mirrors or ()), int(self._gov["best"]),
+                get("adaptive"), get("checksum"), get("merkle"),
+                get("checksum_note"), get("merkle_note"),
+                tuple(get("verified") or ()), get("sources_dead"),
+                get("verifying"), get("verify_done"), get("verify_total"),
+                get("warning"), retry_until, window, src_key,
+            )
+            entry = self._snap_cache
+            if entry is not None and entry[0] == key:
+                return _snap_copy(entry[1]) if copy else entry[1]
+            derived = self._derived()
             warnings = []
-            if self.extra.get("sources_dead"):
+            if extra.get("sources_dead"):
                 warnings.append("mirror_dead")
-            if self.extra.get("checksum") == "warn":
+            if extra.get("checksum") == "warn":
                 warnings.append("checksum_mismatch")
-            if self.extra.get("merkle") == "warn":
+            if extra.get("merkle") == "warn":
                 warnings.append("merkle_mismatch")
-            if self.extra.get("warning"):
-                warnings.append(self.extra["warning"])
-            return {
-                "id": self.id, "url": util.redact_url(self.url),
-                "state": self.state,
-                "filename": self.final_filename or util.filename_from_url(self.url),
-                "dir": str(self.target_dir),
-                "fullpath": str(self.final_path),
-                "size": self.total, "done": self.done,
-                "speed": int(self.speed),
-                "eta": ((self.total - self.done) / self.speed)
-                       if self.total > 0 and self.speed > 1 else -1,
+            if extra.get("warning"):
+                warnings.append(extra["warning"])
+            total, done, speed = self.total, self.done, self.speed
+            snap = {
+                "id": self.id, "url": derived["url"],
+                "state": self._state,
+                "filename": derived["name"],
+                "dir": derived["dir"],
+                "fullpath": derived["fullpath"],
+                "size": total, "done": done,
+                "speed": int(speed),
+                "eta": ((total - done) / speed) if total > 0 and speed > 1
+                       else -1,
                 "kind": self.kind, "error": self.error,
                 "error_code": self.error_code,
                 "warning_codes": warnings,
-                "category": self.category,
+                "category": derived["category"],
                 "created": self.created,
                 "segments": self._active,          # canli baglanti sayisi
                 "segments_cfg": self.spec.segments,
                 "segments_effective": self._allowed,
-                "adaptive": self.extra.get("adaptive"),
-                "checksum": self.extra.get("checksum", ""),
-                "merkle": self.extra.get("merkle", ""),
-                "checksum_note": self.extra.get("checksum_note", ""),
-                "merkle_note": self.extra.get("merkle_note", ""),
-                "verified": list(self.extra.get("verified", [])),
+                "adaptive": extra.get("adaptive"),
+                "checksum": extra.get("checksum", ""),
+                "merkle": extra.get("merkle", ""),
+                "checksum_note": extra.get("checksum_note", ""),
+                "merkle_note": extra.get("merkle_note", ""),
+                "verified": list(extra.get("verified", [])),
                 "mirrors": len(self.spec.mirrors or []),
                 "mirror_health": [
                     {"url": util.redact_url(s.url),
@@ -799,12 +893,24 @@ class DownloadJob:
                 "sched_wait": bool(window),
                 # Retry-After kapisi acikken duvar saati (epoch); 0 = yok
                 "retry_after_until": retry_until,
-                "verifying": bool(self.extra.get("verifying")),   # dogrulaniyor
-                "verify_done": int(self.extra.get("verify_done") or 0),
-                "verify_total": int(self.extra.get("verify_total") or 0),
-                "warning": str(self.extra.get("warning") or ""),
+                "verifying": bool(extra.get("verifying")),   # dogrulaniyor
+                "verify_done": int(extra.get("verify_done") or 0),
+                "verify_total": int(extra.get("verify_total") or 0),
+                "warning": str(extra.get("warning") or ""),
                 "best_speed": int(self._gov["best"]),
             }
+            self._snap_cache = (key, snap)
+            self._snap_gen += 1          # stats revizyonu: icerik degisti
+            return _snap_copy(snap) if copy else snap
+
+    def snapshot_rev(self, windows=None) -> tuple[int, dict]:
+        """(revizyon, gorunum): stats deltalari icin AYNI kilitta okunur.
+
+        Ayri okunsaydi arada yenilenen gorunum eski revizyonla eslesir ve
+        istemci yeni icerigi hic almazdi (ya da gereksiz tekrar alirdi)."""
+        with self._lock:
+            snap = self.snapshot(windows, copy=False)
+            return self._snap_gen, snap
 
     def _changed(self):
         self.on_change(self)

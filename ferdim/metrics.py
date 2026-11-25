@@ -54,23 +54,35 @@ class Collector:
         self._coexist = 0
 
     # ------------------------------------------------------------ ornekleme
-    def observe(self, jobs, coexist_active: bool = False) -> None:
+    def observe(self, jobs, coexist_active: bool = False, states=None) -> None:
         """Kuyruk tick'i: is nesnelerini okur, deltalari toplama ekler.
+
+        `states` verilirse (kuyruk yolu) yalniz `jobs` orneklenir; durum
+        sayaclari (Prometheus `ferdim_queue_jobs`) hazir sozlukten alinir ve
+        kuyruktan cikan isler `forget()` ile dusurulur. Boylece 10 000
+        duraklatilmis is her tick'te kilit/sozluk kopyasi odemez. `states`
+        verilmezse (dogrudan kullanim) sayim `jobs`tan turetilir.
 
         Tek bir isin okunamasi (kilit/ozellik hatasi) tick'in tamamini
         dusurmez: is atlanir, digerleri sayilir."""
         with self._lock:
-            live: set[str] = set()
-            states: dict[str, int] = {}
+            if states is None:
+                live: set[str] | None = set()
+                counts: dict[str, int] = {}
+            else:
+                live = None
+                counts = dict(states)
             links, speed = 0, 0.0
             for job in list(jobs):
                 try:
                     jid = str(getattr(job, "id", "") or "")
                     if not jid:
                         continue
-                    live.add(jid)
+                    if live is not None:
+                        live.add(jid)
                     state = str(getattr(job, "state", "") or "")
-                    states[state] = states.get(state, 0) + 1
+                    if live is not None:
+                        counts[state] = counts.get(state, 0) + 1
                     if state in TERMINAL and self._states.get(jid) not in TERMINAL:
                         self._jobs_total[state] = \
                             self._jobs_total.get(state, 0) + 1
@@ -91,15 +103,28 @@ class Collector:
                     self._sample_counters(jid, self._snapshot_counters(job))
                 except Exception:
                     continue
-            for jid in set(self._done) - live:      # kuyruktan cikti
-                self._done.pop(jid, None)
-                self._counters.pop(jid, None)
-                self._states.pop(jid, None)
+            if live is not None:
+                for jid in set(self._done) - live:      # kuyruktan cikti
+                    self._forget_locked(jid)
             self._bound()
-            self._queue_jobs = states
+            self._queue_jobs = counts
             self._links = links
             self._speed = speed
             self._coexist = 1 if coexist_active else 0
+
+    def forget(self, job_id: str) -> None:
+        """Kuyruktan cikan isin ornekleme tabanini siler (O(1)).
+
+        Toplamlar (bayt/tekrar) SILINMEZ: Prometheus sayaclari monotonik
+        kalmali; is kuyruktan ciksa da toplam geri sarmaz."""
+        with self._lock:
+            self._forget_locked(str(job_id))
+
+    def _forget_locked(self, jid: str) -> None:
+        """Is basina tabanlari dusurur (kilit cagiranda)."""
+        self._done.pop(jid, None)
+        self._counters.pop(jid, None)
+        self._states.pop(jid, None)
 
     @staticmethod
     def _snapshot_counters(job):

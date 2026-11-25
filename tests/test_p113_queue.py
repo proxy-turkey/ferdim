@@ -233,7 +233,7 @@ class StatsTests(QueueCase):
         real = job.snapshot
         started, release = threading.Event(), threading.Event()
 
-        def blocking_snapshot():
+        def blocking_snapshot(windows=None, copy=True):
             started.set()
             release.wait(5)
             return real()
@@ -259,6 +259,81 @@ class StatsTests(QueueCase):
         self.assertTrue(out.get("st"), "stats donmedi")
         self.assertEqual([j["id"] for j in out["st"]["jobs"]], [job.id])
 
+    def test_snapshot_cache_reflects_direct_field_changes(self):
+        """Onbellek TUM gorunen alanlari kapsar: alan dogrudan degisse de
+        snapshot/stats taze deger dondurur (bayat gorunum olmaz)."""
+        qm = self._queue()
+        job = self._add(qm)
+        first = qm.stats()["jobs"][0]
+        self.assertEqual(first["state"], JobState.PAUSED)
+        rev = qm.stats()["rev"]
+
+        job.total = 4096
+        job.done = 1024
+        job.speed = 2048.0
+        job._active = 3
+        job.error = "agnet"
+        job.error_code = "network"
+        job.extra["checksum"] = "warn"
+        job.extra["checksum_note"] = "sha256 uyusmuyor"
+        job.extra["verified"] = ["sha256"]
+        job.extra["verify_total"] = 9
+        job.final_filename = "yeni-ad.bin"
+
+        snap = job.snapshot()
+        self.assertEqual((snap["size"], snap["done"], snap["speed"]),
+                         (4096, 1024, 2048))
+        self.assertEqual(snap["segments"], 3)
+        self.assertEqual(snap["error"], "agnet")
+        self.assertEqual(snap["error_code"], "network")
+        self.assertEqual(snap["checksum"], "warn")
+        self.assertEqual(snap["checksum_note"], "sha256 uyusmuyor")
+        self.assertEqual(snap["verified"], ["sha256"])
+        self.assertEqual(snap["verify_total"], 9)
+        self.assertEqual(snap["filename"], "yeni-ad.bin")
+        self.assertIn("checksum_mismatch", snap["warning_codes"])
+        st = qm.stats()
+        row = st["jobs"][0]
+        self.assertEqual(row["filename"], "yeni-ad.bin")
+        self.assertEqual(row["checksum"], "warn")
+        self.assertGreater(st["rev"], rev, "icerik degisti: revizyon artmali")
+        # ayni cagri tekrar: yeni revizyon yok
+        self.assertEqual(qm.stats(since=st["rev"])["jobs"], [])
+
+    def test_snapshot_cache_is_not_shared_with_callers(self):
+        """Donen sozluk/listeler cagirana aittir: degistirmek onbellegi
+        bozmaz (copy=True varsayilani)."""
+        qm = self._queue()
+        job = self._add(qm)
+        snap = job.snapshot()
+        snap["state"] = "bozuk"
+        snap["warning_codes"].append("uydurma")
+        snap["verified"].append("sahte")
+        again = job.snapshot()
+        self.assertEqual(again["state"], JobState.PAUSED)
+        self.assertEqual(again["warning_codes"], [])
+        self.assertEqual(again["verified"], [])
+
+    def test_category_window_is_computed_once_per_stats_call(self):
+        """stats: pencere kumesi cagri basina bir kez hesaplanir."""
+        # .bin -> 'program' kategorisi: pencere o kategoriye tanimlanir
+        qm = self._queue(schedule={
+            "enabled": False, "start": "00:00", "stop": "00:00",
+            "categories": {"program": {"start": "00:00", "stop": "00:01"}}})
+        jobs = [self._add(qm, f"http://127.0.0.1:1/w{i}.bin")
+                for i in range(4)]
+        calls = []
+        with mock.patch.object(util, "window_open",
+                               lambda *a, **k: bool(calls.append(a))):
+            st = qm.stats()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(len(st["jobs"]), 4)
+        for row in st["jobs"]:
+            self.assertTrue(row["sched_wait"], row["window"])
+            self.assertEqual(row["window"], "00:00-00:01")
+        self.assertEqual({j.id for j in jobs},
+                         {row["id"] for row in st["jobs"]})
+
     def test_api_parses_stats_parameters_defensively(self):
         qm = self._queue()
         a, b, c = self._three(qm)
@@ -282,8 +357,8 @@ class StatsTests(QueueCase):
         holder = qm.jobs[0]
         real = holder.snapshot
 
-        def churn():
-            snap = real()
+        def churn(windows=None, copy=True):
+            snap = real(windows, copy)
             qm.add(JobSpec(url="http://127.0.0.1:1/churn.bin"), paused=True)
             return snap
 
@@ -298,6 +373,67 @@ class StatsTests(QueueCase):
         delta = qm.stats(since=rev)
         self.assertFalse(delta["full"])
         self.assertIn(late.id, [j["id"] for j in delta["jobs"]])
+
+
+class TickCostTests(QueueCase):
+    """Bosta tick: yalniz degisen/calisan islerle ugrasilir."""
+
+    def test_tick_only_touches_changed_or_running_jobs(self):
+        qm = self._queue()
+        jobs = [self._add(qm, f"http://127.0.0.1:1/t{i}.bin")
+                for i in range(4)]
+        jobs[0].state = JobState.DONE
+        speeds, sampled = [], []
+        real_speed = type(jobs[0]).update_speed
+        real_observe = qm.metrics.observe
+
+        def counting_speed(self_):
+            speeds.append(self_.id)
+            return real_speed(self_)
+
+        def counting_observe(hot, coexist_active=False, states=None):
+            sampled.append([j.id for j in hot])
+            return real_observe(hot, coexist_active, states)
+
+        jobtype = type(jobs[0])
+        with mock.patch.object(jobtype, "update_speed", counting_speed), \
+                mock.patch.object(qm.metrics, "observe", counting_observe):
+            qm._tick()                 # ilk gecis: tabanlar kurulur
+            speeds.clear()
+            sampled.clear()
+            qm._tick()                 # degisiklik yok: is basina is yok
+            self.assertEqual(speeds, [], "duraklatilmis iste hiz hesaplandi")
+            self.assertEqual(sampled, [[]], "degismeyen is yeniden orneklendi")
+            # kosan is: her tick hiz alir ve orneklenir
+            jobs[1].state = JobState.DOWNLOADING
+            qm._tick()
+            self.assertEqual(speeds, [jobs[1].id])
+            self.assertEqual(sampled[-1], [jobs[1].id])
+            # kosu bitince hiz bir kez sifirlanir
+            jobs[1].speed = 1234.0
+            jobs[1].state = JobState.DONE
+            qm._tick()
+            self.assertEqual(jobs[1].speed, 0.0, "biten iste hiz sifirlanmali")
+            speeds.clear()
+            qm._tick()
+            self.assertEqual(speeds, [], "biten is artik hiz hesaplamaz")
+
+    def test_tick_idle_flag_and_state_counts(self):
+        qm = self._queue()
+        job = self._add(qm)
+        qm._tick()
+        self.assertTrue(qm._idle, "is yokken tick uzun uyumali")
+        self.assertEqual(qm._state_counts.get(JobState.PAUSED), 1)
+        queued = qm.add(JobSpec(url="http://127.0.0.1:1/q.bin"))
+        qm._tick()
+        self.assertFalse(qm._idle, "kuyrukta is varsa kisa aralik")
+        self.assertEqual(qm._state_counts.get(JobState.QUEUED), 1)
+        qm.remove(job.id)
+        qm._tick()                     # sayac temizligi tick'te
+        self.assertIsNone(qm._state_counts.get(JobState.PAUSED))
+        self.assertNotIn(job.id, qm._job_seen)
+        self.assertEqual(qm._state_counts.get(JobState.QUEUED), 1)
+        self.assertTrue(queued)
 
 
 class ControlTests(QueueCase):
