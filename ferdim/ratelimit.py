@@ -4,6 +4,9 @@ from __future__ import annotations
 import threading
 import time
 
+_TIME = time          # enjekte edilen saati (testler) ayirt etmek icin
+RATE_WAKE = 5.0       # sn: durdurma olayi beklerken hiz degisimi icin tavan
+
 
 class TokenBucket:
     """rate<=0 iken hic bekletmez (sinirsiz)."""
@@ -38,11 +41,12 @@ class TokenBucket:
         beklerdi."""
         if self._rate <= 0 or n <= 0:
             return True
-        step = 0.1 if stop is not None else 0.25
         while True:
             if stop is not None and stop.is_set():
                 return False
             with self._cond:
+                if self._rate <= 0:      # set_rate(0): sinir kalkti
+                    return True
                 now = time.monotonic()
                 burst = max(self._rate, 1 << 17, n)  # tek istek hep sigsin
                 self._tokens = min(burst, self._tokens + (now - self._ts) * self._rate)
@@ -51,7 +55,28 @@ class TokenBucket:
                     self._tokens -= n
                     return True
                 wait = (n - self._tokens) / self._rate
-            time.sleep(min(wait, step))
+            self._wait(wait, stop)
+
+    def _wait(self, wait: float, stop) -> None:
+        """Tam eksik sure kadar bekle (yoklama yok).
+
+        Durdurma olayi verilmisse bekleme DOGRUDAN o olay uzerindedir:
+        pause/cancel aninda doner. Olay yoksa kendi kosulumuzda beklenir;
+        set_rate/refund notify ile erken uyandirir. Olayli beklemede hiz
+        degisikligi en gec RATE_WAKE sn icinde, bir sonraki turda gecerli
+        olur (olay iki kaynaktan ayni anda beklenemez).
+
+        Testler `ratelimit.time`'i sahte saatle degistirir: o durumda
+        bekleme sahte saatin sleep'i ile ilerletilir (gercek bekleme yok,
+        zaman dogru akar)."""
+        if stop is not None:
+            stop.wait(min(wait, RATE_WAKE))
+            return
+        if time is _TIME:
+            with self._cond:
+                self._cond.wait(wait)
+            return
+        time.sleep(wait)
 
     def refund(self, n: int) -> None:
         """take() ile alinan n bayti kovaya geri verir (bilesik kova iptali)."""
@@ -60,6 +85,7 @@ class TokenBucket:
         with self._cond:
             burst = max(self._rate, 1 << 17, n)
             self._tokens = min(burst, self._tokens + n)
+            self._cond.notify_all()
 
 
 class CombinedBucket:
