@@ -4,6 +4,13 @@ All notable changes to FerDim are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 semantic versioning.
 
+## [1.8.1] — 2026-11-25
+
+### Fixed
+- A test could pause a download only after it had already finished on
+  fast builders, so the Fedora 44 and 45 package builds failed and those
+  releases did not get 1.8.0.
+
 ## [1.8.0] — 2026-11-25
 
 Data integrity and crash safety: nothing may finish as `done` with wrong

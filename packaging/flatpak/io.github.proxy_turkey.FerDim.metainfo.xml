@@ -46,6 +46,11 @@
   </screenshots>
 
   <releases>
+    <release version="1.8.1" date="2026-11-25">
+      <description>
+        <p>Build fix for fast builders; no functional changes.</p>
+      </description>
+    </release>
     <release version="1.8.0" date="2026-11-25">
       <description>
         <p>Data integrity and crash safety: safer resume, power-cut durability, corrupt queue recovery and soft-404 warnings.</p>

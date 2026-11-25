@@ -252,12 +252,16 @@ class ValidatorTests(_Base):
     def test_resume_with_explicit_checksum_is_allowed_and_catches_change(self):
         """Acik saglama varsa devam edilir; degisim bitis dogrulamasinda
         yakalanir (dosya korunur, is HATA)."""
+        self.rsrv.delay = 0.002                 # duraklatma yarida kalsin
         j = self.job(f"{self.rsrv.base}/data.bin", segments=4,
                      filename="chk.bin", sha256=sha(DATA))
         j.start()
         self.assertTrue(wait_until(lambda: j.done > 2 << 20, 30), j.done)
         j.pause()
         self.assertEqual(j.state, JobState.PAUSED, j.error)
+        # hizli derleyicide dosya duraklatmadan once bitebiliyordu: o zaman
+        # devam yalniz yayinlar (dogru sonuc DONE) ve test anlamini yitirir
+        self.assertLess(j.done, len(DATA), "duraklatma indirme bittikten sonra")
         self.rsrv.payload = bytes(b ^ 0x5A for b in DATA)
         j.resume()
         self.assertTrue(wait_state(j, (JobState.DONE, JobState.ERROR)),
