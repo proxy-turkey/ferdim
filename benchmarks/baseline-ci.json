@@ -1,0 +1,25 @@
+{
+  "calibration": 61.631268747462244,
+  "cpu_count": 4,
+  "generated": "2026-11-25T22:33:08Z",
+  "io_calibration": 5.884055890787591,
+  "metrics": {
+    "cdc_mib_s": 156.0344534117852,
+    "engine_mib_s": 185.44973088976664,
+    "idle_cpu_pct": 0.12499485647728044,
+    "idle_loaded_cpu_pct": 0.24998909222593876,
+    "idle_loaded_rss_mib": 209.21875,
+    "idle_queued_cpu_pct": 0.7499720679465549,
+    "idle_queued_rss_mib": 215.546875,
+    "idle_rss_mib": 34.546875,
+    "idle_sse_cpu_pct": 0.6249765895487867,
+    "idle_sse_rss_mib": 235.76953125,
+    "queue_bulk_add_jobs_s": 288.28417988031725,
+    "queue_load_jobs_s": 7398.223712824211,
+    "stats_calls_s": 28.253294856867917,
+    "stats_frame_ms": 67.76986500000248
+  },
+  "platform": "linux",
+  "python": "3.13.18",
+  "version": 1
+}
