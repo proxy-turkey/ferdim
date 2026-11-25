@@ -21,6 +21,7 @@ const VIRTUAL_MIN = 120;    // bu sayidan fazla satirda pencere kullanilir
 const OVERSCAN = 8;         // pencere ustu/alti fazladan satir
 const ROW_EST = 64;         // olculmemis satir yuksekligi tahmini (px)
 const HIST_PAGE = 100;      // gecmis sayfasi
+const FRAME_MAX = 64 << 20; // tek SSE karesi ust siniri (10 000 is ~5-10 MB)
 
 let T = {};                 // aktif ceviri sozlugu
 let LANG = localStorage.getItem("ferdimLang") || "";
@@ -167,11 +168,11 @@ const cssColor = (() => {
   };
 })();
 
-/* canvas'i aygit piksel oranina gore olceklendirir (HiDPI) */
-function fitCanvas(cv) {
+/* canvas'i aygit piksel oranina gore olceklendirir (HiDPI).
+ * Boyut DISARIDAN verilirse duzen OKUNMAZ: satir dongusunde her oynayan
+ * satir icin zorunlu yerlesim (forced layout) uretmemek icin. */
+function fitCanvasSize(cv, w, h) {
   const dpr = window.devicePixelRatio || 1;
-  const w = Math.max(1, Math.round(cv.clientWidth || cv.width || 1));
-  const h = Math.max(1, Math.round(cv.clientHeight || cv.height || 1));
   if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
     cv.width = Math.round(w * dpr);
     cv.height = Math.round(h * dpr);
@@ -181,9 +182,30 @@ function fitCanvas(cv) {
   return { ctx, w, h };
 }
 
-/* values eski -> yeni; sabit HIST_MAX penceresi saga yaslanir. Donus: tepe */
-function drawLine(cv, values, color, area) {
-  const { ctx, w, h } = fitCanvas(cv);
+function fitCanvas(cv) {
+  const w = Math.max(1, Math.round(cv.clientWidth || cv.width || 1));
+  const h = Math.max(1, Math.round(cv.clientHeight || cv.height || 1));
+  return fitCanvasSize(cv, w, h);
+}
+
+/* Mini grafik CSS kutusu sabittir (64x16). Olcusu BIR KEZ okunur: yazma
+ * dongusunun icinde okumak satir basina yeniden yerlesim demekti. Pencere
+ * yeniden boyutlaninca (ya da yakinlastirmada) tazelenir. */
+let sparkBox = null;
+
+function sparkSize(cv) {
+  if (!sparkBox) {
+    sparkBox = { w: Math.max(1, Math.round(cv.clientWidth || 64)),
+                 h: Math.max(1, Math.round(cv.clientHeight || 16)) };
+  }
+  return sparkBox;
+}
+
+/* values eski -> yeni; sabit HIST_MAX penceresi saga yaslanir. Donus: tepe.
+ * `size` verilirse canvas olcusu hazirdir (duzen okunmaz). */
+function drawLine(cv, values, color, area, size) {
+  const { ctx, w, h } = size ? fitCanvasSize(cv, size.w, size.h)
+                             : fitCanvas(cv);
   ctx.clearRect(0, 0, w, h);
   ctx.strokeStyle = cssColor("--line");
   ctx.lineWidth = 1;
@@ -434,7 +456,9 @@ function updateRow(r, j) {
   r.eta.textContent = playing ? eta(j.eta) : "";
   r.spark.hidden = !playing;    // duraklatilan/biten iste bos mini grafik kalmasin
   if (playing) {
-    drawLine(r.spark, jobHist.get(j.id) || [], cssColor("--acc"), false);
+    // olcu onceden bilinir: satir dongusunde duzen okunmaz (P7)
+    drawLine(r.spark, jobHist.get(j.id) || [], cssColor("--acc"), false,
+             sparkSize(r.spark));
     r.spark.setAttribute("aria-label",
       trf("spark_a11y", { cur: rate(j.speed) }));
   }
@@ -491,8 +515,14 @@ function applyStats(s) {
     }
   }
   let next = Number.isInteger(s.rev) ? s.rev : 0;
-  if (!isFull && Number.isInteger(s.total_jobs) && s.total_jobs !== jobs.length)
-    next = 0;                                 // kacan kare: tam kare iste
+  const gap = !isFull && Number.isInteger(s.total_jobs)
+    && s.total_jobs !== jobs.length;           // kacan kare: liste eksik
+  if (gap) {
+    // Yalniz rev=0 yoklamayi duzeltir; CANLI akis sunucu tarafinda kendi
+    // rev'ini tutar, bu yuzden akis kapatilip TAM kareyle yeniden kurulur.
+    next = 0;
+    resync();
+  }
   rev = next;
   const top = Object.assign({}, s);
   delete top.jobs;
@@ -802,7 +832,9 @@ async function readFrames(reader) {
       buf = buf.slice(cut + 2);
       handleFrame(block);
     }
-    if (buf.length > (1 << 20)) buf = "";   // bozuk akis: birikmesin
+    // tek kare 64 MiB'i asarsa akis bozulmustur: sessizce sifirlamak
+    // istemciyi sunucunun rev'inden koparir -> tam kareyle yeniden kur
+    if (buf.length > FRAME_MAX) { resync(); return; }
   }
 }
 
@@ -820,10 +852,31 @@ function handleFrame(block) {
   streamTries = 0;                              // akis saglikli (kare geldi)
   if (!data || event !== "stats") return;
   let s;
-  try { s = JSON.parse(data); } catch { return; }
+  try { s = JSON.parse(data); }
+  catch { resync(); return; }        // bozuk kare: tam kareden basla
   if (!applyStats(s)) return;
   sampleHistory(Date.now());
   render(); renderStatus(); announce(); updateGraphs();
+}
+
+/* --------------------------------------------------------------- resync
+ * Fark karesi tutarsiz (sayim tutmadi, kare cozulemedi ya da siniri asti):
+ * canli akis TAM kareyle yeniden kurulur. Sunucu `since`yi kendi tutar;
+ * istemcide rev=0 yapmak akisi duzeltmez, kapatip yeniden baglanmak gerekir.
+ * Dongu korumasi: en fazla 2 sn'de bir. */
+let resyncAt = 0;
+
+function resync() {
+  const now = Date.now();
+  if (now - resyncAt < 2000) return;
+  resyncAt = now;
+  rev = 0;                    // yoklama tam kare ister
+  streamClose();              // akis kapanir (sunucu kareyi hemen keser)
+  setTimeout(() => {
+    if (document.hidden) return;
+    poll();                   // hemen bir tam kare
+    streamLoop();             // akis yeniden acilir: ilk karesi tamdir
+  }, 0);
 }
 
 /* token dondurulmus/gecersiz: sekmedeki kopyayi at, sayfa yeniden yuklenir */
@@ -1391,6 +1444,7 @@ function onScroll() {
 }
 scroller.addEventListener("scroll", onScroll, { passive: true });
 window.addEventListener("resize", () => {
+  sparkBox = null;              // mini grafik olcusu yeniden okunsun
   if (virtualOn) onScroll();
 });
 

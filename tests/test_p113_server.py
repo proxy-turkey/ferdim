@@ -136,6 +136,67 @@ class LineReader:
         return False
 
 
+class _StubSock:
+    """Engellenebilir sahte soket: yaziciyi kare ortasinda durdurmak icin.
+
+    Gercek soket tamponu boyle bir denetim vermez; tek yuvali kuyrugun
+    kare ezmesi ve yavas yazici senaryolarini sinamak icin yazma adimi
+    olayla bekletilir."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.data = bytearray()
+        self.armed = threading.Event()
+        self.blocked = threading.Event()
+        self.release = threading.Event()
+
+    def setsockopt(self, *_a, **_k):
+        pass
+
+    def shutdown(self, _how=None):
+        pass
+
+    def send(self, chunk):
+        if self.armed.is_set() and not self.release.is_set():
+            self.blocked.set()
+            self.release.wait(10.0)
+        with self.lock:
+            self.data += bytes(chunk)
+        return len(chunk)
+
+    def frames(self):
+        """Biriken SSE govdesini karelere ayirir (yarim kare atilir)."""
+        with self.lock:
+            text = self.data.decode("utf-8", "replace")
+        out = []
+        for block in text.split("\n\n"):
+            data = [ln[5:].lstrip(" ") for ln in block.split("\n")
+                    if ln.startswith("data:")]
+            if not data:
+                continue
+            try:
+                out.append(json.loads("\n".join(data)))
+            except ValueError:      # yarim kare: henuz yazilmadi
+                continue
+        return out
+
+
+def apply_frames(frames) -> dict:
+    """Kareleri sirayla uygular (web/app.js applyStats gibi; yinelenebilir).
+
+    Tam kare listeyi DEGISTIRIR, fark karesi kimlik bazinda ezer, `removed`
+    duser. Ayni karenin iki kez uygulanmasi sonucu degistirmez."""
+    state = {}
+    for frame in frames:
+        if frame.get("full"):
+            state.clear()
+        for jid in frame.get("removed") or ():
+            state.pop(jid, None)
+        for job in frame.get("jobs") or ():
+            state[job["id"]] = job
+    return state
+
+
 class FakeQM:
     """Yalnizca dinleyici defteri: soket sunucusu bunu kullanir."""
 
@@ -159,10 +220,10 @@ class ClientQueueTests(unittest.TestCase):
         a, b = socket.socketpair()
         try:
             c = Client(a)             # yazici baslatilmaz: kuyruk elle denetlenir
-            self.assertTrue(c.offer(b"birinci"))
-            self.assertTrue(c.offer(b"ikinci"))
-            self.assertEqual(c.take(), b"ikinci")   # eski kare dustu
-            self.assertEqual(c.take(), b"")
+            self.assertTrue(c.offer(b"birinci", 1))
+            self.assertTrue(c.offer(b"ikinci", 2))
+            self.assertEqual(c.take(), (b"ikinci", 2))   # eski kare dustu
+            self.assertEqual(c.take(), (b"", None))
         finally:
             a.close()
             b.close()
@@ -352,10 +413,12 @@ class HubTests(unittest.TestCase):
         h.start()
         a, b = socket.socketpair()
         try:
-            h.add_sse(a)
+            client = h.add_sse(a)
             frames = _SseFrames(b)
             first = frames.next()
             self.assertTrue(first["full"])
+            # yazici basarili gonderimden sonra rev'i ilerletir (H1)
+            self.assertTrue(wait_for(lambda: client.rev == first["rev"], 5.0))
             self.assertEqual(sorted(j["id"] for j in first["jobs"]), ["a", "b"])
             fake.drop("a")
             fake.upsert("b", state="done", checksum="ok")
@@ -422,6 +485,142 @@ class HubTests(unittest.TestCase):
             h.stop()
             a.close()
             b.close()
+
+    # ------------------------------------------------ kare kaybi / sinirlar
+    def test_08_replaced_frame_is_not_lost(self):
+        """Tek yuvali kuyruk bir kareyi ezse bile degisiklik kaybolmaz.
+
+        `since` GONDERILMIS rev'den hesaplandigi icin ezilen karenin
+        degisiklikleri sonraki karede yeniden gonderilir (H1). Itici
+        parcacik baslatilmaz: `_push` elle cagrilir (yaris yok)."""
+        fake = FakeStats()
+        fake.upsert("a", state="queued", note="n")
+        h = Hub(fake, interval=0.01, heartbeat=60.0)
+        stub = _StubSock()
+        client = h.add_sse(stub)
+        try:
+            h._push()                       # kucuk tam kare (rev1)
+            self.assertTrue(wait_for(lambda: client.rev is not None, 5.0))
+            stub.armed.set()
+            # yazici BUYUK bir fark karesiyle mesgul: kare yiyecek kadar uzun
+            fake.upsert("a", state="queued", note="x" * (4 << 20))
+            h._push()
+            self.assertTrue(stub.blocked.wait(5.0), "yazici mesgul edilemedi")
+            # yazici mesgulken iki degisiklik: ikinci teklif birinciyi EZER
+            fake.upsert("b", state="done")
+            h._push()
+            fake.upsert("c", state="done")
+            h._push()
+            stub.release.set()
+            self.assertTrue(wait_for(lambda: client.rev == fake.rev, 5.0))
+            state = apply_frames(stub.frames())
+            self.assertIn("b", state, "ezilen kare kayboldu")
+            self.assertEqual(state["b"]["state"], "done")
+            self.assertEqual(state["c"]["state"], "done")
+            self.assertEqual(state["a"]["state"], "queued")
+        finally:
+            h.stop()
+
+    def test_09_hub_restarts_after_stop(self):
+        """stop() sonrasi start() yeniden calisir (L2)."""
+        fake = FakeStats()
+        fake.upsert("a", state="queued")
+        h = Hub(fake, interval=0.01, heartbeat=0.05)
+        h.start()
+        self.assertTrue(h.running)
+        h.stop()
+        self.assertFalse(h.running)
+        h.start()                       # durdurma bayragi temizlenmeli
+        self.assertTrue(h.running)
+        a, b = socket.socketpair()
+        try:
+            self.assertIsNotNone(h.add_client(a, name="test"))
+            first = json.loads(LineReader(b).block(5.0))
+            self.assertEqual(first["event"], "stats")
+            fake.upsert("a", state="done")
+            h.notify()
+            end = time.monotonic() + 5.0
+            seen = None
+            while time.monotonic() < end:
+                cand = json.loads(LineReader(b).block(5.0))
+                if any(j["state"] == "done" for j in cand["jobs"]):
+                    seen = cand
+                    break
+            self.assertIsNotNone(seen, "yeniden baslayan merkez kare uretmedi")
+        finally:
+            h.stop()
+            a.close()
+            b.close()
+
+    def test_10_one_delta_per_push_for_many_viewers(self):
+        """Farkli rev'lerdeki istemciler TEK istatistik hesabiyla beslenir.
+
+        Fark, izleyicilerin GORDUGU en eski rev'den hesaplanir: ust kume
+        alan istemci ayni kareyi yeniden uygular (yinelenebilir)."""
+        fake = FakeStats()
+        fake.upsert("a", state="queued")
+        h = Hub(fake, interval=0.01, heartbeat=60.0)
+        stub = _StubSock()
+        slow = h.add_sse(stub)                 # A: yazicisi kilitlenecek
+        sock_a, sock_b = socket.socketpair()
+        try:
+            h._push()                          # A: tam kare (rev1)
+            self.assertTrue(wait_for(lambda: slow.rev is not None, 5.0))
+            stub.armed.set()
+            fake.upsert("b", state="queued")
+            h._push()                          # A tikali: rev ilerlemez
+            self.assertTrue(stub.blocked.wait(5.0))
+            fast = h.add_sse(sock_a)           # B: tam kare ile GUNCEL rev
+            h._push()                          # B'nin ilk karesi (tam)
+            frames = _SseFrames(sock_b)
+            full = frames.next()
+            self.assertTrue(full["full"])
+            self.assertTrue(wait_for(lambda: fast.rev == fake.rev, 5.0))
+            self.assertLess(slow.rev, fast.rev)        # farkli rev'ler
+            calls = fake.call_count()
+            fake.upsert("c", state="done")
+            h._push()                          # TEK hesap: min rev'den fark
+            self.assertEqual(fake.call_count() - calls, 1)
+            delta = frames.next()
+            self.assertEqual(sorted(j["id"] for j in delta["jobs"]),
+                             ["b", "c"])       # ikisinin de eksiği kapanir
+            state_b = apply_frames([full, delta])
+            self.assertEqual(state_b["b"]["state"], "queued")
+            self.assertEqual(state_b["c"]["state"], "done")
+            stub.release.set()                 # yavas istemci de yetisir
+            self.assertTrue(wait_for(
+                lambda: "c" in apply_frames(stub.frames()), 5.0))
+            state_a = apply_frames(stub.frames())
+            self.assertEqual(state_a["b"]["state"], "queued")
+            self.assertEqual(state_a["c"]["state"], "done")
+            self.assertTrue(wait_for(lambda: slow.rev == fast.rev, 5.0))
+        finally:
+            h.stop()
+            sock_a.close()
+            sock_b.close()
+
+    def test_11_client_caps(self):
+        """Eszamanli istemci siniri: SSE ve soket izleyicisi ayri sayilir."""
+        fake = FakeStats()
+        h = Hub(fake, interval=10.0, heartbeat=10.0,
+                max_sse=1, max_watchers=1)
+        pairs = [socket.socketpair() for _ in range(4)]
+        socks = [p[0] for p in pairs]
+        peers = [p[1] for p in pairs]
+        try:
+            first = h.add_sse(socks[0])
+            self.assertIsNotNone(first)
+            self.assertIsNone(h.add_sse(socks[1]))      # sinir: SSE
+            self.assertIsNotNone(h.add_client(socks[2], name="w1"))
+            self.assertIsNone(h.add_client(socks[3], name="w2"))  # izleyici
+            self.assertEqual(h.count(), 2)
+            # yuva bosalinca yeni istemci kabul edilir
+            h.remove_client(first)
+            self.assertIsNotNone(h.add_sse(socks[1]))
+        finally:
+            h.stop()
+            for sock in socks + peers:
+                sock.close()
 
 
 class _SseFrames:
@@ -511,6 +710,39 @@ class SockServerTests(unittest.TestCase):
         srv.shutdown()
         srv.server_close()
 
+    def test_03_watcher_cap_sends_error_line(self):
+        """Izleyici siniri doluysa JSON hata satiri; baglanti acik kalir."""
+        root = tmp_root(self, "ferdim-p113-cap-")
+        fake = FakeStats()
+        fake.upsert("a")
+        hub = Hub(fake, interval=0.01, heartbeat=0.05, max_watchers=1)
+        ctx = {"hub": hub, "qm": FakeQM(), "env": object(), "cfg": {}}
+        srv = SockServer(str(root / "ferdim.sock"), ctx)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        second = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            first.settimeout(5.0)
+            first.connect(str(root / "ferdim.sock"))
+            first.sendall(b'{"cmd":"watch"}\n')
+            self.assertEqual(json.loads(LineReader(first).block(5.0))["event"],
+                             "stats")
+            second.settimeout(5.0)
+            second.connect(str(root / "ferdim.sock"))
+            second.sendall(b'{"cmd":"watch"}\n')
+            reply = json.loads(LineReader(second).block(5.0))
+            self.assertEqual(reply.get("code"), "too_many")
+            # reddedilen baglanti kapanmadi: RPC hala kullanilabilir
+            second.sendall(b'{"cmd":"version","req_id":7}\n')
+            msg = json.loads(LineReader(second).block(5.0))
+            self.assertEqual(msg.get("req_id"), 7)
+            self.assertTrue(msg.get("ok"))
+        finally:
+            first.close()
+            second.close()
+            srv.shutdown()
+            srv.server_close()
+
 
 # ------------------------------------------------------------ /api/events
 def _http(port: int, path: str, token: str | None, host: str) -> bytes:
@@ -523,12 +755,14 @@ def _http(port: int, path: str, token: str | None, host: str) -> bytes:
 class _WebCase(unittest.TestCase):
     """Yaltilmis HTTP sunucusu: sahte stats + gercek make_server."""
 
+    hub_kwargs = {"interval": 0.01, "heartbeat": 0.05}
+
     def setUp(self):
         self.root = tmp_root(self, "ferdim-p113-web-")
         self.env = AppEnv(root=self.root)
         self.fake = FakeStats()
         self.fake.upsert("a", state="downloading")
-        self.hub = Hub(self.fake, interval=0.01, heartbeat=0.05)
+        self.hub = Hub(self.fake, **self.hub_kwargs)
         self.ctx = {"env": self.env, "cfg": {}, "qm": FakeQM(),
                     "hub": self.hub, "web_access": api.WebAccess(TOKEN)}
         self.httpd = web.make_server(self.env, self.ctx, 0)
@@ -589,6 +823,32 @@ class EventsEndpointTests(_WebCase):
         sock.sendall(_http(self.port, "/api/events", TOKEN, "evil.example:1"))
         head = LineReader(sock, sep=b"\r\n\r\n").block(5.0)
         self.assertIn(b" 421 ", head.split(b"\r\n")[0])
+
+
+class SseCapTests(_WebCase):
+    """Eszamanli akis siniri: ikinci sekme 503 + JSON hata alir (L4)."""
+
+    hub_kwargs = {"interval": 0.01, "heartbeat": 0.05, "max_sse": 1}
+
+    def test_01_second_stream_rejected(self):
+        first = self._open()
+        head = LineReader(first, sep=b"\r\n\r\n").block(5.0)
+        self.assertIn(b" 200 ", head.split(b"\r\n")[0])
+        _SseFrames(first).next()               # kayit oturdu
+        self.assertEqual(self.hub.count(), 1)
+        second = self._open()
+        head2 = LineReader(second, sep=b"\r\n\r\n").block(5.0)
+        self.assertIn(b" 503 ", head2.split(b"\r\n")[0])
+        self.assertNotIn(b"text/event-stream", head2)
+        body = b""
+        while True:
+            part = second.recv(65536)
+            if not part:
+                break
+            body += part
+        self.assertIn(b"too_many", body)
+        # reddedilen istemci merkeze KAYDEDILMEZ (yuva kapanmaz, tikanmaz)
+        self.assertEqual(self.hub.count(), 1)
 
 
 class StatsQueryTests(_WebCase):
@@ -683,7 +943,24 @@ class WebUiStaticTests(unittest.TestCase):
             self.assertIn(key, S, key)
             self.assertEqual(set(S[key]), set(LANGS), key)
 
-    def test_05_hosts_panel_refreshes_on_its_own_timer(self):
+    def test_05_stream_gap_triggers_resync(self):
+        """Kare boslugu sessizce yutulmaz: akis TAM kareyle yeniden kurulur.
+
+        `rev=0` yalniz yoklamayi duzeltir; canli akis sunucu tarafinda kendi
+        rev'ini tutar. Sayim tutmazsa, kare cozulemezse ya da kare siniri
+        asarsa akis kapatilip yeniden baglanilir (ilk kare tamdir)."""
+        self.assertIn("function resync()", self.js)
+        self.assertIn("FRAME_MAX", self.js)
+        for head, need in (("function applyStats", "resync()"),
+                           ("function handleFrame", "resync()"),
+                           ("async function readFrames", "resync()")):
+            start = self.js.index(head)
+            body = self.js[start:self.js.index("\n}\n", start)]
+            self.assertIn(need, body, head)
+        # sessiz sifirlama kalmadi: yalniz baslangic atamasi kaldi
+        self.assertEqual(self.js.count('buf = ""'), 1, "sessiz sifirlama olmamali")
+
+    def test_06_hosts_panel_refreshes_on_its_own_timer(self):
         """Panel tazelemesi istatistik karelerine BAGLANMAZ.
 
         Sunucu degisiklik yokken kare gondermez (bosta trafik yok); panel

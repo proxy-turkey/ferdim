@@ -29,6 +29,10 @@ SEND_TIMEOUT = 3.0        # tek send() icin cekirdek zaman asimi (SO_SNDTIMEO)
 FRAME_TIMEOUT = 12.0      # bir karenin toplam yazma butcesi (sn)
 CHUNK = 64 * 1024         # parca boyu: gonderim butcesi parca parca denetlenir
 SSE_KEEPALIVE = 15.0      # SSE yorum satiri araligi (sn)
+# Eszamanli istemci sinirlari (L4): her baglanti bir yazici parcacigi ve
+# bir kare kuyrugu tutar; sinirsiz sekme/izleyici bellegi ve CPU'yu sisirir.
+MAX_SSE = 16              # ayni anda acik web akisi (sekme)
+MAX_WATCHERS = 16         # soket izleyicisi (CLI/GTK/D-Bus koprusu)
 
 
 def sock_frame(stats: dict) -> bytes:
@@ -59,8 +63,13 @@ class Client:
     """Tek istemci: tek yuvali kuyruk + kendi yazici parcacigi.
 
     `delta` SSE istemcileri icindir (fark kareleri); soket izleyicisi her
-    zaman tam kare alir. `rev` istemcinin gordugu son rev'dir, None ise
-    sonraki kare tam gonderilir.
+    zaman tam kare alir.
+
+    `rev` istemcinin GERCEKTEN gordugu son rev'dir (yazici basarili
+    gonderimden SONRA gunceller, bkz. `sent`); None ise sonraki kare tam
+    gonderilir. Tek yuvali kuyruk bir kareyi ezebilir: `since` bu yuzden
+    `rev`den (gonderilmis olandan) hesaplanir, boylece ezilen karenin
+    degisiklikleri bir sonraki karede yeniden gonderilir.
 
     `closed` bir threading.Event'tir: istek/bekleme parcaciklari akisin
     bittigini `closed.wait()` ile ogrenir.
@@ -72,13 +81,14 @@ class Client:
         self.sock = sock
         self.name = name
         self.delta = False
-        self.rev = None
-        self.mark = None          # son gonderilen karenin ust alan ozeti
+        self.rev = None           # gonderilmis (gorulen) rev; yazici yazar
+        self.mark = None          # son teklif edilen karenin ust alan ozeti
         self.keepalive = float(keepalive)
         self._send_timeout = float(send_timeout)
         self._frame_timeout = float(frame_timeout)
         self._lock = threading.Lock()
         self._frame = b""
+        self._frame_rev = None    # bekleyen karenin rev'i
         self._event = threading.Event()
         self._closed = threading.Event()
         self._thread: threading.Thread | None = None
@@ -126,21 +136,35 @@ class Client:
         return self._closed.wait(timeout)
 
     # -------------------------------------------------------------- kuyruk
-    def offer(self, frame: bytes) -> bool:
-        """Yeni kare birakir; bekleyen eski kare DUSER (birlestirme)."""
+    def offer(self, frame: bytes, rev: int | None = None) -> bool:
+        """Yeni kare birakir; bekleyen eski kare DUSER (birlestirme).
+
+        `rev` karenin rev'idir; yazici gonderim BASARILI olduktan sonra
+        `sent()` ile istemcinin rev'ini ilerletir. Ezilen kare oldugu icin
+        bir sonraki kare `since`i bu rev'den (gonderilenden) hesaplar."""
         with self._lock:
             if self._closed.is_set():
                 return False
             self._frame = frame
+            self._frame_rev = rev
             self._event.set()
         return True
 
-    def take(self) -> bytes:
-        """Bekleyen en yeni kareyi alir (yoksa bos bayt)."""
+    def take(self) -> tuple[bytes, int | None]:
+        """Bekleyen en yeni kareyi (ve rev'ini) alir."""
         with self._lock:
-            frame, self._frame = self._frame, b""
+            frame, rev = self._frame, self._frame_rev
+            self._frame, self._frame_rev = b"", None
             self._event.clear()
-        return frame
+        return frame, rev
+
+    def sent(self, rev: int | None) -> None:
+        """Yazici basarili gonderimden SONRA cagirir: istemci bu rev'i gordu."""
+        if rev is None:
+            return
+        with self._lock:
+            if self.rev is None or rev > self.rev:
+                self.rev = rev
 
     # ------------------------------------------------------------- yazici
     def _run(self) -> None:
@@ -148,16 +172,18 @@ class Client:
             self._event.wait(self.keepalive or None)
             if self._closed.is_set():
                 return
-            frame = self.take()
+            frame, rev = self.take()
             if not frame:
                 if not self.keepalive:
                     continue
                 if time.monotonic() - self._sent < self.keepalive:
                     continue
                 frame = b": ping\n\n"      # SSE kalp atisi (yorum satiri)
+                rev = None
             if not self._send(frame):
                 self.close()
                 return
+            self.sent(rev)
 
     def _send(self, data: bytes) -> bool:
         """Kareyi parca parca yazar; butce asilirsa False (baglanti kapanir)."""
@@ -182,14 +208,18 @@ class Hub:
 
     `stats(params)` cagrilabilir olmalidir (api.handle(ctx, "stats", params));
     `since` verildiginde fark karesi dondurebilir. rev yoksa (eski sunucu)
-    butun kareler tam gonderilir.
+    butun kareler tam gonderilir. Eszamanli istemci sayisi sinirlidir
+    (`max_sse`, `max_watchers`): sinir dolunca `add_client` None doner.
     """
 
     def __init__(self, stats, interval: float = PUSH_INTERVAL,
-                 heartbeat: float = HEARTBEAT):
+                 heartbeat: float = HEARTBEAT, max_sse: int = MAX_SSE,
+                 max_watchers: int = MAX_WATCHERS):
         self._stats = stats
         self._interval = float(interval)
         self._heartbeat = float(heartbeat)
+        self._max_sse = int(max_sse)
+        self._max_watchers = int(max_watchers)
         self._lock = threading.Lock()
         self._clients: list[Client] = []
         self._wake = threading.Event()
@@ -200,7 +230,11 @@ class Hub:
 
     # -------------------------------------------------------------- yasam
     def start(self, qm=None) -> "Hub":
-        """Titreyen itici parcacigi baslatir; dinleyici bir kez baglanir."""
+        """Titreyen itici parcacigi baslatir; dinleyici bir kez baglanir.
+
+        stop() sonrasi yeniden baslatilabilir: durdurma bayragi temizlenir
+        (aksi halde parcacik hemen cikar ve istemciler kare almaz)."""
+        self._stop.clear()
         if qm is not None and self._listener is None:
             try:
                 qm.add_listener(self.notify)
@@ -239,21 +273,31 @@ class Hub:
 
     # ----------------------------------------------------------- istemciler
     def add_client(self, sock, delta: bool = False, name: str = "",
-                   keepalive: float = 0.0) -> Client:
-        client = Client(sock, name=name, keepalive=keepalive)
-        client.delta = bool(delta)
+                   keepalive: float = 0.0, start: bool = True) -> Client | None:
+        """Istemciyi merkeze baglar; sinir doluysa None.
+
+        Sinir asilinca sokete DOKUNULMAZ: baglantiyi reddeden taraf (HTTP
+        503 / soket hata satiri) yanitini yazabilsin. `start=False`: yazici
+        parcacigi baslatilmaz; SSE istek isleyicisi once yuva ayirir, basliklar
+        ciktiktan sonra `start()` cagirir."""
         with self._lock:
             if self._stop.is_set():
-                client.close()
-                return client           # cagiran `closed` ile hemen doner
+                return None
+            limit = self._max_sse if delta else self._max_watchers
+            if limit and sum(1 for c in self._clients
+                             if c.delta == bool(delta)) >= limit:
+                return None
+            client = Client(sock, name=name, keepalive=keepalive)
+            client.delta = bool(delta)
             self._clients.append(client)
-        client.start()
+        if start:
+            client.start()
         self._wake.set()                # ilk kare beklemesin
         return client
 
-    def add_sse(self, sock, name: str = "sse") -> Client:
+    def add_sse(self, sock, name: str = "sse", start: bool = True) -> Client | None:
         return self.add_client(sock, delta=True, name=name,
-                               keepalive=SSE_KEEPALIVE)
+                               keepalive=SSE_KEEPALIVE, start=start)
 
     def remove_client(self, client: Client) -> None:
         with self._lock:
@@ -299,51 +343,66 @@ class Hub:
         clients = self._snapshot()
         if not clients:
             return            # istemci yok: istatistik HESAPLANMAZ (bosta CPU)
-        full = None
-        cached: dict = {}     # rev -> kare (ayni rev tek kez hesaplanir)
+        viewers = [c for c in clients if c.delta]
+        watchers = [c for c in clients if not c.delta]
+
+        # 1) TEK fark karesi: izleyicilerin GORDUGU en eski rev'den. Boylece
+        #    (a) istemci basina ayri hesap yok (10 000 iste N kat is yok) ve
+        #    (b) tek yuvali kuyrukta ezilen bir karenin degisiklikleri
+        #    sonraki karede kapsanir (since gonderilmis rev'den hesaplanir).
+        #    Cok gormus istemci ayni kareyi yeniden uygular: snapshot'lar
+        #    mutlak oldugu icin bu islem yinelenebilir (idempotent).
+        since = min((c.rev for c in viewers if c.rev is not None),
+                    default=None)
+        delta = self._stats({"since": since}) if since is not None else None
+        if delta is not None and not isinstance(delta.get("rev"), int):
+            # rev'siz yanit: fark mi tam mi bilinemez -> tam kareye dus
+            delta = None
+
+        # 2) Tam kare yalniz gerekiyorsa hesaplanir ve tel bicimi bir kez
+        #    kodlanir (P1): butun izleyiciler ayni baytlari alir.
+        need_full = (bool(watchers) or delta is None
+                     or any(c.rev is None for c in viewers))
+        full = self._stats({}) if need_full else None
+        full_tag = mark(full) if full is not None else None
+        full_sock = None
+        full_sse = None
+
         for client in clients:
             try:
                 if not client.delta:
                     # soket izleyicisi tel sozlesmesi: TAM kare (`jobs`
                     # butun liste). Yalniz DEGISIKLIK varsa gonderilir:
-                    # rev/ust alanlar ayniysa kare uretilmez (10 000 iste
-                    # saniyede megabaytlar JSON uretilmez).
-                    if full is None:
-                        full = self._stats({})
-                    tag = mark(full)
-                    if tag == client.mark:
+                    # rev/ust alanlar ayniysa kare uretilmez.
+                    if full_tag == client.mark:
                         continue
-                    client.mark = tag
-                    client.offer(sock_frame(full))
+                    client.mark = full_tag
+                    if full_sock is None:
+                        full_sock = sock_frame(full)
+                    client.offer(full_sock,
+                                 full.get("rev")
+                                 if isinstance(full.get("rev"), int) else None)
                     continue
-                # SSE: istemci basina `since` -> yalniz degisen isler
-                if client.rev is None:
-                    if full is None:
-                        full = self._stats({})
-                    frame = full
-                elif client.rev in cached:
-                    frame = cached[client.rev]
-                else:
-                    frame = self._stats({"since": client.rev})
-                    cached[client.rev] = frame
-                rev = frame.get("rev")
-                if not isinstance(rev, int):
-                    # rev yok (eski sunucu): fark kurulamaz, her kare tam
-                    # gonderilir; rev takibi bir sonraki karede yeniden denenir
-                    client.rev = None
-                else:
-                    # kare yalniz DEGISIKLIK varsa gonderilir: rev ayni ve
-                    # ust alanlar (turbo, hiz, limit, nm...) ayni ise trafik
-                    # uretilmez
-                    tag = mark(frame)
-                    same = (rev == client.rev and tag == client.mark
-                            and not frame.get("jobs")
-                            and not frame.get("removed"))
-                    client.rev = rev
-                    client.mark = tag
-                    if same:
-                        continue          # degisiklik yok: kare gonderilmez
-                client.offer(sse_frame(frame))
+                if client.rev is None or delta is None:
+                    # hic kare gormemis (ya da fark kurulamiyor): tam kare
+                    client.mark = full_tag
+                    if full_sse is None:
+                        full_sse = sse_frame(full)
+                    client.offer(full_sse,
+                                 full.get("rev")
+                                 if isinstance(full.get("rev"), int) else None)
+                    continue
+                # kare yalniz DEGISIKLIK varsa gonderilir: istemci zaten bu
+                # rev'deyse ve ust alanlar (turbo, hiz, limit, nm...) ayniysa
+                # bos kare trafigi uretilmez
+                tag = mark(delta)
+                same = (delta["rev"] == client.rev and tag == client.mark
+                        and not delta.get("jobs")
+                        and not delta.get("removed"))
+                if same:
+                    continue
+                client.mark = tag
+                client.offer(sse_frame(delta), delta["rev"])
             except Exception:
                 continue      # tek istemcinin hatasi digerlerini durdurmaz
 

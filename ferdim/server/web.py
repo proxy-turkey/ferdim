@@ -275,30 +275,37 @@ def make_server(env, ctx, preferred_port: int) -> ThreadingHTTPServer:
         def _serve_events(self):
             """SSE akisi: kareler ortak merkezden (hub) gelir.
 
-            Basliklar bu is parcaciginda yazilir; sonra soket itici
-            parcaciga devredilir ve bu is parcacigi yalnizca akis bitene
-            kadar bekler. Istemci kaybolursa yazma butcesi dolar, merkez
-            baglantiyi kapatir: is parcacigi sizmaz."""
+            Yuva ONCE ayrilir: istemci siniri doluysa baslik yazilmadan 503
+            + JSON donulur (tarayici sonsuz sekme acamaz). Basliklar bu is
+            parcaciginda yazilir; sonra soket itici parcaciga devredilir ve
+            bu is parcacigi yalnizca akis bitene kadar bekler. Istemci
+            kaybolursa yazma butcesi dolar, merkez baglantiyi kapatir: is
+            parcacigi sizmaz."""
             hub = getattr(self.server, "hub", None)
             if hub is None:
                 self._deny(404, "bulunamadi")
                 return
-            self.close_connection = True
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "close")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-            self.wfile.flush()
-            # yazma asimi: soket zaman asimi tek send()'i sinirlar, kare
-            # butcesini merkez uygular (okuma yok, is parcacigi beklemede)
+            client = hub.add_sse(self.connection, start=False)
+            if client is None:
+                self._deny(503, "cok fazla istemci", "too_many")
+                return
             try:
-                self.connection.settimeout(_hub.SEND_TIMEOUT)
-            except OSError:
-                pass
-            client = hub.add_sse(self.connection)
-            try:
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                self.wfile.flush()
+                # yazma asimi: soket zaman asimi tek send()'i sinirlar, kare
+                # butcesini merkez uygular (okuma yok, is parcacigi beklemede)
+                try:
+                    self.connection.settimeout(_hub.SEND_TIMEOUT)
+                except OSError:
+                    pass
+                client.start()
                 client.wait_closed()
             finally:
                 hub.remove_client(client)
